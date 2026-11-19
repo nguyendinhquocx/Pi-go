@@ -7,19 +7,30 @@
 package codingagent
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
+	"os/user"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
 	"sync"
 
 	"github.com/MichaelKinsy/PiG/internal/jsonparse"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/nodeerrno"
+	"github.com/MichaelKinsy/PiG/internal/nodefs"
+	"github.com/MichaelKinsy/PiG/internal/orderedjson"
+	"github.com/MichaelKinsy/PiG/internal/resolvepath"
 	"github.com/MichaelKinsy/PiG/internal/text"
 )
 
 var trustRequiringProjectConfigResources = [...]string{
 	"settings.json",
+	"mcp.json",
 	"extensions",
 	"skills",
 	"prompts",
@@ -109,27 +120,39 @@ func GetProjectTrustOptions(cwd string, includeSessionOnly bool) []ProjectTrustO
 // cwd; .agents/skills is checked from cwd through every ancestor. The user's
 // ~/.agents/skills is global input and never requires project trust.
 func HasTrustRequiringProjectResources(cwd string) bool {
-	home := os.Getenv("HOME")
-	if home == "" {
-		home, _ = os.UserHomeDir()
+	// trust-manager.ts:187 canonicalizePath(resolvePath(process.env.HOME || homedir())): without HOME, Node's os.homedir() reads
+	// the user database. An empty home would resolve to the working directory and hide its .agents/skills.
+	userAgentsSkills, userHomeKey := "", ""
+	if home := cmp.Or(os.Getenv("HOME"), osHomedir()); home != "" {
+		home = normalizeTrustCwd(home)
+		userAgentsSkills = filepath.Join(home, ".agents", "skills")
+		if resolvepath.FoldsCase() {
+			userHomeKey = resolvepath.ComparisonKey(home)
+		}
 	}
-	home = normalizeTrustCwd(home)
-	userAgentsSkills := filepath.Join(home, ".agents", "skills")
 	current := normalizeTrustCwd(cwd)
 
 	configDir := ProjectConfigDir(current)
+	var probe nodefs.PathProbe
 	for _, entry := range trustRequiringProjectConfigResources {
-		if _, err := os.Stat(filepath.Join(configDir, entry)); err == nil {
+		if probe.Set(configDir, entry).Exists() {
 			return true
 		}
 	}
 
-	for {
-		agentsSkills := filepath.Join(current, ".agents", "skills")
-		if agentsSkills != userAgentsSkills {
-			if _, err := os.Stat(agentsSkills); err == nil {
-				return true
+	for first := true; ; first = false {
+		isUserSkills := probe.Set(current, ".agents", "skills").Is(userAgentsSkills)
+		// pathsEqual(<current>/.agents/skills, <home>/.agents/skills) is current's key equal to home's, so one key is made for the walk and no level builds a path or a key of its own.
+		// The working directory is as realpath spelled it and gets the full key; every parent is filepath.Dir's, already resolved.
+		if !isUserSkills && userHomeKey != "" {
+			if first {
+				isUserSkills = resolvepath.ComparisonKey(current) == userHomeKey
+			} else {
+				isUserSkills = resolvepath.HasComparisonKey(current, userHomeKey)
 			}
+		}
+		if !isUserSkills && probe.Exists() {
+			return true
 		}
 		parent := filepath.Dir(current)
 		if parent == current {
@@ -137,6 +160,23 @@ func HasTrustRequiringProjectResources(cwd string) bool {
 		}
 		current = parent
 	}
+}
+
+// osHomedir is Node's os.homedir(): libuv's uv_os_homedir reads HOME (USERPROFILE on Windows), and the user database when the
+// variable is unset or empty.
+func osHomedir() string {
+	key := "HOME"
+	if runtime.GOOS == "windows" {
+		key = "USERPROFILE"
+	}
+	//perf:ok reached only when HOME is empty (cmp.Or fallback), once per trust check
+	if home := os.Getenv(key); home != "" {
+		return home
+	}
+	if current, err := user.Current(); err == nil {
+		return current.HomeDir
+	}
+	return ""
 }
 
 // ProjectTrustStore reads and writes <agentDir>/trust.json.
@@ -154,6 +194,22 @@ func NewProjectTrustStore(agentDir string) *ProjectTrustStore {
 	return &ProjectTrustStore{trustPath: filepath.Join(abs, "trust.json")}
 }
 
+// trustFileKeys are the keys of data that name path, in key order: usually one, several on Windows when the decision was saved with different casing.
+func trustFileKeys(data map[string]*bool, path string) []string {
+	if len(data) == 0 {
+		return nil
+	}
+	want := resolvepath.ComparisonKey(path)
+	var keys []string
+	for key := range data {
+		if resolvepath.ComparisonKey(key) == want {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	return keys
+}
+
 func (s *ProjectTrustStore) read() (map[string]*bool, error) {
 	data, err := os.ReadFile(s.trustPath)
 	if err != nil {
@@ -167,20 +223,23 @@ func (s *ProjectTrustStore) read() (map[string]*bool, error) {
 	if err := jsonparse.Validate(content); err != nil {
 		return nil, fmt.Errorf("Failed to read trust store %s: %w", s.trustPath, err)
 	}
-	var parsed any
-	if err := json.Unmarshal(content, &parsed); err != nil {
-		return nil, fmt.Errorf("Failed to read trust store %s: %w", s.trustPath, err)
-	}
-	object, ok := parsed.(map[string]any)
-	if !ok {
+	if !orderedjson.IsObject(content) {
 		return nil, fmt.Errorf("Invalid trust store %s: expected an object", s.trustPath)
 	}
-	out := make(map[string]*bool, len(object))
-	for key, value := range object {
-		switch typed := value.(type) {
-		case bool:
-			out[key] = new(typed)
-		case nil:
+	object, err := orderedjson.Parse(content)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to read trust store %s: %w", s.trustPath, err)
+	}
+	out := make(map[string]*bool, object.Len())
+	// Object.entries order decides which invalid value the error names: array-index keys first, then insertion order.
+	for _, key := range object.Keys() {
+		raw, _ := object.Get(key)
+		switch string(raw) {
+		case "true":
+			out[key] = new(true)
+		case "false":
+			out[key] = new(false)
+		case "null":
 			out[key] = nil
 		default:
 			return nil, fmt.Errorf("Invalid trust store %s: value for %q must be true, false, or null", s.trustPath, key)
@@ -190,7 +249,18 @@ func (s *ProjectTrustStore) read() (map[string]*bool, error) {
 }
 
 func (s *ProjectTrustStore) write(data map[string]*bool) error {
-	encoded, err := json.MarshalIndent(data, "", "  ")
+	// writeTrustFile (trust-manager.ts:126-135) sorts the keys with Array.prototype.sort, which compares UTF-16 code units, and writes JSON.stringify(sorted, null, 2): no HTML escaping, array-index keys first.
+	sorted := orderedjson.New()
+	for _, key := range slices.SortedFunc(maps.Keys(data), func(a, b string) int {
+		return slices.Compare(jsstring.ToUTF16(a), jsstring.ToUTF16(b))
+	}) {
+		value := json.RawMessage("null")
+		if data[key] != nil {
+			value = json.RawMessage(strconv.FormatBool(*data[key]))
+		}
+		sorted.Set(key, value)
+	}
+	encoded, err := stringifyIndented(rawObject(sorted))
 	if err != nil {
 		return fmt.Errorf("write trust store %s: %w", s.trustPath, err)
 	}
@@ -198,7 +268,8 @@ func (s *ProjectTrustStore) write(data map[string]*bool) error {
 	if err := nodeerrno.MkdirAll(filepath.Dir(s.trustPath), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(s.trustPath, append(encoded, '\n'), 0o644); err != nil {
+	// upstream: coding-agent/src/core/trust-manager.ts:142 writeFileSync(path, ..., "utf-8"): no mode, so a new file is 0666 with the umask taken out.
+	if err := os.WriteFile(s.trustPath, append(encoded, '\n'), 0o666); err != nil {
 		return nodeerrno.FromPathError(err)
 	}
 	return nil
@@ -221,7 +292,7 @@ func (s *ProjectTrustStore) withLock(fn func() error) (err error) {
 }
 
 // Get returns the nearest decision for cwd, or nil when none applies.
-func (s *ProjectTrustStore) Get(cwd string) (*bool, error) {
+func (s *ProjectTrustStore) Get(cwd string) (ProjectTrustDecision, error) {
 	entry, err := s.GetEntry(cwd)
 	if err != nil || entry == nil {
 		return nil, err
@@ -236,10 +307,15 @@ func (s *ProjectTrustStore) GetEntry(cwd string) (entry *ProjectTrustStoreEntry,
 		if readErr != nil {
 			return readErr
 		}
+		if len(data) == 0 {
+			return nil // nothing is saved, so no path has a decision, and the realpath of cwd would only name the keys to look for
+		}
 		for current := normalizeTrustCwd(cwd); ; current = filepath.Dir(current) {
-			if value, ok := data[current]; ok && value != nil {
-				entry = &ProjectTrustStoreEntry{Path: current, Decision: *value}
-				return nil
+			for _, key := range trustFileKeys(data, current) {
+				if value := data[key]; value != nil {
+					entry = &ProjectTrustStoreEntry{Path: key, Decision: *value}
+					return nil
+				}
 			}
 			parent := filepath.Dir(current)
 			if parent == current {
@@ -251,7 +327,7 @@ func (s *ProjectTrustStore) GetEntry(cwd string) (entry *ProjectTrustStoreEntry,
 }
 
 // Set sets or clears the canonical decision for cwd.
-func (s *ProjectTrustStore) Set(cwd string, decision *bool) error {
+func (s *ProjectTrustStore) Set(cwd string, decision ProjectTrustDecision) error {
 	return s.SetMany([]ProjectTrustUpdate{{Path: cwd, Decision: decision}})
 }
 
@@ -265,8 +341,10 @@ func (s *ProjectTrustStore) SetMany(updates []ProjectTrustUpdate) error {
 		}
 		for _, update := range updates {
 			key := normalizeTrustCwd(update.Path)
+			for _, existing := range trustFileKeys(data, key) {
+				delete(data, existing)
+			}
 			if update.Decision == nil {
-				delete(data, key)
 				continue
 			}
 			data[key] = new(*update.Decision)
@@ -274,3 +352,6 @@ func (s *ProjectTrustStore) SetMany(updates []ProjectTrustUpdate) error {
 		return s.write(data)
 	})
 }
+
+// ProjectTrustDecision is a saved project trust decision: true trusts, false distrusts, nil is undecided (trust-manager.ts:9, boolean | null).
+type ProjectTrustDecision = *bool

@@ -30,17 +30,34 @@ linters:
     # positives). Preserve upstream-faithful user-visible strings via
     # settings.misspell.ignore-words rather than editing them to match US spelling.
     - misspell
+  settings:
+    gocritic:
+      # The default checks stay on. These performance checks find appends that can combine, conversions that copy,
+      # case-insensitive comparisons that allocate, and writes that build a string only to write it. hugeParam and
+      # rangeValCopy (copies of value-typed parameters and range values) are not enabled: they fire hundreds of times
+      # on copies that cost nothing measurable.
+      enabled-checks:
+        - appendCombine
+        - equalFold
+        - preferDecodeRune
+        - preferStringWriter
+        - rangeExprCopy
+        - stringXbytes
   exclusions:
     # Rules here are programmatic suppressions for audited false-positive
     # classes. Site-specific false positives should generally live beside the
     # code as `//nolint:<linter> // rationale` so reviewers see the tradeoff.
     rules:
-      # gosec: subprocess launched with variable: expected in a CLI tool
-      # that execs user-specified commands (git, node, tar, etc.)
+      # gosec G204 (subprocess launched with a variable) is ENABLED: every production site
+      # carries an inline `//nolint:gosec` naming where the program and arguments come from.
+      # Test files are excluded below; they run the fixtures they build on the developer's
+      # or CI's own machine.
       - linters: [gosec]
+        path: ".*_test\\.go"
         text: "G204:"
-      # gosec: file inclusion via variable: expected for a tool that
-      # reads user config files, session files, and extension sources
+      # gosec: file inclusion via variable. Stays excluded: a CLI that runs as the user, as
+      # Pi does, reads the files its user, config and state directory name; a path taint rule
+      # has no signal here.
       - linters: [gosec]
         text: "G304:"
       # gosec: path traversal via taint: same rationale as G304
@@ -54,8 +71,9 @@ linters:
       # intentionally, no crypto needed
       - linters: [gosec]
         text: "G404:"
-      # gosec: potential hardcoded credentials: OAuth client IDs and
-      # redirect URIs are public by design (RFC 8252 §8.4)
+      # gosec: potential hardcoded credentials. Stays excluded: it fires on env var names,
+      # token endpoint URLs and public OAuth identifiers (RFC 8252 §8.4); gitleaks and
+      # TruffleHog scan for real secrets in CI.
       - linters: [gosec]
         text: "G101:"
       # gosec: Slowloris: local-only OAuth callback server bound to
@@ -111,6 +129,19 @@ linters:
       # releases CDN (trusted source), not arbitrary user input
       - linters: [gosec]
         text: "G110:"
+      # gosec: request forgery via taint, in the two files where gosec reports it only in some runs
+      # on identical bytes (install_telemetry.go in two of six runs, remote_catalog_provider.go in
+      # one). An inline pragma there fails nolintlint in every run where gosec stays silent, and
+      # a repository-wide exclusion would make the pragmas that other sites carry (they fire in every
+      # run) unused. The request URL of install_telemetry.go is PIG_INSTALL_TELEMETRY_URL from the
+      # CLI user's own environment or a constant; remote_catalog_provider.go requests the catalog
+      # base URL its caller passes or a constant. A repository the user opened can name a URL only
+      # through project settings.json, mcp.json or extensions, and the boundary for that is project
+      # trust, enforced in internal/codingagent/trust_manager.go (trustRequiringProjectConfigResources),
+      # not by this rule.
+      - linters: [gosec]
+        path: "internal/codingagent/(install_telemetry|remote_catalog_provider)\\.go"
+        text: "G704:"
       # staticcheck: error strings should not be capitalized: upstream
       # error messages are user-facing and intentionally capitalized
       - linters: [staticcheck]
@@ -128,6 +159,8 @@ linters:
         text: "inline: Call of ai.ptrString"
     paths:
       - .upstream
+      # Vendored third-party module source (third_party/jsonschema/FORK.md); its style is upstream's.
+      - third_party
 
 formatters:
   enable:

@@ -31,6 +31,7 @@ func Sh(t testing.TB) string {
 func ScriptCommand(t testing.TB, path string, args ...string) *exec.Cmd {
 	t.Helper()
 	if !needsInterpreter {
+		//nolint:gosec // G204 (class a): program is the repository script path the test passes to ScriptCommand (a fixed test fixture on POSIX), with test-given args.
 		return exec.Command(path, args...)
 	}
 	interpreter := ShebangInterpreter(t, path)
@@ -47,6 +48,7 @@ func ScriptCommand(t testing.TB, path string, args ...string) *exec.Cmd {
 	default:
 		t.Skipf("%s: Windows cannot run a #!%s script", path, interpreter)
 	}
+	//nolint:gosec // G204 (class b): program is the bash, sh, python3, or node path from Bash/Sh (posixTool) or exec.LookPath in the testenv helpers; argv[0] is the script path.
 	return exec.Command(program, append([]string{path}, args...)...)
 }
 
@@ -85,11 +87,26 @@ func python3(t testing.TB) string {
 	return ""
 }
 
+// managedEnvSignals name the variables a lane, CI or release host sets. Node-dependent tests must not pass silently there.
+var managedEnvSignals = []string{"CI", "GITHUB_ACTIONS", "PIG_LANE_SLICE"}
+
 func node(t testing.TB) string {
 	t.Helper()
 	path, err := exec.LookPath("node")
-	if err != nil {
-		t.Skip("node is not on PATH")
+	return requireNode(t, path, err, os.Getenv)
+}
+
+// requireNode returns path when node was found. Without node it skips on a plain developer run, and fails in a lane or CI environment, where a silent skip would hide every node-dependent test.
+func requireNode(t testing.TB, path string, err error, getenv func(string) string) string {
+	t.Helper()
+	if err == nil {
+		return path
 	}
-	return path
+	for _, name := range managedEnvSignals {
+		if getenv(name) != "" {
+			t.Fatalf("node is not on PATH (%v) and %s is set, so this host must run node-dependent tests instead of skipping them; put the mise node on PATH (export PATH=$HOME/.local/share/mise/shims:$PATH)", err, name)
+		}
+	}
+	t.Skip("node is not on PATH")
+	return ""
 }

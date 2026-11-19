@@ -7,6 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf16"
+
+	"github.com/MichaelKinsy/PiG/internal/codingagent/prompts"
+	"github.com/MichaelKinsy/PiG/internal/pioracle"
 )
 
 func TestMkdirTempFixedWidth(t *testing.T) {
@@ -22,10 +26,10 @@ func TestMkdirTempFixedWidth(t *testing.T) {
 	}
 }
 
-func TestMaskCWDSnapshotIDsKeepsWidth(t *testing.T) {
+func TestMaskSnapshotIDsKeepsWidth(t *testing.T) {
 	pig := "/tmp/parity-snap-cwd-0123456789 (main)\n~/x/parity-snap-cwd-98..."
 	pi := "/tmp/parity-snap-cwd-9876543210 (main)\n~/x/parity-snap-cwd-12..."
-	gotPig, gotPi := maskCWDSnapshotIDs(pig), maskCWDSnapshotIDs(pi)
+	gotPig, gotPi := maskSnapshotIDs(pig), maskSnapshotIDs(pi)
 	if gotPig != gotPi {
 		t.Fatalf("masked outputs differ:\n%q\n%q", gotPig, gotPi)
 	}
@@ -35,8 +39,40 @@ func TestMaskCWDSnapshotIDsKeepsWidth(t *testing.T) {
 	if want := "/tmp/parity-snap-cwd-0000000000 (main)\n~/x/parity-snap-cwd-00..."; gotPig != want {
 		t.Fatalf("masked = %q, want %q", gotPig, want)
 	}
-	if other := "parity-snap-PIG_HOME-0123456789"; maskCWDSnapshotIDs(other) != other {
+	if other := "parity-snap-PIG_HOME-0123456789"; maskSnapshotIDs(other) != other {
 		t.Fatalf("masked a non-cwd snapshot name")
+	}
+}
+
+func TestMaskSnapshotIDsCoversExtensionSnapshots(t *testing.T) {
+	pig := ` Extension "/tmp/parity-snap-extension-0123456789/error-stack.mjs" error: stack` + "\n" + ` parity-snap-extension-98...`
+	pi := ` Extension "/tmp/parity-snap-extension-9876543210/error-stack.mjs" error: stack` + "\n" + ` parity-snap-extension-12...`
+	gotPig, gotPi := maskSnapshotIDs(pig), maskSnapshotIDs(pi)
+	if gotPig != gotPi {
+		t.Fatalf("masked outputs differ:\n%q\n%q", gotPig, gotPi)
+	}
+	if want := ` Extension "/tmp/parity-snap-extension-0000000000/error-stack.mjs" error: stack` + "\n" + ` parity-snap-extension-00...`; gotPig != want {
+		t.Fatalf("masked = %q, want %q", gotPig, want)
+	}
+}
+
+// An extension error prints the snapshot path and the TUI wraps it, so the two binaries' snapshot paths must have one length: a one-digit difference moves a wrap point between their screens.
+func TestSnapshotExtensionPathHasFixedWidthSuffix(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "extension.mjs")
+	if err := os.WriteFile(source, []byte("export default function () {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// os.MkdirTemp's suffix is one to ten digits, nine in a fifth of the names: 200 names make a pass by chance impossible in practice.
+	for range 200 {
+		snapshot, err := snapshotExtensionPath(t, source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		base := filepath.Base(filepath.Dir(snapshot))
+		digits, ok := strings.CutPrefix(base, extensionSnapshotPrefix)
+		if !ok || len(digits) != snapshotIDDigits || strings.Trim(digits, "0123456789") != "" {
+			t.Fatalf("snapshot directory %q: want %q followed by %d digits", base, extensionSnapshotPrefix, snapshotIDDigits)
+		}
 	}
 }
 
@@ -134,15 +170,39 @@ func TestPromptPathLengthsBalance(t *testing.T) {
 	if !filepath.IsAbs(promptPathRoot) {
 		t.Fatalf("promptPathRoot %q is not absolute; Pi would print a longer root than pig", promptPathRoot)
 	}
-	digits := strings.Repeat("0", snapshotIDDigits)
-	pigHome := filepath.Join(promptPathRoot, pigHomePrefix+digits)
-	piPackage := filepath.Join(promptPathRoot, piPackagePrefix+digits, piPackageLink)
-	pig := 2*(len(pigHome)+len("/docs")) + d22ConstantGap
+	pigHome := filepath.Join(promptPathRoot, pigHomePrefix+strings.Repeat("0", pigHomeIDDigits))
+	piPackage := filepath.Join(promptPathRoot, piPackagePrefix+strings.Repeat("0", snapshotIDDigits), piPackageLink)
+	pig := 2*(len(pigHome)+len("/docs")+pigBundleDirLen) + d22ConstantGap
 	pi := 3 * len(piPackage)
 	if pig != pi {
 		t.Fatalf("docs path characters: pig %d, pi %d; the system prompts would differ in length", pig, pi)
 	}
 	if pigHomePrefix != "parity-snap-PIG_HOME-" {
 		t.Fatalf("pigHomePrefix %q must match snapshotEnvDirs naming", pigHomePrefix)
+	}
+}
+
+// The context estimate of a faux turn is chars/4 of the system message, so one character of difference between the two prompts can move a token. The runner's docs paths exist to make pig's preamble and docs section exactly as long as Pi's; TestPromptPathLengthsBalance only checks that the constants add up. This test measures the real sections at the runner's path lengths, so a wording change on either side (such as Pi 705d047c dropping four product-name spellings from its docs section) fails here and names the constant to set, rather than appearing as a one-token drift in rpc/26-rpc-session-stats-context-estimate and fullscreen/10-main-screen-compaction-settled.
+func TestPromptPathLengthsMatchRealPrompts(t *testing.T) {
+	pigHome := filepath.Join(promptPathRoot, pigHomePrefix+strings.Repeat("0", pigHomeIDDigits))
+	pigDocs := filepath.Join(pigHome, "docs") + "/" + strings.Repeat("b", pigBundleDirLen-len("/"))
+	piPackage := filepath.Join(promptPathRoot, piPackagePrefix+strings.Repeat("0", snapshotIDDigits), piPackageLink)
+
+	var pigChars int
+	for _, section := range prompts.BuildSystemPromptSections(prompts.Options{Cwd: "/tmp", PigDocsPath: pigDocs}) {
+		if section.Name == "preamble" || section.Name == "docs" {
+			pigChars += len(utf16.Encode([]rune(*section.Value)))
+		}
+	}
+	var pi struct{ Preamble, Docs string }
+	pioracle.Run(t, `
+const { buildSystemPromptSections } = await load("pi-coding-agent/core/system-prompt.js");
+const sections = buildSystemPromptSections({ cwd: "/tmp" });
+emit({ Preamble: sections.preamble, Docs: sections.docs });`, nil, &pi, "PI_PACKAGE_DIR="+piPackage)
+	piChars := len(utf16.Encode([]rune(pi.Preamble + pi.Docs)))
+
+	if pigChars != piChars {
+		t.Fatalf("pig's preamble and docs section are %d characters, Pi's are %d at the runner's docs paths: set d22ConstantGap to %d and size pigHomeIDDigits and piPackageLink so that 3*len(piPackageDir) == 2*(len(pigHome)+len(\"/docs\")+pigBundleDirLen) + d22ConstantGap",
+			pigChars, piChars, d22ConstantGap+pigChars-piChars)
 	}
 }

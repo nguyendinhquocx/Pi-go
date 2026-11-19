@@ -14,24 +14,26 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os/exec"
 	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/MichaelKinsy/PiG/internal/coding/pigidentity"
 	"github.com/MichaelKinsy/PiG/internal/coding/pigversion"
 )
 
 func TestPiUserAgentFormat(t *testing.T) {
-	got := PiUserAgent()
+	got := FormatUserAgent(nil)
 	wantPrefix := "pig/" + pigversion.Version + " ("
 	if !strings.HasPrefix(got, wantPrefix) {
-		t.Fatalf("PiUserAgent() = %q, want prefix %q", got, wantPrefix)
+		t.Fatalf("FormatUserAgent(nil) = %q, want prefix %q", got, wantPrefix)
 	}
 	// pig/<version> (<platform> <release>; <arch>), mirroring upstream's
 	// "pi (<platform> <release>; <arch>)" shape with PiG's product name.
 	if !regexp.MustCompile(`^pig/\S+ \([^;()]+; [^()]+\)$`).MatchString(got) {
-		t.Fatalf("PiUserAgent() = %q, want pig/<version> (<platform> <release>; <arch>)", got)
+		t.Fatalf("FormatUserAgent(nil) = %q, want pig/<version> (<platform> <release>; <arch>)", got)
 	}
 
 	// Upstream's AI helper reads node:os. Obtain its machine identity independently of PiG's mappings; D65 changes only the product identity on this surface.
@@ -41,7 +43,7 @@ func TestPiUserAgentFormat(t *testing.T) {
 		t.Fatalf("read Node OS identity: %v", err)
 	}
 	if want := "pig/" + pigversion.Version + string(machine); got != want {
-		t.Fatalf("PiUserAgent() = %q, want independent Node OS identity %q", got, want)
+		t.Fatalf("FormatUserAgent(nil) = %q, want independent Node OS identity %q", got, want)
 	}
 }
 
@@ -51,8 +53,8 @@ func TestProductVersionAvailableWithoutMain(t *testing.T) {
 	if ProductVersion != pigversion.Version {
 		t.Fatalf("ProductVersion = %q, want %q", ProductVersion, pigversion.Version)
 	}
-	if got, want := PiUserAgent(), "pig/"+pigversion.Version+" ("; !strings.HasPrefix(got, want) {
-		t.Fatalf("PiUserAgent() = %q, want prefix %q", got, want)
+	if got, want := FormatUserAgent(nil), "pig/"+pigversion.Version+" ("; !strings.HasPrefix(got, want) {
+		t.Fatalf("FormatUserAgent(nil) = %q, want prefix %q", got, want)
 	}
 }
 
@@ -147,8 +149,7 @@ func userAgentProviderCases(t *testing.T) []userAgentProviderCase {
 			name: "azure-openai-responses",
 			build: func(client *http.Client) Provider {
 				p, ok := NewAzureOpenAIResponsesProvider(AzureOpenAIResponsesConfig{
-					APIKey: "azure-key", Model: "gpt-5",
-					AzureResourceName: "res", AzureDeploymentName: "dep",
+					APIKey: "azure-key", Model: "gpt-5", BaseURL: "https://res.openai.azure.com/openai/v1",
 				}).(*openAIResponsesProvider)
 				if !ok {
 					t.Fatal("NewAzureOpenAIResponsesProvider did not return *openAIResponsesProvider")
@@ -185,26 +186,16 @@ func userAgentProviderCases(t *testing.T) []userAgentProviderCase {
 		{
 			name: "google-vertex",
 			build: func(client *http.Client) Provider {
-				p, ok := NewGoogleVertexProvider(GoogleVertexConfig{
+				return newGoogleVertexTestProvider(GoogleVertexConfig{
 					APIKey: "key", Model: "gemini-2.5-flash", Project: "proj", Location: "us-central1",
-				}).(*googleVertexProvider)
-				if !ok {
-					t.Fatal("NewGoogleVertexProvider did not return *googleVertexProvider")
-				}
-				p.client = client
-				return p
+				}, client)
 			},
 			sse: userAgentGoogleSSE,
 		},
 		{
 			name: "mistral-conversations",
 			build: func(client *http.Client) Provider {
-				p, ok := NewMistralProvider(MistralConfig{APIKey: "key", Model: "mistral-large-latest", BaseURL: "https://example.test/v1"}).(*mistralProvider)
-				if !ok {
-					t.Fatal("NewMistralProvider did not return *mistralProvider")
-				}
-				p.client = client
-				return p
+				return newMistralTestProvider(MistralConfig{APIKey: "key", Model: "mistral-large-latest", BaseURL: "https://example.test/v1"}, client)
 			},
 			sse: userAgentMistralSSE,
 		},
@@ -212,10 +203,10 @@ func userAgentProviderCases(t *testing.T) []userAgentProviderCase {
 }
 
 // TestProviderDefaultUserAgent proves every non-Anthropic HTTP provider
-// stamps PiUserAgent() as its default User-Agent, mirroring upstream's
+// stamps FormatUserAgent(nil) as its default User-Agent, mirroring upstream's
 // `{ "User-Agent": getPiUserAgent(), ...model.headers }` seed.
 func TestProviderDefaultUserAgent(t *testing.T) {
-	want := PiUserAgent()
+	want := FormatUserAgent(nil)
 	for _, tc := range userAgentProviderCases(t) {
 		t.Run(tc.name, func(t *testing.T) {
 			var header http.Header
@@ -232,16 +223,15 @@ func TestProviderDefaultUserAgent(t *testing.T) {
 	}
 }
 
-// TestProviderUserAgentOverridePrecedence proves ordinary providers preserve
-// upstream's model/request header precedence, while Codex reapplies its
-// product identity after both header sources in buildBaseCodexHeaders.
+// TestProviderUserAgentOverridePrecedence proves every provider preserves
+// upstream's model/request header precedence. Since Pi 1.1.0 Codex sets its
+// product identity first as well (buildBaseCodexHeaders, #10429).
 func TestProviderUserAgentOverridePrecedence(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		build         func(client *http.Client, extraHeaders map[string]string) Provider
 		sse           string
 		optionsHeader ProviderHeaders
-		forceDefault  bool
 	}{
 		{
 			name: "openai-completions model header",
@@ -261,7 +251,7 @@ func TestProviderUserAgentOverridePrecedence(t *testing.T) {
 			optionsHeader: ProviderHeaders{"User-Agent": new("request-client")},
 		},
 		{
-			name: "openai-codex-responses forces product identity",
+			name: "openai-codex-responses request header outranks model header",
 			build: func(client *http.Client, extraHeaders map[string]string) Provider {
 				p, ok := NewOpenAICodexResponsesProvider(OpenAICodexResponsesConfig{APIKey: codexTestTokenForAccount("user-agent"), Model: "gpt-5"}).(*openAIResponsesProvider)
 				if !ok {
@@ -273,7 +263,6 @@ func TestProviderUserAgentOverridePrecedence(t *testing.T) {
 			},
 			sse:           userAgentOpenAIResponsesSSE,
 			optionsHeader: ProviderHeaders{"User-Agent": new("request-client")},
-			forceDefault:  true,
 		},
 		{
 			name: "google-generative-ai model header",
@@ -286,8 +275,7 @@ func TestProviderUserAgentOverridePrecedence(t *testing.T) {
 		{
 			name: "mistral-conversations model header",
 			build: func(client *http.Client, extraHeaders map[string]string) Provider {
-				p := &mistralProvider{cfg: MistralConfig{BaseURL: "https://example.test/v1", APIKey: "key", Model: "mistral-large-latest", ExtraHeaders: extraHeaders}, client: client}
-				return p
+				return newMistralTestProvider(MistralConfig{BaseURL: "https://example.test/v1", APIKey: "key", Model: "mistral-large-latest", ExtraHeaders: extraHeaders}, client)
 			},
 			sse: userAgentMistralSSE,
 		},
@@ -304,13 +292,50 @@ func TestProviderUserAgentOverridePrecedence(t *testing.T) {
 				opts.Headers = tc.optionsHeader
 				want = "request-client"
 			}
-			if tc.forceDefault {
-				want = PiUserAgent()
-			}
 			drainProviderStream(t, provider, opts)
 			if got := header.Get("User-Agent"); got != want {
 				t.Errorf("User-Agent = %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+// openai-codex-stream.test.ts "lets model and caller headers override originator and User-Agent" (#10429): the identity headers are defaults, Authorization is not.
+func TestCodexModelAndCallerHeadersOverrideOriginatorAndUserAgent(t *testing.T) {
+	token := codexTestTokenForAccount("override")
+	var header http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header = r.Header.Clone()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(userAgentOpenAIResponsesSSE))
+	}))
+	t.Cleanup(server.Close)
+	// The model's headers reach the provider the way Pi's streamOpenAICodexResponses(model, ...) reads model.headers.
+	model := cloneGeneratedModel(t, "openai-codex/gpt-5.6-sol").ToModel()
+	model.ProviderMeta.BaseURL = server.URL
+	model.ProviderMeta.Headers = map[string]string{"Originator": "my-app"}
+	stream, err := StreamSimple(t.Context(), model, NormalizeContext(Context{Messages: []Message{UserMessage{Content: UserText("Say hello")}}}), StreamOptions{
+		APIKey: token, Transport: TransportSSE, Headers: ProviderHeaders{"user-agent": new("my-app/1.0"), "Authorization": new("Bearer ignored")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream.Result()
+	if got := header.Get("originator"); got != "my-app" {
+		t.Errorf("originator = %q, want the model header", got)
+	}
+	if got := header.Get("User-Agent"); got != "my-app/1.0" {
+		t.Errorf("User-Agent = %q, want the caller header", got)
+	}
+	if got := header.Get("Authorization"); got != "Bearer "+token {
+		t.Errorf("Authorization = %q, want the token", got)
+	}
+	// The WebSocket handshake builds the same base headers.
+	ws := codexWebSocketHeaders(ClientIdentityTarget{}, nil, map[string]string{"originator": "my-app"}, ProviderHeaders{"user-agent": new("my-app/1.0")}, "token", "acct", "request")
+	if ws.Get("originator") != "my-app" || ws.Get("User-Agent") != "my-app/1.0" {
+		t.Errorf("websocket originator = %q, User-Agent = %q", ws.Get("originator"), ws.Get("User-Agent"))
+	}
+	if defaults := codexWebSocketHeaders(ClientIdentityTarget{}, nil, nil, nil, "token", "acct", "request"); defaults.Get("User-Agent") != FormatUserAgent(nil) || defaults.Get("originator") != pigidentity.CodexOriginator {
+		t.Errorf("default websocket identity = %q / %q", defaults.Get("originator"), defaults.Get("User-Agent"))
 	}
 }

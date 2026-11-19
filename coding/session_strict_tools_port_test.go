@@ -1,5 +1,7 @@
 package coding
 
+// pi: packages/coding-agent/src/core/tools/tool-definition-wrapper.ts
+
 import (
 	"encoding/json"
 	"os"
@@ -10,13 +12,14 @@ import (
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
+	"github.com/MichaelKinsy/PiG/tui"
 )
 
 func TestBuiltinStrictOptOutPort(t *testing.T) {
 	// .upstream/v0.87.1/packages/coding-agent/test/builtin-tool-strict-mode.test.ts:34
 	t.Run("preserves explicit opt-outs when wrapping definitions for execution", func(t *testing.T) {
 		strict := []string{"read", "bash", "powershell", "edit", "write"}
-		for _, tool := range tools.CreateAllTools(t.TempDir(), nil, "") {
+		for _, tool := range tools.CreateAllTools(t.TempDir(), nil) {
 			if !slices.Contains(strict, tool.Name()) {
 				continue
 			}
@@ -26,9 +29,11 @@ func TestBuiltinStrictOptOutPort(t *testing.T) {
 			}
 			// Builtin rendering is a separate Go component layer. Non-nil callbacks
 			// make preservation through the definition wrapper observable here.
-			definition.RenderCall = func(json.RawMessage, extension.Theme, extension.ToolRenderContext) extension.Component { return "call" }
+			definition.RenderCall = func(json.RawMessage, extension.Theme, extension.ToolRenderContext) extension.Component {
+				return tui.NewText("call")
+			}
 			definition.RenderResult = func(extension.AgentToolResult, extension.ToolRenderResultOptions, extension.Theme, extension.ToolRenderContext) extension.Component {
-				return "result"
+				return tui.NewText("result")
 			}
 			override := definition
 			override.ConstrainedSampling = json.RawMessage(`false`)

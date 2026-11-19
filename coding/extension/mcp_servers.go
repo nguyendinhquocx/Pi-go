@@ -3,12 +3,13 @@ package extension
 import (
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"regexp"
 	"slices"
 	"strings"
 	"sync"
 
+	"github.com/MichaelKinsy/PiG/internal/changeobservers"
+	"github.com/MichaelKinsy/PiG/internal/configvalue"
 	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
 	"github.com/MichaelKinsy/PiG/internal/nodeurl"
 
@@ -74,11 +75,13 @@ type McpOAuthConfig struct {
 	// ClientName is the `client_name` sent with dynamic client registration,
 	// for servers that only accept known clients. Default: the app name.
 	ClientName string `json:"clientName,omitempty"`
-	// ClientRegistration is how pi identifies itself without ClientID. `dcr`
-	// (default): dynamic client registration. `cimd`: pi's Client ID Metadata
-	// Document on pi.dev, for authorization servers that allow pi by that URL.
-	// The server must support it for public clients, and the callback must use
-	// the default path `/callback`.
+	// ClientRegistration is how pi identifies itself without ClientID. `auto`
+	// (default): pi's Client ID Metadata Document on pi.dev when the
+	// authorization server supports it for public clients, otherwise dynamic
+	// client registration; with ClientName or a CallbackURL other than
+	// `/callback` on localhost or 127.0.0.1, always dynamic client
+	// registration. `cimd`: always the document, and sign-in fails without
+	// support. `dcr`: always dynamic client registration.
 	ClientRegistration string `json:"clientRegistration,omitempty"`
 	// AuthServerMetadataURL is an authorization server metadata document
 	// (RFC 8414 or OpenID Connect discovery) to use instead of discovery
@@ -86,6 +89,22 @@ type McpOAuthConfig struct {
 	// server or none. The document is trusted as configured. It must use
 	// https, except on loopback hosts.
 	AuthServerMetadataURL string `json:"authServerMetadataUrl,omitempty"`
+}
+
+// UnmarshalJSON reads `callbackPort` as a JavaScript number, so `8080.0` and `8e3` are the integers validation accepts.
+func (c *McpOAuthConfig) UnmarshalJSON(data []byte) error {
+	type plain McpOAuthConfig
+	aux := struct {
+		*plain
+		CallbackPort *float64 `json:"callbackPort"`
+	}{plain: (*plain)(c)}
+	err := json.Unmarshal(data, &aux)
+	c.CallbackPort = nil
+	if aux.CallbackPort != nil && *aux.CallbackPort == float64(int(*aux.CallbackPort)) {
+		port := int(*aux.CallbackPort)
+		c.CallbackPort = &port
+	}
+	return err
 }
 
 // McpAuthConfig sends the token of a pi provider (`/login <provider>`) as the
@@ -398,22 +417,24 @@ func validateOAuth(fields map[string]json.RawMessage, name string) string {
 		}
 	}
 	// upstream: mcp-servers.ts validateOAuth (clientRegistration, 1.0.1 #10302).
-	if v, ok := oauth["clientRegistration"]; ok && string(v) != `"dcr"` {
+	if v, ok := oauth["clientRegistration"]; ok && string(v) != `"auto"` && string(v) != `"dcr"` {
 		if string(v) != `"cimd"` {
-			return `oauth.clientRegistration must be "dcr" or "cimd"`
+			return `oauth.clientRegistration must be "auto", "dcr", or "cimd"`
 		}
 		_, hasClientID := oauth["clientId"]
 		_, hasClientName := oauth["clientName"]
 		if hasClientID || hasClientName {
 			return `oauth.clientRegistration "cimd" cannot be combined with oauth.clientId or oauth.clientName`
 		}
+		var callback string
 		if raw, ok := oauth["callbackUrl"]; ok {
 			var s string
 			if isString(raw) && json.Unmarshal(raw, &s) == nil {
-				if u, err := nodeurl.ParseHTTPURL(s); err == nil && (u.Hostname == "[::1]" || callbackPathname(s) != "/callback") {
-					return `oauth.clientRegistration "cimd" requires oauth.callbackUrl on localhost or 127.0.0.1 with path /callback`
-				}
+				callback = s
 			}
+		}
+		if !IsClientMetadataDocumentCallback(callback) {
+			return `oauth.clientRegistration "cimd" requires oauth.callbackUrl on localhost or 127.0.0.1 with path /callback`
 		}
 	}
 	if v, ok := oauth["authServerMetadataUrl"]; ok {
@@ -426,21 +447,6 @@ func validateOAuth(fields map[string]json.RawMessage, name string) string {
 		}
 	}
 	return ""
-}
-
-// callbackPathname is `new URL(raw).pathname` for a validated loopback
-// callback URL: dot segments removed and an empty path reported as "/".
-func callbackPathname(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return ""
-	}
-	// Resolving the path against itself removes "." and ".." segments as the WHATWG parser does.
-	path := u.ResolveReference(&url.URL{Path: u.Path, RawPath: u.RawPath}).EscapedPath()
-	if path == "" {
-		return "/"
-	}
-	return path
 }
 
 func objectMap(raw json.RawMessage) (map[string]json.RawMessage, bool) {
@@ -527,15 +533,21 @@ func ValidateMcpServerConfig(name string, value json.RawMessage) (McpServerConfi
 			return McpServerConfig{}, fmt.Sprintf(`server "%s": timeout must be a positive number of seconds`, name)
 		}
 	}
-	typ, _ := stringField(fields, "type")
+	// upstream: mcp-servers.ts validateMcpServerConfig (`type === undefined || type === "http"`): a `type` that is present but not a string names no transport.
+	typ, typeIsString := stringField(fields, "type")
+	_, typePresent := fields["type"]
+	typeIs := func(names ...string) bool {
+		return !typePresent || (typeIsString && slices.Contains(names, typ))
+	}
 	if typ == "sse" {
 		return McpServerConfig{}, fmt.Sprintf(`server "%s": legacy SSE transport is not supported; use the streamable HTTP URL`, name)
 	}
 
 	rawURL, hasURL := stringField(fields, "url")
-	if hasURL && (typ == "" || typ == "http" || typ == "streamable-http") {
+	if hasURL && typeIs("http", "streamable-http") {
 		// upstream: mcp-servers.ts validateMcpServerConfig (`URL.canParse(value.url) && /^https?:$/.test(new URL(value.url).protocol)`).
-		parsedURL, err := nodeurl.ParseHTTPURL(rawURL)
+		// pig divergence (D156): the URL is checked after environment expansion, as headers and env values are resolved (Pi #10654).
+		parsedURL, err := nodeurl.ParseHTTPURL(ExpandMcpURL(rawURL))
 		if err != nil {
 			return McpServerConfig{}, fmt.Sprintf(`server "%s": url must be an http or https URL`, name)
 		}
@@ -555,9 +567,9 @@ func ValidateMcpServerConfig(name string, value json.RawMessage) (McpServerConfi
 				return McpServerConfig{}, fmt.Sprintf(`server "%s": auth requires an https URL, or http on localhost, 127.0.0.1, or [::1]`, name)
 			}
 		}
-		return decodeMcpServerConfig(name, value)
+		return decodeMcpServerConfig(value), ""
 	}
-	if _, hasCommand := stringField(fields, "command"); hasCommand && (typ == "" || typ == "stdio") {
+	if _, hasCommand := stringField(fields, "command"); hasCommand && typeIs("stdio") {
 		if raw, ok := fields["args"]; ok {
 			var args []json.RawMessage
 			valid := len(raw) > 0 && raw[0] == '[' && json.Unmarshal(raw, &args) == nil
@@ -574,17 +586,32 @@ func ValidateMcpServerConfig(name string, value json.RawMessage) (McpServerConfi
 		if raw, ok := fields["cwd"]; ok && !isString(raw) {
 			return McpServerConfig{}, fmt.Sprintf(`server "%s": cwd must be a string`, name)
 		}
-		return decodeMcpServerConfig(name, value)
+		return decodeMcpServerConfig(value), ""
 	}
 	return McpServerConfig{}, fmt.Sprintf(`server "%s" needs either "command" (stdio) or "url" (streamable HTTP)`, name)
 }
 
-func decodeMcpServerConfig(name string, value json.RawMessage) (McpServerConfig, string) {
-	var config McpServerConfig
-	if err := json.Unmarshal(value, &config); err != nil {
-		return McpServerConfig{}, fmt.Sprintf(`server "%s": %s`, name, err)
+// ExpandMcpURL expands the environment references of a server URL the way header and env values are resolved
+// (`$VAR`, `${VAR}`, `$$`). A URL that cannot be expanded now (a `!command`, or a variable that is unset) stays as
+// written, so a literal URL that contains a `$` keeps working. Validation, the transport and the OAuth URL use the
+// expansion; the stored config keeps the reference.
+//
+// pig divergence (D156): Pi uses the URL as written (Pi #10654).
+func ExpandMcpURL(raw string) string {
+	if configvalue.IsCommandConfigValue(raw) || !configvalue.IsConfigValueConfigured(raw, nil) {
+		return raw
 	}
-	return config, ""
+	return configvalue.Resolve(raw, nil)
+}
+
+// decodeMcpServerConfig reads the members the host uses from a validated entry. Validation checks only the members of the entry's transport, so a member of the other transport (or an unused one) with a value of another type is ignored, as it is in Pi's untyped object.
+//
+// upstream: mcp-servers.ts validateMcpServerConfig (returns the entry as is after checking the transport's members)
+func decodeMcpServerConfig(value json.RawMessage) McpServerConfig {
+	var config McpServerConfig
+	// The value is valid JSON; an error names the first member that does not fit its Go type, and the decoder keeps every member that does.
+	_ = json.Unmarshal(value, &config)
+	return config
 }
 
 // RegisteredMcpServer is a server an extension registered with
@@ -613,13 +640,14 @@ func (s RegisteredMcpServer) MarshalJSON() ([]byte, error) {
 }
 
 // McpServerRegistry holds the servers registered by the extensions of one
-// runtime. It is safe for concurrent use; the change listener runs after the
-// registry's lock is released.
+// runtime. It is safe for concurrent use; the change listener and the change
+// observers run after the registry's lock is released.
 type McpServerRegistry struct {
 	mu             sync.Mutex
 	order          []string
 	servers        map[string]RegisteredMcpServer
 	changeListener func()
+	observers      changeobservers.Observers
 }
 
 // NewMcpServerRegistry returns an empty registry.
@@ -640,6 +668,7 @@ func (r *McpServerRegistry) Register(server RegisteredMcpServer) {
 	if listener != nil {
 		listener()
 	}
+	r.observers.Notify()
 }
 
 // Unregister removes a server registered by extensionPath. Servers of other
@@ -658,6 +687,7 @@ func (r *McpServerRegistry) Unregister(name, extensionPath string) {
 	if listener != nil {
 		listener()
 	}
+	r.observers.Notify()
 }
 
 // Get returns a registered server.
@@ -694,4 +724,23 @@ func (r *McpServerRegistry) SetChangeListener(listener func()) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.changeListener = listener
+}
+
+// ObserveChange registers observe to run after every change to the registry, after the change listener. Upstream's registry has the one listener
+// the runner owns (runner.ts:465-467), and `pi.getMcpServers()` reads the registry live (loader.ts:495-497); an owner that hands a copy of the list to
+// a runtime that has no `mcp_servers_change` handler reports each change through this. observe runs on the goroutine that changed the registry, after
+// it released its lock, and must return at once. The returned function removes it and can be called repeatedly.
+func (r *McpServerRegistry) ObserveChange(observe func()) func() {
+	return r.observers.Add(observe)
+}
+
+// IsClientMetadataDocumentCallback reports whether pi's Client ID Metadata Documents list a redirect URI for the loopback
+// callbackUrl: they list `/callback` on localhost and 127.0.0.1, on any port. An empty callbackUrl means pi uses such a URI.
+// upstream: packages/coding-agent/src/core/mcp-servers.ts:isClientMetadataDocumentCallback
+func IsClientMetadataDocumentCallback(callbackURL string) bool {
+	if callbackURL == "" {
+		return true
+	}
+	u, err := nodeurl.ParseHTTPURL(callbackURL)
+	return err == nil && u.Hostname != "[::1]" && u.Pathname == "/callback"
 }

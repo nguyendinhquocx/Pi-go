@@ -2,6 +2,7 @@ package coding
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"reflect"
@@ -69,6 +70,42 @@ func TestModelRuntimeClassifiersUpstream(t *testing.T) {
 		}
 	})
 
+	// model-runtime.ts:808 (v1.1.0): assertClassifierInputSupported runs before auth, so a model without image input never
+	// reaches the provider, and GPT-6 Luna takes images through the runtime-resolved API key.
+	t.Run("rejects classifier images for models without image input and sends them to GPT-6 Luna", func(t *testing.T) {
+		services, _ := nativeCompatServices(t, "", nil)
+		runtime := services.ModelRuntime()
+		withImages := classifiersTestContext
+		withImages.Images = []ai.ImageContent{{Data: "aW1hZ2U=", MimeType: "image/png"}}
+		// typesafe/jev-latest takes images since Pi v1.4.0; opencode/jev-1.13 is the text-only classifier.
+		jev, _ := runtime.GetModelOfType(ai.ModelTypeClassifier, "opencode", "jev-1.13").(*ai.ClassifierModel)
+		luna, _ := runtime.GetModelOfType(ai.ModelTypeClassifier, "openai", "gpt-6-luna").(*ai.ClassifierModel)
+		if jev == nil || luna == nil {
+			t.Fatalf("jev=%v luna=%v", jev, luna)
+		}
+
+		rejected := runtime.Classify(t.Context(), jev, withImages)
+		if rejected.StopReason != ai.ClassifierStopReasonError || rejected.ErrorMessage != "Model opencode/jev-1.13 does not accept image input" {
+			t.Fatalf("rejected = %+v", rejected)
+		}
+
+		services.Registry().SetRuntimeAPIKey("openai", "sk-openai")
+		var url, authorization, input string
+		fetch := classifiersTestFetch(func(request *http.Request) (*http.Response, error) {
+			url, authorization = request.URL.String(), request.Header.Get("Authorization")
+			body, _ := io.ReadAll(request.Body)
+			input = string(body)
+			return &http.Response{StatusCode: 200, Status: "OK", Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"answers":[{"type":"predicate","name":"approved","probability":0.7}]}`))}, nil
+		})
+		result := runtime.Classify(t.Context(), luna, withImages, ai.ModelsClassifierOptions{ClassifierOptions: ai.ClassifierOptions{Fetch: &http.Client{Transport: fetch}}})
+		if result.StopReason != ai.ClassifierStopReasonStop || len(result.Answers) != 1 || result.Answers[0].Answer != (ai.ClassifierBoolAnswer{Probability: 0.7}) {
+			t.Fatalf("result = %+v", result)
+		}
+		if url != "https://api.openai.com/v1/decisions" || authorization != "Bearer sk-openai" || !strings.Contains(input, `"image_url":"data:image/png;base64,aW1hZ2U="`) {
+			t.Fatalf("url=%s authorization=%s body=%s", url, authorization, input)
+		}
+	})
+
 	// model-runtime-images.test.ts:143
 	t.Run("registers extension image and classifier models with their implementations", func(t *testing.T) {
 		services, _ := nativeCompatServices(t, "", nil)
@@ -123,6 +160,109 @@ func TestModelRuntimeClassifiersUpstream(t *testing.T) {
 		}
 		if provider := runtime.GetProvider("typesafe"); provider == nil || provider.Classify == nil {
 			t.Fatalf("typesafe = %+v", provider)
+		}
+	})
+}
+
+// model-registry.ts classify and generateImages are the runtime's: the options reach the provider through the registry, and a classification that fails because its request was cancelled settles as an aborted result, not an error.
+// Pi: packages/coding-agent/src/core/model-registry.ts classify/generateImages; model-runtime.ts classify.
+func TestModelRegistryClassifyForwardsOptionsAndACancelledRequestIsAborted(t *testing.T) {
+	services, _ := nativeCompatServices(t, "", nil)
+	services.Registry().SetRuntimeAPIKey("typesafe", "sk-typesafe")
+	runtime := services.ModelRuntime()
+	jev, _ := runtime.GetModelOfType(ai.ModelTypeClassifier, "typesafe", "jev-latest").(*ai.ClassifierModel)
+	if jev == nil {
+		t.Fatal("jev-latest is missing")
+	}
+	var requests int
+	fetch := classifiersTestFetch(func(*http.Request) (*http.Response, error) {
+		requests++
+		return &http.Response{StatusCode: 200, Status: "OK", Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"answers":{"approved":{"type":"noul","noul":0.8}}}`))}, nil
+	})
+	options := ai.ModelsClassifierOptions{ClassifierOptions: ai.ClassifierOptions{Fetch: &http.Client{Transport: fetch}}}
+	var registry *ModelRegistry = services.Registry()
+	if result := registry.Classify(t.Context(), jev, classifiersTestContext, options); result.StopReason != ai.ClassifierStopReasonStop || requests != 1 {
+		t.Fatalf("registry classify with options = %+v after %d requests", result, requests)
+	}
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if result := runtime.Classify(cancelled, jev, classifiersTestContext, options); result.StopReason != ai.ClassifierStopReasonAborted {
+		t.Errorf("a cancelled classification = %+v, want an aborted result", result)
+	}
+
+	var apiKeys []string
+	image := imagesTestImageModel("ignored", "shared")
+	if err := runtime.RegisterProvider("registry-images", ProviderConfigInput{
+		APIKey: "provider-key", Models: []ai.AnyModel{image},
+		Images: ai.ProviderImageAPIMap{"test-images": {GenerateImages: func(_ context.Context, model *ai.ImageModel, _ ai.ImagesContext, options ai.ImagesOptions) (ai.AssistantImages, error) {
+			apiKeys = append(apiKeys, options.APIKey)
+			return imagesTestOKResult(model), nil
+		}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	imageModel, _ := runtime.GetModelOfType(ai.ModelTypeImage, "registry-images", "shared").(*ai.ImageModel)
+	if imageModel == nil {
+		t.Fatal("the registered image model is missing")
+	}
+	if result := registry.GenerateImages(t.Context(), imageModel, imagesTestContext, ai.ModelsImagesOptions{ImagesOptions: ai.ImagesOptions{APIKey: "caller-key"}}); result.StopReason != ai.ImagesStopReasonStop {
+		t.Fatalf("registry generateImages = %+v", result)
+	}
+	if len(apiKeys) != 1 || apiKeys[0] != "caller-key" {
+		t.Errorf("the provider saw API keys %q, want the caller's option to reach it through the registry", apiKeys)
+	}
+}
+
+// Ports the two models.json image cases of packages/coding-agent/test/model-runtime-classifiers.test.ts (Pi 7f225f25).
+func TestModelRuntimeClassifierImagesUpstream(t *testing.T) {
+	withImage := classifiersTestContext
+	withImage.Images = []ai.ImageContent{{Data: "cG5n", MimeType: "image/png"}}
+	type captured struct {
+		url, optIn string
+		body       map[string]any
+	}
+	captureImageRequest := func(t *testing.T, config, provider, id string) captured {
+		t.Helper()
+		services, _ := nativeCompatServices(t, config, nil)
+		runtime := services.ModelRuntime()
+		services.Registry().SetRuntimeAPIKey(provider, "secret")
+		model, _ := runtime.GetModelOfType(ai.ModelTypeClassifier, provider, id).(*ai.ClassifierModel)
+		if model == nil {
+			t.Fatalf("missing classifier model %s/%s", provider, id)
+		}
+		var requests []captured
+		fetch := classifiersTestFetch(func(request *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(request.Body)
+			var body map[string]any
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Errorf("body %s: %v", raw, err)
+			}
+			requests = append(requests, captured{url: request.URL.String(), optIn: request.Header.Get("typesafe-danger-zone-images"), body: body})
+			return &http.Response{StatusCode: 200, Status: "OK", Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"answers":{"approved":{"type":"noul","noul":0.8}}}`))}, nil
+		})
+		result := runtime.Classify(t.Context(), model, withImage, ai.ModelsClassifierOptions{ClassifierOptions: ai.ClassifierOptions{Fetch: &http.Client{Transport: fetch}}})
+		if result.StopReason != ai.ClassifierStopReasonStop || len(requests) != 1 {
+			t.Fatalf("result = %+v, requests = %d", result, len(requests))
+		}
+		return requests[0]
+	}
+	wantState := []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,cG5n"}}, map[string]any{"text": "Looks good"}}
+
+	// model-runtime-classifiers.test.ts:88 (Pi 7f225f25)
+	t.Run("keeps OpenRouter's image form when models.json routes OpenRouter through a proxy", func(t *testing.T) {
+		request := captureImageRequest(t, `{"providers":{"openrouter":{"baseUrl":"https://proxy.example.com/v1"}}}`, "openrouter", "typesafe/jev-1.14")
+
+		// OpenRouter answers TypeSafe assets with 200 but drops the images.
+		if request.url != "https://proxy.example.com/v1/systemone" || !reflect.DeepEqual(request.body["state"], wantState) || request.body["assets"] != nil || request.optIn != "" {
+			t.Fatalf("request = %+v", request)
+		}
+	})
+	// model-runtime-classifiers.test.ts:104 (Pi 7f225f25)
+	t.Run("applies provider compat from models.json to classifier models", func(t *testing.T) {
+		request := captureImageRequest(t, `{"providers":{"typesafe":{"baseUrl":"https://proxy.example.com/v1","compat":{"imageInput":"state-image-urls","sendImageOptInHeader":false}}}}`, "typesafe", "jev-latest")
+
+		if request.url != "https://proxy.example.com/v1/systemone" || !reflect.DeepEqual(request.body["state"], wantState) || request.optIn != "" {
+			t.Fatalf("request = %+v", request)
 		}
 	})
 }

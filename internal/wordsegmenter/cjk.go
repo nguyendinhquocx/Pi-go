@@ -1,8 +1,11 @@
+//go:build !pig_strip_word_dictionaries
+
 // © 2016 and later: Unicode, Inc. and others.
 // Copyright (C) 2006-2016, International Business Machines Corporation and others.
 // ICU CjkBreakEngine translation; see LICENSES/Unicode-3.0.txt and LICENSES/LicenseRef-ICU-CJK.txt.
 
-// Package wordsegmenter implements word segments used by the terminal editor.
+// Ports packages/tui/src/utils.ts (getWordSegmenter: the CJK dictionary engine of Intl.Segmenter)
+
 package wordsegmenter
 
 import (
@@ -13,6 +16,9 @@ import (
 	"strings"
 
 	"golang.org/x/text/unicode/norm"
+
+	"github.com/MichaelKinsy/PiG/internal/allocsize"
+	"github.com/MichaelKinsy/PiG/internal/pigstrip"
 )
 
 // The immutable index is generated from ICU release-78.3 cjdict.txt. Lookup borrows its embedded bytes; it does not build a dictionary map on the input loop.
@@ -21,6 +27,7 @@ import (
 var cjkDictionary string
 
 func dictionaryUint32(offset int) int {
+	//portlint:allow utf16units offset indexes the embedded little-endian ICU dictionary bytes, not a JS string; Pi's Intl.Segmenter (utils.ts:getWordSegmenter) has no such table
 	return int(binary.LittleEndian.Uint32([]byte(cjkDictionary[offset : offset+4])))
 }
 func dictionaryWord(index int) string {
@@ -32,6 +39,7 @@ func dictionaryMatches(text string, offsets []int, start int, visit func(length 
 	count := dictionaryUint32(0)
 	low, high := 0, count
 	for length := 1; length <= 20 && start+length < len(offsets); length++ {
+		//portlint:allow utf16units offsets are byte positions of Go's own UTF-8 text built by the segmenter; Intl.Segmenter (utils.ts:getWordSegmenter) reports UTF-16 indexes that segments.go converts at its boundary
 		prefix := text[offsets[start]:offsets[start+length]]
 		low += sort.Search(high-low, func(i int) bool { return dictionaryWord(low+i) >= prefix })
 		high = low + sort.Search(high-low, func(i int) bool { return !strings.HasPrefix(dictionaryWord(low+i), prefix) })
@@ -44,15 +52,16 @@ func dictionaryMatches(text string, offsets []int, start int, visit func(length 
 	}
 }
 
-func dictionaryCharacter(r rune) bool {
-	return wordRuleClass(r)&ruleDictionaryCJK != 0
-}
 func katakana(r rune) bool {
 	return r >= 0x30a1 && r <= 0x30fe && r != 0x30fb || r >= 0xff66 && r <= 0xff9f
 }
 
 // cjkBoundaries ports ICU 78.3 CjkBreakEngine::divideUpDictionaryRange (word, not phrase, mode): NFKC mapping, weighted shortest path, unknown-character cost and Katakana-run candidates. Returned positions index the original UTF-8 text.
 func cjkBoundaries(text string) []int {
+	// pig additive (D92): a Piglet that strips word-dictionaries finds no boundary inside a CJK run, as dictionaries_off.go does.
+	if pigstrip.Has(pigstrip.ListFeatures, pigstrip.WordDictionaries) {
+		return nil
+	}
 	normalized := text
 	var inputMap []int
 	if !norm.NFKC.IsNormalString(text) {
@@ -79,8 +88,8 @@ func cjkBoundaries(text string) []int {
 	offsets = append(offsets, len(normalized))
 	n := len(chars)
 	const unreachable = ^uint32(0)
-	best := make([]uint32, n+1)
-	previous := make([]int, n+1)
+	best := make([]uint32, allocsize.Add(n, 1))
+	previous := make([]int, allocsize.Add(n, 1))
 	for i := range n + 1 {
 		best[i] = unreachable
 		previous[i] = -1

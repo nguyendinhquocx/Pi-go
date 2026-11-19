@@ -1,5 +1,7 @@
 package tui
 
+// Ports packages/tui/src/tui-main-screen.ts (doRender over-wide row crash)
+
 import (
 	"fmt"
 	"os"
@@ -34,7 +36,7 @@ func (e *RenderOverflowError) Error() string {
 }
 
 // SetLogDirectory sets the redraw and overflow log directory. Empty disables redraw logging and selects the OS temp directory for crash dumps, matching TuiBase's logDirectory constructor argument.
-func (t *TUI) SetLogDirectory(dir string) {
+func (t *TuiMainScreen) SetLogDirectory(dir string) {
 	t.mu.Lock()
 	t.logDirectory = dir
 	t.mu.Unlock()
@@ -44,7 +46,7 @@ func (t *TUI) SetLogDirectory(dir string) {
 // crash log (all rendered rows with their widths), stop the TUI to restore
 // terminal state, then throw. A failed log write propagates before the stop,
 // as upstream's synchronous fs calls do. The caller holds t.mu.
-func (t *TUI) crashOnDifferentialOverflow(newLines []string, index, width int) {
+func (t *TuiMainScreen) crashOnDifferentialOverflow(newLines []string, index, width int) {
 	lineWidth := widthx.VisibleWidth(newLines[index])
 	dir := t.logDirectory
 	if dir == "" {

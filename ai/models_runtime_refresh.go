@@ -18,8 +18,22 @@ func (m *Models) Refresh(ctx context.Context, options ...ModelsRefreshOptions) M
 		return result
 	}
 	allowNetwork := opts.AllowNetwork == nil || *opts.AllowNetwork
+	// An offline refresh inside an operation that runs no extension code and reads only this package's own stores (ProvidersRunOnCaller) does no
+	// I/O but its file reads, so its providers restore one after another on the caller and settle in provider order, as Pi's settle at one await
+	// depth.
+	inline := !allowNetwork && ProvidersRunOnCaller(ctx)
+	// pending counts the providers whose refresh has not settled, and one for this loop until it has started them all; done closes when it reaches zero.
 	var errorsMu sync.Mutex
-	var wg sync.WaitGroup
+	pending, done := 1, make(chan struct{})
+	release := func() {
+		errorsMu.Lock()
+		pending--
+		last := pending == 0
+		errorsMu.Unlock()
+		if last {
+			close(done)
+		}
+	}
 	for _, provider := range m.GetProviders() {
 		if provider.RefreshModels == nil || (opts.Providers != nil && !slices.Contains(opts.Providers, provider.ID)) {
 			continue
@@ -28,42 +42,77 @@ func (m *Models) Refresh(ctx context.Context, options ...ModelsRefreshOptions) M
 		if signal == nil {
 			continue
 		}
-		wg.Go(func() {
-			_, err := awaitModelsOperation(signal, &m.operations, func() (struct{}, error) {
-				stored, credentialErr := readProviderCredential(signal, m.credentials, provider.ID)
-				if err := m.runProviderRefreshPhase(provider, stored, false, nil, generation, signal); err != nil {
-					return struct{}{}, err
+		// The operation runs on the collection's operations, and the refresh settles when it returns or when its signal is cancelled (Pi's
+		// raceWithAbortSignal), whichever is first: the signal's AfterFunc settles a cancelled wait without a waiting goroutine.
+		var settleOnce sync.Once
+		settle := func(err error) {
+			settleOnce.Do(func() {
+				if err != nil && signal.Err() == nil {
+					errorsMu.Lock()
+					result.Errors[provider.ID] = err
+					result.ErrorOrder = append(result.ErrorOrder, provider.ID)
+					errorsMu.Unlock()
 				}
-				if credentialErr != nil {
-					return struct{}{}, credentialErr
+				m.mu.Lock()
+				if m.refreshControllers[provider.ID] == signal {
+					delete(m.refreshControllers, provider.ID)
 				}
-				if !allowNetwork || signal.Err() != nil {
-					return struct{}{}, nil
-				}
-				credential, err := m.resolveRefreshCredential(signal, provider, stored)
-				if err != nil || credential == nil {
-					return struct{}{}, err
-				}
-				return struct{}{}, m.runProviderRefreshPhase(provider, credential, true, opts.Force, generation, signal)
+				m.mu.Unlock()
+				release()
 			})
-			if err != nil && signal.Err() == nil {
-				errorsMu.Lock()
-				result.Errors[provider.ID] = err
-				result.ErrorOrder = append(result.ErrorOrder, provider.ID)
-				errorsMu.Unlock()
+		}
+		errorsMu.Lock()
+		pending++
+		errorsMu.Unlock()
+		if signal.Err() != nil {
+			settle(context.Cause(signal))
+			continue
+		}
+		run := func() error {
+			stored, credentialErr := readProviderCredential(signal, m.credentials, provider.ID)
+			if err := m.runProviderRefreshPhase(provider, stored, false, nil, generation, signal); err != nil {
+				return err
 			}
-			m.mu.Lock()
-			if m.refreshControllers[provider.ID] == signal {
-				delete(m.refreshControllers, provider.ID)
+			if credentialErr != nil {
+				return credentialErr
 			}
-			m.mu.Unlock()
-		})
+			if !allowNetwork || signal.Err() != nil {
+				return nil
+			}
+			credential, err := m.resolveRefreshCredential(signal, provider, stored)
+			if err != nil || credential == nil {
+				return err
+			}
+			return m.runProviderRefreshPhase(provider, credential, true, opts.Force, generation, signal)
+		}
+		if inline {
+			err := run()
+			if signal.Err() != nil {
+				err = context.Cause(signal)
+			}
+			settle(err)
+			continue
+		}
+		stop := context.AfterFunc(signal, func() { settle(context.Cause(signal)) })
+		if !m.goOwned(func() {
+			err := run()
+			stop()
+			if signal.Err() != nil {
+				err = context.Cause(signal)
+			}
+			settle(err)
+		}) {
+			// Drain began between this refresh's admission and its start; it has cancelled the signal, which settles the provider.
+			stop()
+			settle(errModelsDraining)
+		}
 	}
-	done := make(chan struct{})
-	m.operations.Go(func() { wg.Wait(); close(done) })
-	select {
-	case <-done:
-	case <-ctx.Done():
+	release()
+	if !inline {
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
 	}
 	errorsMu.Lock()
 	defer errorsMu.Unlock()
@@ -76,9 +125,10 @@ func (m *Models) runProviderRefreshPhase(provider *ModelsProvider, credential *C
 		return err
 	}
 	if stored != nil {
-		stored = withKnownModelTypes(new(stored.Clone()))
+		// Records of model types this version does not know stay aside in the entry and never reach the provider.
+		stored = new(stored.Clone())
 	}
-	return provider.RefreshModels(RefreshModelsContext{Credential: credential, Stored: stored, AllowNetwork: allowNetwork, Force: force, Signal: signal, Publish: func(publication ModelsPublication) (bool, error) {
+	return provider.RefreshModels(RefreshModelsContext{Credential: credential, Stored: stored, AllowNetwork: allowNetwork, Force: force, Signal: signal, BaseURL: provider.BaseURL, Publish: func(publication ModelsPublication) (bool, error) {
 		return m.publishProviderModels(provider.ID, generation, signal, publication)
 	}})
 }
@@ -89,16 +139,8 @@ func (m *Models) publishProviderModels(providerID string, generation uint64, sig
 	done := make(chan struct{})
 	m.publicationChains[providerID] = done
 	m.mu.Unlock()
-	result := make(chan modelsOperationResult[bool], 1)
-	m.operations.Go(func() {
-		defer func() {
-			m.mu.Lock()
-			if m.publicationChains[providerID] == done {
-				delete(m.publicationChains, providerID)
-			}
-			close(done)
-			m.mu.Unlock()
-		}()
+	publish := func() modelsOperationResult[bool] {
+		defer m.releasePublication(providerID, done)
 		if previous != nil {
 			<-previous
 		}
@@ -108,8 +150,7 @@ func (m *Models) publishProviderModels(providerID string, generation uint64, sig
 			return signal.Err() == nil && m.refreshGenerations[providerID] == generation
 		}
 		if !current() {
-			result <- modelsOperationResult[bool]{}
-			return
+			return modelsOperationResult[bool]{}
 		}
 		var err error
 		if publication.Persist != nil {
@@ -118,21 +159,36 @@ func (m *Models) publishProviderModels(providerID string, generation uint64, sig
 			err = m.modelsStore.Delete(signal, providerID)
 		}
 		if err != nil {
-			result <- modelsOperationResult[bool]{err: err}
-			return
+			return modelsOperationResult[bool]{err: err}
 		}
 		m.mu.Lock()
+		defer m.mu.Unlock()
 		if signal.Err() != nil || m.refreshGenerations[providerID] != generation {
-			m.mu.Unlock()
-			result <- modelsOperationResult[bool]{}
-			return
+			return modelsOperationResult[bool]{}
 		}
 		if publication.Update != nil {
 			publication.Update()
 		}
-		m.mu.Unlock()
-		result <- modelsOperationResult[bool]{value: true}
-	})
+		return modelsOperationResult[bool]{value: true}
+	}
+	if previous == nil && publication.Persist == nil && !publication.PersistSet {
+		// No earlier publication to wait for and nothing to write: Pi's queued publication runs on an already-settled chain without I/O
+		// (models.ts publishProviderModels), so it runs here rather than on a goroutine the caller would wait for.
+		next := publish()
+		if signal.Err() != nil {
+			return false, context.Cause(signal)
+		}
+		return next.value, next.err
+	}
+	result := make(chan modelsOperationResult[bool], 1)
+	if !m.goOwned(func() { result <- publish() }) {
+		// Drain has begun, so the write is not started. Later publications queue behind this one, which never runs, so it settles its place in the chain.
+		m.releasePublication(providerID, done)
+		if signal.Err() != nil {
+			return false, context.Cause(signal)
+		}
+		return false, errModelsDraining
+	}
 	if signal.Err() != nil {
 		return false, context.Cause(signal)
 	}
@@ -142,6 +198,17 @@ func (m *Models) publishProviderModels(providerID string, generation uint64, sig
 	case <-signal.Done():
 		return false, context.Cause(signal)
 	}
+}
+
+// releasePublication settles a publication's place in its provider's chain: later publications wait on done. It is a method, not a closure over the
+// publication, because every publication would allocate that closure, and a startup refresh publishes once per provider.
+func (m *Models) releasePublication(providerID string, done chan struct{}) {
+	m.mu.Lock()
+	if m.publicationChains[providerID] == done {
+		delete(m.publicationChains, providerID)
+	}
+	close(done)
+	m.mu.Unlock()
 }
 
 func (m *Models) resolveRefreshCredential(ctx context.Context, provider *ModelsProvider, stored *Credential) (*Credential, error) {
@@ -158,7 +225,7 @@ func (m *Models) resolveRefreshCredential(ctx context.Context, provider *ModelsP
 		}
 		// A refresh that has started survives cancellation or a superseding model refresh, so a rotated refresh token is always persisted. A newer refresh then sees the fresh credential.
 		// upstream: packages/ai/src/models.ts:resolveRefreshCredential
-		return refreshStoredOAuthCredential(ctx, m.credentials, provider.ID, oauth, func(current Credential) bool { return float64(nowMillis()) >= current.ExpiresMillis() })
+		return refreshStoredOAuthCredential(ctx, m.credentials, provider.ID, oauth, func(current Credential) bool { return float64(nowMillis()) >= current.ExpiresMillis() }, m.goOwned)
 	}
 	apiKey := provider.Auth.APIKey
 	if apiKey == nil {

@@ -97,7 +97,7 @@ func TestPromptSelectedToolsMutationsAcrossSDKs(t *testing.T) {
 		}
 		assertPromptSelectedTools(t, []extension.Extension{*loaded}, []string{"first"})
 	})
-	for _, language := range []string{"go", "python", "rust", "node"} {
+	for _, language := range []string{"go", "python", "rust", "node", "lisp"} {
 		t.Run(language, func(t *testing.T) {
 			for _, placement := range []string{"isolated", "packed"} {
 				t.Run(placement, func(t *testing.T) {
@@ -164,7 +164,7 @@ func assertPromptSelectedTools(t *testing.T, exts []extension.Extension, names [
 		{"repair", []string{"read", "bash"}, names[len(names)-1:]},
 	} {
 		base := slices.Clone(tc.base)
-		result, err := runner.EmitBeforeAgentStart(t.Context(), tc.prompt, nil, "base", extension.BuildSystemPromptOptions{SelectedTools: base})
+		result, err := runner.EmitBeforeAgentStart(t.Context(), extension.UserPromptTrigger(tc.prompt, nil), extension.BuildSystemPromptOptions{SelectedTools: base})
 		if tc.prompt == "null" || tc.prompt == "repair" && len(names) == 1 {
 			if err == nil || err.Error() != "Cannot read properties of null (reading 'length')" {
 				t.Fatalf("null selectedTools: result=%+v err=%v reported=%v", result, err, reported)
@@ -257,19 +257,41 @@ def new_extension():
  e.on_event("before_agent_start",handler)
  return e
 `, name)
+	case "lisp":
+		path = filepath.Join(cfg.Source, name+".lisp")
+		source = fmt.Sprintf(`(defpackage %[1]q (:use "COMMON-LISP"))
+(in-package %[1]q)
+(defun new-extension ()
+  (let ((e (pig:make-extension %[1]q)))
+    (pig:on e "before_agent_start"
+      (lambda (ctx data) (declare (ignore ctx))
+        (let ((options (pig:jget data "systemPromptOptions")) (prompt (pig:jget data "prompt")))
+          (sleep 0.02)
+          (flet ((selected () (gethash "selectedTools" options)))
+            (cond ((equal prompt "repair") (setf (gethash "selectedTools" options) (if (eq (selected) :null) (vector %[1]q) :null)) nil)
+                  ((equal prompt "null") (setf (gethash "selectedTools" options) :null) nil)
+                  ((equal prompt "mixed") (setf (gethash "selectedTools" options) (vector :null 17 %[1]q)) nil)
+                  (t (if (equal prompt "replace")
+                         (setf (gethash "selectedTools" options) (vector %[1]q))
+                         (setf (gethash "selectedTools" options) (concatenate 'simple-vector (selected) (vector %[1]q))))
+                     (cond ((equal prompt "error") (error "selected tools failure"))
+                           ((equal prompt "result") (pig:obj "systemPrompt" "Exact prompt.")))))))))
+    e))
+`, name)
 	case "rust":
 		path = filepath.Join(cfg.Source, "src", "lib.rs")
 		source = fmt.Sprintf(`use pig_sdk::{Extension,Schema};
 pub fn new_extension()->Extension {
  let mut e=Extension::new(%[1]q);
- e.on_event_result("before_agent_start",false,|_,data| {
+ e.on_before_agent_start(|_,event| {
   std::thread::sleep(std::time::Duration::from_millis(20));
-  if data["prompt"]=="repair" {data["systemPromptOptions"]["selectedTools"]=if data["systemPromptOptions"]["selectedTools"].is_null() {Schema::Array(vec![Schema::String(%[1]q.into())])} else {Schema::Null};return Ok(None)}
-  if data["prompt"]=="null" {data["systemPromptOptions"]["selectedTools"]=Schema::Null;return Ok(None)}
-  if data["prompt"]=="mixed" {data["systemPromptOptions"]["selectedTools"]=Schema::Array(vec![Schema::Null,Schema::Number(17.into()),Schema::String(%[1]q.into())]);return Ok(None)}
-  if data["prompt"]=="replace" {data["systemPromptOptions"]["selectedTools"]=Schema::Array(vec![Schema::String(%[1]q.into())])} else {data["systemPromptOptions"]["selectedTools"].as_array_mut().ok_or("selectedTools is not a list")?.push(Schema::String(%[1]q.into()))}
-  if data["prompt"]=="error" {return Err("selected tools failure".into())}
-  if data["prompt"]=="result" {let mut result=Schema::Object(Default::default());result["systemPrompt"]=Schema::String("Exact prompt.".into());return Ok(Some(result))};Ok(None)
+  let prompt=event.payload()["prompt"].clone();
+  if prompt=="repair" {event.edit_system_prompt_options(|options| options["selectedTools"]=if options["selectedTools"].is_null() {Schema::Array(vec![Schema::String(%[1]q.into())])} else {Schema::Null});return Ok(None)}
+  if prompt=="null" {event.edit_system_prompt_options(|options| options["selectedTools"]=Schema::Null);return Ok(None)}
+  if prompt=="mixed" {event.edit_system_prompt_options(|options| options["selectedTools"]=Schema::Array(vec![Schema::Null,Schema::Number(17.into()),Schema::String(%[1]q.into())]));return Ok(None)}
+  if prompt=="replace" {event.edit_system_prompt_options(|options| options["selectedTools"]=Schema::Array(vec![Schema::String(%[1]q.into())]))} else {event.edit_system_prompt_options(|options| -> Result<(),String> {options["selectedTools"].as_array_mut().ok_or("selectedTools is not a list")?.push(Schema::String(%[1]q.into()));Ok(())})?}
+  if prompt=="error" {return Err("selected tools failure".into())}
+  if prompt=="result" {let mut result=Schema::Object(Default::default());result["systemPrompt"]=Schema::String("Exact prompt.".into());return Ok(Some(result))};Ok(None)
  });
  e
 }`, name)

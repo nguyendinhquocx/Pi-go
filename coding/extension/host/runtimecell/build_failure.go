@@ -32,6 +32,8 @@ type BuildFailure struct {
 	// Cached is set when the failure is a recorded earlier one: the build did not
 	// run again because none of its inputs changed.
 	Cached bool
+	// Drift lists the SDK changes the extension was written for the old shape of. It is empty unless every compile error is such a change.
+	Drift []Drift
 
 	// cause is the error the failure was recorded from, when it was not already a report, so errors.Is and errors.As reach it.
 	cause error

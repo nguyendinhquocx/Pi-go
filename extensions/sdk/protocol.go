@@ -3,6 +3,7 @@ package sdk
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -68,6 +69,9 @@ type registerMsg struct {
 	// MarkdownTransformer reports a registered Markdown transformer; the host
 	// runs it with markdown_transform requests.
 	MarkdownTransformer bool `json:"markdown_transformer,omitempty"`
+	// OwnsThinkingRuns reports that the extension owns the thinking runs of assistant messages (PiG-only).
+	// pig additive (D214)
+	OwnsThinkingRuns bool `json:"owns_thinking_runs,omitempty"`
 	// ToolRenderers is the number of tool renderer resolvers registered while the factory ran.
 	ToolRenderers int `json:"tool_renderers,omitempty"`
 	// McpServers and VirtualModels are the registrations made while the factory ran; the host applies them when the extension loads.
@@ -101,18 +105,18 @@ type virtualModelDecl struct {
 }
 
 type toolDef struct {
-	Name                string   `json:"name"`
-	Label               string   `json:"label,omitempty"` // upstream ToolDefinition.label
-	Description         string   `json:"description"`
-	Parameters          Schema   `json:"parameters"`                     // JSON Schema: must match host's ToolDecl.Parameters
-	ConstrainedSampling any      `json:"constrained_sampling,omitempty"` // false | ConstrainedSampling: provider-side constrained sampling request
-	PromptSnippet       string   `json:"prompt_snippet,omitempty"`
-	ExecutionMode       string   `json:"execution_mode,omitempty"`
-	PromptGuidelines    []string `json:"prompt_guidelines,omitempty"` // Bullets injected into system prompt Guidelines section when tool is active
-	Source              string   `json:"source,omitempty"`            // pig additive (D23): optional per-tool source; defaults to extension name
-	RenderShell         string   `json:"render_shell,omitempty"`      // "self" when the renderers draw their own framing
-	RendersCall         bool     `json:"renders_call,omitempty"`      // the tool has a call renderer
-	RendersResult       bool     `json:"renders_result,omitempty"`    // the tool has a result renderer
+	Name                string     `json:"name"`
+	Label               string     `json:"label,omitempty"` // upstream ToolDefinition.label
+	Description         string     `json:"description"`
+	Parameters          schemaRoot `json:"parameters"`                     // JSON Schema: must match host's ToolDecl.Parameters; the root is written in the order TSchema.Schema recorded
+	ConstrainedSampling any        `json:"constrained_sampling,omitempty"` // false | ConstrainedSampling: provider-side constrained sampling request
+	PromptSnippet       string     `json:"prompt_snippet,omitempty"`
+	ExecutionMode       string     `json:"execution_mode,omitempty"`
+	PromptGuidelines    []string   `json:"prompt_guidelines,omitempty"` // Bullets injected into system prompt Guidelines section when tool is active
+	Source              string     `json:"source,omitempty"`            // pig additive (D23): optional per-tool source; defaults to extension name
+	RenderShell         string     `json:"render_shell,omitempty"`      // "self" when the renderers draw their own framing
+	RendersCall         bool       `json:"renders_call,omitempty"`      // the tool has a call renderer
+	RendersResult       bool       `json:"renders_result,omitempty"`    // the tool has a result renderer
 	// The upstream 0.99.1 tool definition fields, in the host's ToolDecl shape.
 	OutputSchema    Schema           `json:"output_schema,omitempty"`
 	Exposure        ToolExposure     `json:"exposure,omitempty"`
@@ -123,13 +127,17 @@ type toolDef struct {
 	// PreparesArguments reports that the tool defines PrepareArguments; the host asks for it with tool_prepare_arguments before it validates the arguments.
 	PreparesArguments bool `json:"prepares_arguments,omitempty"`
 
+	// ReachesTools reports that the tool defines ReachesTools; the host asks for it with tool_reaches_tools.
+	ReachesTools bool `json:"reaches_tools,omitempty"`
+
+	// reachesTools is the tool's ReachesTools.
+	reachesTools ToolReachesToolsFunc
 	// prepareLoadout is the tool's PrepareLoadout; the host asks for it with tool_prepare_loadout when PreparesLoadout is set.
 	prepareLoadout ToolPrepareLoadoutFunc
 }
 
 type handlerDef struct {
 	Event     string `json:"event"`
-	CanBlock  bool   `json:"can_block"`
 	HandlerID int    `json:"handler_id"`
 }
 
@@ -168,13 +176,13 @@ type rendererDef struct {
 }
 
 type readyMsg struct {
-	SessionName string          `json:"session_name"`
-	Cwd         string          `json:"cwd"`
-	Mode        string          `json:"mode"`
-	Width       int             `json:"width"`
-	Height      int             `json:"height,omitempty"`
-	Model       string          `json:"model"`
-	State       json.RawMessage `json:"state,omitempty"` // initial StatePayload snapshot
+	Cwd    string          `json:"cwd"`
+	Mode   string          `json:"mode"`
+	Width  int             `json:"width"`
+	Height int             `json:"height,omitempty"`
+	State  json.RawMessage `json:"state,omitempty"` // initial StatePayload snapshot
+	// SourceInfo is the provenance the loader stamped on this extension (Context.ExtensionSourceInfo).
+	SourceInfo *SourceInfo `json:"sourceInfo,omitempty"`
 }
 
 type requestMsg struct {
@@ -184,6 +192,17 @@ type requestMsg struct {
 	HandlerID  int             `json:"handler_id,omitempty"`
 	ToolCallID string          `json:"tool_call_id,omitempty"`
 	Args       json.RawMessage `json:"args,omitempty"`
+	Stream     *eventStreamMsg `json:"stream,omitempty"`
+	// Batch, on tool_call, names the parallel batch the call belongs to; absent for a call outside one, which takes part in no order (toolBatchOrders).
+	Batch string `json:"batch,omitempty"`
+	// ChildSession names the child agent session whose customTools define Tool (tool_call, tool_prepare_arguments).
+	ChildSession string `json:"child_session,omitempty"`
+	// ToolCallIndex, on tool_call, is the call's position in its assistant message's batch (Context.ToolCallIndex).
+	ToolCallIndex *int `json:"tool_call_index,omitempty"`
+
+	// streamData and streamErr are the payload a stream request produced, or why it could not be produced (applyEventStream).
+	streamData map[string]any
+	streamErr  error
 }
 
 type responseMsg struct {
@@ -200,6 +219,8 @@ type callMsg struct {
 	Method          string          `json:"method"`
 	Args            json.RawMessage `json:"args,omitempty"`
 	ParentRequestID string          `json:"parent_request_id,omitempty"`
+	// Timer marks a call made through a request's context after the request's handler returned: deferred work, which Pi runs from a timer, an immediate or a later continuation, once the loop turns (D189).
+	Timer bool `json:"timer,omitempty"`
 }
 
 type callResultMsg struct {
@@ -210,11 +231,24 @@ type callResultMsg struct {
 	notifySeq uint64
 }
 
-// widgetPushMsg carries a string list widget. It has no width: the host lays
-// the list out at its own width, as Pi does for setWidget(key, string[]).
+// widgetPushMsg carries a string list widget or a widget view. It has no
+// width: the host lays the list out, and renders the view, at its own width,
+// as Pi does for setWidget(key, string[]). A view push carries no lines.
 type widgetPushMsg struct {
-	Key   string   `json:"key"`
-	Lines []string `json:"lines"`
+	Key   string          `json:"key"`
+	Lines []string        `json:"lines"`
+	View  json.RawMessage `json:"view,omitempty"`
+}
+
+func (m widgetPushMsg) MarshalJSON() ([]byte, error) {
+	if m.View != nil {
+		return json.MarshalJS(struct {
+			Key  string          `json:"key"`
+			View json.RawMessage `json:"view"`
+		}{m.Key, m.View})
+	}
+	type lines widgetPushMsg
+	return json.MarshalJS(lines(m))
 }
 
 type cancelMsg struct {
@@ -246,7 +280,9 @@ type errorInfo struct {
 // conn manages the socket connection with read/write goroutines and
 // request/response correlation for extension→host calls.
 type conn struct {
-	nc      net.Conn
+	nc net.Conn
+	// fused reports a fused extension's connection (framePartsReader): the extension runs in the host's process.
+	fused   bool
 	writeMu sync.Mutex // serializes writes
 
 	// callID generates unique IDs for extension→host calls.
@@ -257,6 +293,8 @@ type conn struct {
 	pending        map[string]chan *callResultMsg
 	pendingParents map[string]string
 	requestParents map[string]*requestParent
+	// pendingSlots maps a dialog call to the response slot of the tool handler that waits for it. The read loop settles the slot when it reads the answer.
+	pendingSlots map[string]*settleSlot
 
 	// incoming is where the read loop puts request/notify/shutdown messages.
 	incoming chan envelope
@@ -273,6 +311,10 @@ type conn struct {
 	// can wait until the loop has applied every notification that preceded
 	// its result.
 	notifications atomic.Uint64
+
+	// images is the set of image refs whose bytes a frame on this
+	// connection carried (D107).
+	images sentImages
 }
 
 type pendingCall struct {
@@ -285,10 +327,13 @@ type pendingCall struct {
 }
 
 func newConn(nc net.Conn) *conn {
+	_, fused := nc.(framePartsReader)
 	return &conn{
 		nc:             nc,
+		fused:          fused,
 		pending:        make(map[string]chan *callResultMsg),
 		pendingParents: make(map[string]string),
+		pendingSlots:   make(map[string]*settleSlot),
 		incoming:       make(chan envelope, 16),
 		done:           make(chan struct{}),
 		stopped:        make(chan struct{}),
@@ -315,14 +360,28 @@ func (c *conn) readLoop() {
 		close(c.done)
 	}()
 	defer close(c.incoming)
+	parts, _ := c.nc.(framePartsReader)
 	for {
-		data, err := c.readFrame()
+		var data, args []byte
+		var err error
+		if parts != nil {
+			data, args, err = parts.ReadFrameParts()
+		} else {
+			data, err = c.readFrame()
+		}
 		if err != nil {
 			return
 		}
 		var env envelope
 		if err := json.Unmarshal(data, &env); err != nil {
-			continue // skip malformed
+			// The Node, Python and Rust SDKs end the connection on a frame they cannot decode, as the host does; skipping it would leave the host waiting for the answer to a request it carried.
+			return
+		}
+		if args != nil {
+			if env.Request == nil {
+				return
+			}
+			env.Request.Args = args
 		}
 		if env.Type == msgPing && env.Ping != nil {
 			if err := c.send(envelope{Type: msgPong, Pong: &pongMsg{Nonce: env.Ping.Nonce}}); err != nil {
@@ -334,11 +393,15 @@ func (c *conn) readLoop() {
 		if env.Type == msgCallResult {
 			c.pendingMu.Lock()
 			ch, ok := c.pending[env.ID]
+			slot := c.pendingSlots[env.ID]
 			if ok {
 				delete(c.pending, env.ID)
 				delete(c.pendingParents, env.ID)
+				delete(c.pendingSlots, env.ID)
 			}
 			c.pendingMu.Unlock()
+			// Pi resumes the handlers whose dialogs were answered in the order the answers arrived. This loop reads them in that order, which the goroutines that wait do not keep.
+			slot.settle()
 			if ok && ch != nil {
 				if env.CallResult != nil {
 					env.CallResult.notifySeq = c.notifications.Load()
@@ -353,6 +416,11 @@ func (c *conn) readLoop() {
 		}
 		c.incoming <- env
 	}
+}
+
+// framePartsReader is the connection of a fused extension (D31), which runs in the host's process: ReadFrameParts returns each host frame's JSON with the placeholder 0 in place of a request's Args, and the Args bytes the host encoded, by reference and never written again, or nil when the frame has none. The extension decodes the small envelope and reads Args where they are, without copying or validating them. A socket does not have the method, so an extension in its own process reads byte frames.
+type framePartsReader interface {
+	ReadFrameParts() (shell, args []byte, err error)
 }
 
 func (c *conn) readFrame() ([]byte, error) {
@@ -378,14 +446,22 @@ func (c *conn) writeFrame(data []byte) error {
 }
 
 func (c *conn) writeFrameLocked(data []byte) error {
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(data)))
-	if _, err := c.nc.Write(hdr[:]); err != nil {
+	// One write: a header and a body written apart cost the host two reads and, on a stream socket, two segments. A small frame is copied behind its header; a large one goes out as one vectored write instead of being copied.
+	if len(data) <= smallFrameBytes {
+		frame := make([]byte, 4, 4+len(data))
+		binary.BigEndian.PutUint32(frame, uint32(len(data)))
+		_, err := c.nc.Write(append(frame, data...))
 		return err
 	}
-	_, err := c.nc.Write(data)
+	hdr := make([]byte, 4)
+	binary.BigEndian.PutUint32(hdr, uint32(len(data)))
+	buffers := net.Buffers{hdr, data}
+	_, err := buffers.WriteTo(c.nc)
 	return err
 }
+
+// smallFrameBytes is the largest frame copied behind its header to be written with one call.
+const smallFrameBytes = 64 << 10
 
 func (c *conn) send(env envelope) error {
 	data, err := marshalEnvelope(env)
@@ -404,15 +480,18 @@ func (c *conn) sendLocked(env envelope) error {
 }
 
 func marshalEnvelope(env envelope) ([]byte, error) {
-	data, err := json.Marshal(env)
+	data, err := json.MarshalJS(env)
 	if err != nil {
 		return nil, err
 	}
 	if len(data) > MaxFrameSize {
-		return nil, fmt.Errorf("frame too large: %d bytes exceeds %d", len(data), MaxFrameSize)
+		return nil, fmt.Errorf("%w: %d bytes exceeds %d", errFrameTooLarge, len(data), MaxFrameSize)
 	}
 	return data, nil
 }
+
+// errFrameTooLarge is the failure of a frame past MaxFrameSize.
+var errFrameTooLarge = errors.New("frame too large")
 
 // call sends a call message and blocks until the host replies with call_result.
 func (c *conn) call(method string, args any) (*callResultMsg, error) {
@@ -431,17 +510,23 @@ func (c *conn) callFor(parentRequestID, method string, args any) (*callResultMsg
 // written. Streaming APIs use this to establish the host-side consumer before
 // sending ordered notify frames on the same connection.
 func (c *conn) beginCallFor(parentRequestID, method string, args any) (pendingCall, error) {
-	return c.beginCall(parentRequestID, nil, method, args)
+	return c.beginCall(parentRequestID, nil, method, args, nil)
 }
 
-func (c *conn) beginParentCall(parent *requestParent, method string, args any) (pendingCall, error) {
-	return c.beginCall("", parent, method, args)
+// beginParentCallFor sends a call scoped to its parent request; a call whose answer settles slot has the read loop settle it when it reads the answer.
+func (c *conn) beginParentCallFor(parent *requestParent, method string, args any, slot *settleSlot) (pendingCall, error) {
+	return c.beginCall("", parent, method, args, slot)
 }
 
-func (c *conn) beginCall(parentRequestID string, parent *requestParent, method string, args any) (pendingCall, error) {
+// beginCallForSlot is beginCallFor for a call whose answer settles slot when the read loop reads it.
+func (c *conn) beginCallForSlot(parentRequestID, method string, args any, slot *settleSlot) (pendingCall, error) {
+	return c.beginCall(parentRequestID, nil, method, args, slot)
+}
+
+func (c *conn) beginCall(parentRequestID string, parent *requestParent, method string, args any, slot *settleSlot) (pendingCall, error) {
 	id := fmt.Sprintf("c%d", c.callID.Add(1))
 
-	argsJSON, err := json.Marshal(args)
+	argsJSON, err := json.MarshalJS(args)
 	if err != nil {
 		return pendingCall{}, err
 	}
@@ -460,6 +545,7 @@ func (c *conn) beginCall(parentRequestID string, parent *requestParent, method s
 		return pendingCall{}, fmt.Errorf("extension connection closed")
 	default:
 	}
+	timer := false
 	if parent != nil {
 		parentRequestID, err = c.parentIDLocked(parent)
 		if err != nil {
@@ -469,20 +555,25 @@ func (c *conn) beginCall(parentRequestID string, parent *requestParent, method s
 		callCtx = parent.request
 		if parent.completed {
 			callCtx = parent.runtime
+			timer = true
 		}
 	}
 	c.pending[id] = ch
 	c.pendingParents[id] = parentRequestID
+	if slot != nil {
+		c.pendingSlots[id] = slot
+	}
 	c.pendingMu.Unlock()
 
 	if err := c.sendLocked(envelope{
 		Type: msgCall,
 		ID:   id,
-		Call: &callMsg{Method: method, Args: argsJSON, ParentRequestID: parentRequestID},
+		Call: &callMsg{Method: method, Args: argsJSON, ParentRequestID: parentRequestID, Timer: timer},
 	}); err != nil {
 		c.pendingMu.Lock()
 		delete(c.pending, id)
 		delete(c.pendingParents, id)
+		delete(c.pendingSlots, id)
 		c.pendingMu.Unlock()
 		return pendingCall{}, err
 	}
@@ -494,6 +585,7 @@ func (c *conn) waitCall(call pendingCall) (*callResultMsg, error) {
 		c.pendingMu.Lock()
 		delete(c.pending, call.id)
 		delete(c.pendingParents, call.id)
+		delete(c.pendingSlots, call.id)
 		c.pendingMu.Unlock()
 	}()
 	ctx := call.ctx
@@ -544,7 +636,7 @@ func (c *conn) cancelParentCalls(parentRequestID string) {
 }
 
 func (c *conn) notify(method string, args any) error {
-	argsJSON, err := json.Marshal(args)
+	argsJSON, err := json.MarshalJS(args)
 	if err != nil {
 		return err
 	}
@@ -554,8 +646,31 @@ func (c *conn) notify(method string, args any) error {
 	})
 }
 
+// notifyResult sends method with the arguments {"request_id": requestID, "result": result}. A result that is already encoded (json.RawMessage, such as the wire of an event an
+// author pushed) is written into the arguments as it is, without being encoded or checked again.
+func (c *conn) notifyResult(method, requestID string, result any) error {
+	raw, ok := result.(json.RawMessage)
+	if !ok {
+		return c.notify(method, map[string]any{"request_id": requestID, "result": result})
+	}
+	id, err := json.MarshalJS(requestID)
+	if err != nil {
+		return err
+	}
+	args := make([]byte, 0, len(`{"request_id":,"result":}`)+len(id)+len(raw))
+	args = append(args, `{"request_id":`...)
+	args = append(args, id...)
+	args = append(args, `,"result":`...)
+	args = append(args, raw...)
+	args = append(args, '}')
+	return c.send(envelope{Type: msgNotify, Notify: &notifyMsg{Method: method, Args: args}})
+}
+
 // respond sends a response to a host request.
 func (c *conn) respond(id string, result any, respErr error) error {
+	// The response is encoded before the write lock is taken: a result of hundreds of MiB takes seconds to encode, and the same lock carries the
+	// heartbeat's pong, which the host answers by closing a connection that stays silent.
+	response, encodeErr := encodeResponse(id, result, respErr)
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	c.pendingMu.Lock()
@@ -576,19 +691,32 @@ func (c *conn) respond(id string, result any, respErr error) error {
 	if err := c.sendLocked(envelope{Type: msgRequestState, RequestState: &requestStateMsg{RequestID: id, State: "completed"}}); err != nil {
 		return err
 	}
+	if encodeErr != nil {
+		return encodeErr
+	}
+	return c.writeFrameLocked(response)
+}
+
+// encodeResponse is the response frame of a request. A result that cannot be encoded, or that cannot be framed (past MaxFrameSize), is answered with that
+// failure, as the Node and Python SDKs answer it, rather than leaving the host waiting for a response until the call is aborted.
+func encodeResponse(id string, result any, respErr error) ([]byte, error) {
 	resp := &responseMsg{}
 	if respErr != nil {
 		resp.Error = &errorInfo{Message: respErr.Error()}
 	}
 	if result != nil {
-		data, err := json.Marshal(result)
+		data, err := json.MarshalJS(result)
 		if err != nil {
 			resp.Error = &errorInfo{Message: err.Error()}
 		} else {
 			resp.Result = data
 		}
 	}
-	return c.sendLocked(envelope{Type: msgResponse, ID: id, Response: resp})
+	frame, err := marshalEnvelope(envelope{Type: msgResponse, ID: id, Response: resp})
+	if errors.Is(err, errFrameTooLarge) {
+		return marshalEnvelope(envelope{Type: msgResponse, ID: id, Response: &responseMsg{Error: &errorInfo{Message: err.Error()}}})
+	}
+	return frame, err
 }
 
 func (c *conn) requestState(id, state, reason string) error {
@@ -603,5 +731,13 @@ func (c *conn) pushWidget(key string, lines []string) error {
 	return c.send(envelope{
 		Type:       msgWidgetPush,
 		WidgetPush: &widgetPushMsg{Key: key, Lines: lines},
+	})
+}
+
+// pushWidgetView sends a widget_push message carrying a view and no lines.
+func (c *conn) pushWidgetView(key string, view json.RawMessage) error {
+	return c.send(envelope{
+		Type:       msgWidgetPush,
+		WidgetPush: &widgetPushMsg{Key: key, View: view},
 	})
 }

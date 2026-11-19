@@ -6,7 +6,10 @@ import type {
   ExtensionVirtualModel,
   InlineExtension,
   McpServerConfig,
+  EntryRenderOptions,
+  KeybindingHints,
   McpServersChangeEvent,
+  MessageRenderOptions,
   ModelRegistry,
   ProviderConfig,
   ProviderStreamEvent,
@@ -18,6 +21,8 @@ import type {
   ToolLoadoutChanges,
   ToolNamespace,
 } from "@earendil-works/pi-coding-agent";
+import { clampThinkingLevel } from "@earendil-works/pi-ai/models";
+import type { Component, Container } from "@earendil-works/pi-tui";
 import type {
   ExtensionToolContext as AdapterExtensionToolContext,
   McpServerConfig as AdapterMcpServerConfig,
@@ -25,7 +30,12 @@ import type {
   ProviderConfig as AdapterProviderConfig,
   PiGLoginDefinition,
   PiGSpriteDefinition,
+  PiGViewLines,
+  PiGViewTheme,
 } from "@michaelkinsy/pig-extension-types";
+
+// Pi's package root does not export ToolRenderContext (Pi 1.4.0+b556cfe5 and 1.5.0 export KeybindingHints, MessageRenderOptions and EntryRenderOptions beside it), so an extension names it through the context parameter Pi's ToolDefinition hands to renderCall.
+type ToolRenderContext = Parameters<NonNullable<ToolDefinition["renderCall"]>>[2];
 
 const login: PiGLoginDefinition = {
   brand: ["."],
@@ -114,7 +124,31 @@ export function toolDefinitionFields(): ToolDefinition {
   };
 }
 
+export function keybindingHints(pi: ExtensionAPI): void {
+  const hints = (hint: KeybindingHints): string => `${hint.keyText("app.tools.expand")} ${hint.keyHint("app.tools.expand", "to expand")}`;
+  pi.registerMessageRenderer("hints", (_message, options: MessageRenderOptions) => {
+    void hints(options);
+    return undefined;
+  });
+  pi.registerEntryRenderer("hints", (_entry, options: EntryRenderOptions) => {
+    void hints(options);
+    return undefined;
+  });
+  const renderCall = (_args: unknown, _theme: unknown, context: ToolRenderContext): undefined => {
+    void hints(context);
+    return undefined;
+  };
+  void renderCall;
+}
+
 export function apiAdditions(pi: ExtensionAPI): void {
+  void pi.exec("git", ["log"], { maxBuffer: 1024 * 1024 }).then((result) => {
+    const truncated: boolean = result.truncated;
+    const killed: boolean = result.killed;
+    void [truncated, killed];
+  });
+  pi.ownThinkingRuns();
+  pi.ownThinkingRuns(false);
   const config: McpServerConfig = { url: "https://mcp.example.com/jira" };
   pi.registerMcpServer("jira", config);
   const servers: RegisteredMcpServer[] = pi.getMcpServers();
@@ -266,3 +300,47 @@ export const adapterReexportsPinnedTypes: [
   Same<AdapterModelRegistry, ModelRegistry>,
   Same<AdapterProviderConfig, ProviderConfig>,
 ] = [true, true, true, true];
+
+// PiG's component kit (D107): a surface root's token overrides and the
+// frontend-only annotations of a component's rows, on any pi-tui component.
+export function kitAnnotations(root: Container, table: Component): void {
+  const surface: Component = root;
+  surface.viewTheme = { accent: "#d75f00", selectedBg: "#102030" };
+  table.viewLines = {
+    list: { items: [{ label: "Blue in Green", detail: "Miles Davis", columns: ["5:37"] }], selectedIndex: 0 },
+    progress: { value: 30, max: 200 },
+    image: { data: "", mimeType: "image/png" },
+  };
+  const theme: PiGViewTheme | undefined = surface.viewTheme;
+  const lines: PiGViewLines | undefined = table.viewLines;
+  void [theme, lines];
+  // @ts-expect-error only the closed token set can be overridden
+  surface.viewTheme = { accent2: "#ffffff" };
+  // @ts-expect-error an override is a #rrggbb color
+  surface.viewTheme = { accent: "orange" };
+  // @ts-expect-error a list names its selected item
+  table.viewLines = { list: { items: [] } };
+}
+
+// before_agent_start tells a user run from a custom-message run (Pi 1.2.0 types.ts BeforeAgentStartEvent, Pi PR #10739).
+export function beforeAgentStartTrigger(pi: ExtensionAPI): void {
+  pi.on("before_agent_start", async (event) => {
+    const kind: "user" | "custom" = event.messageType;
+    if (event.messageType === "custom") {
+      const customType: string | undefined = event.message?.customType;
+      void customType;
+      return undefined;
+    }
+    void kind;
+    // @ts-expect-error messageType is a closed union
+    const other: "plan" = event.messageType;
+    void other;
+    return undefined;
+  });
+}
+
+// Pi serves @earendil-works/pi-ai/models to extensions (core/extensions/virtual-modules.ts, #11156); its declarations resolve.
+export const clampedThinkingLevel: string = clampThinkingLevel(
+  { reasoning: false } as Parameters<typeof clampThinkingLevel>[0],
+  "high",
+);

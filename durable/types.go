@@ -2,20 +2,25 @@ package durable
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/chord"
 	"github.com/MichaelKinsy/PiG/chord/delta"
 	"github.com/MichaelKinsy/PiG/durable/env"
+	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
 // Ports packages/durable/src/types.ts
 
-// JsonValue is a strict JSON value: nil, bool, float64 or another JSON number, string, []any, or map[string]any.
+// JsonValue is a strict JSON value: nil, bool, float64 or another JSON number, string, []any, or an object. Objects that
+// durable decodes or copies are *delta.JsonObject, which keeps JavaScript's property order; a Go map a caller supplies has
+// no order and is copied in own-key order.
 type JsonValue = any
 
 // JsonObject is the JSON object used as the root of every durable document.
-type JsonObject = map[string]any
+type JsonObject = *delta.JsonObject
 
 // Op is one Chord delta operation (packages/chord/src/delta).
 type Op = delta.Op
@@ -93,36 +98,76 @@ type DocumentSemantics struct {
 	Fork    DocumentFork
 }
 
+// LatestConversationSemantics is a conversation document that retains only its current state: the DocumentSemantics member
+// {scope: "conversation", history: "latest"} whose fork is current or initial (types.ts:41-46). Go has no literal types, so
+// NewLatestConversationSemantics fixes the scope and history and DefineDoc rejects a fork a latest document cannot have.
+type LatestConversationSemantics struct {
+	DocumentSemantics
+}
+
+// NewLatestConversationSemantics is the latest conversation semantics with the given fork, ForkCurrent or ForkInitial.
+func NewLatestConversationSemantics(fork DocumentFork) LatestConversationSemantics {
+	return LatestConversationSemantics{DocumentSemantics{Scope: ScopeConversation, History: HistoryLatest, Fork: fork}}
+}
+
+// RewindableConversationSemantics is a conversation document whose history remains addressable for as-of reads: the
+// DocumentSemantics member {scope: "conversation", history: "rewindable"} whose fork is asOf, current or initial (types.ts:48-53).
+type RewindableConversationSemantics struct {
+	DocumentSemantics
+}
+
+// NewRewindableConversationSemantics is the rewindable conversation semantics with the given fork, ForkAsOf, ForkCurrent or ForkInitial.
+func NewRewindableConversationSemantics(fork DocumentFork) RewindableConversationSemantics {
+	return RewindableConversationSemantics{DocumentSemantics{Scope: ScopeConversation, History: HistoryRewindable, Fork: fork}}
+}
+
 // CheckpointInfo is the stored replay state supplied to a document's checkpoint predicate.
 type CheckpointInfo struct {
 	// DeltasSinceBase counts deltas already stored after the newest base, excluding the change being evaluated.
 	DeltasSinceBase int
 }
 
-// CommonDocDefinition holds the definition fields shared by singleton documents and document families.
+// CommonDocDefinition holds the definition fields shared by singleton documents and document families (types.ts:69-79).
+// The singleton definition embeds it; a family definition has its fields except Initial, as upstream's `Omit<CommonDocDefinition<T>, "initial">`.
 type CommonDocDefinition[T any] struct {
 	// Kind is the stable persisted kind; part of the public protocol.
 	Kind string
 	// Version is the positive integer version of the stored value shape.
 	Version int
+	// Initial returns the document's first value.
+	Initial func() T
 	// Migrate converts a value stored by an older version; nil when absent.
 	Migrate func(value JsonObject, fromVersion int) (T, error)
-	// CheckpointWhen returns true to store this ordinary change as a complete base instead of a delta; nil when
-	// absent.
+	// CheckpointWhen is the required policy: it returns true to store this ordinary change as a complete base instead of
+	// a delta. There is no default; a definition without CheckpointWhen and CheckpointWhenRaw is rejected by DefineDoc.
 	CheckpointWhen func(value T, ops []Op, info CheckpointInfo) bool
+	// CheckpointWhenRaw is CheckpointWhen over the exact prepared JSON object, with no typed decode, and satisfies the
+	// requirement in its place. It takes precedence over CheckpointWhen when both are set; a definition that sets both
+	// must make them agree. Built-in documents set it so the per-commit predicate costs nothing in the size of the value.
+	CheckpointWhenRaw func(value JsonObject, ops []Op, info CheckpointInfo) bool
 }
 
 // DocDefinition is a singleton document definition.
 type DocDefinition[T any] struct {
 	CommonDocDefinition[T]
 	DocumentSemantics
-	Initial func() T
 }
 
-// DocFamilyDefinition is a keyed document family definition; Initial(seed) runs only when a member is absent.
+// DocFamilyDefinition is a keyed document family definition; Initial(seed) runs only when a member is absent. It has the fields of
+// CommonDocDefinition except Initial, which takes the seed (types.ts:84-89 `Omit<CommonDocDefinition<T>, "initial"> & ...`).
 type DocFamilyDefinition[T, I any] struct {
-	CommonDocDefinition[T]
+	// Kind is the stable persisted kind; part of the public protocol.
+	Kind string
+	// Version is the positive integer version of the stored value shape.
+	Version int
+	// Migrate converts a value stored by an older version; nil when absent.
+	Migrate func(value JsonObject, fromVersion int) (T, error)
+	// CheckpointWhen is the required policy: it returns true to store this ordinary change as a complete base instead of
+	// a delta. There is no default; DefineDocFamily rejects a definition without it.
+	CheckpointWhen func(value T, ops []Op, info CheckpointInfo) bool
 	DocumentSemantics
+	// Family is upstream's required literal `family: true` (documents.ts FamilyInput); DefineDocFamily panics when it is false.
+	Family  bool
 	Initial func(seed I) T
 }
 
@@ -211,8 +256,9 @@ type TaskRuntime[I, S, R any, H any] interface {
 	// Commit commits on the Session line after rereading the task. It fails when the task is terminal, the
 	// invocation ended, the Harness is closing, or, in a run invocation, the task carries an abort mark. A returned
 	// state replaces the task's state in the same commit; nil leaves it unchanged. tx.CreateTask defaults to the task's
-	// conversation.
-	Commit(ctx context.Context, change func(tx Tx, current RunningTask[I, S, R]) (*NextTaskState[S, R], error)) error
+	// conversation. options.Persistence may defer storing a commit that changes only documents (CommitPersistence); one
+	// that returns a state is stored at once.
+	Commit(ctx context.Context, change func(tx Tx, current RunningTask[I, S, R]) (*NextTaskState[S, R], error), options ...CommitOptions) error
 	// Memo reads a durable memo of this task; ok is false when absent.
 	Memo(ctx context.Context, name string) (value JsonValue, ok bool, err error)
 	// MemoCandidate stores candidate unless a memo already exists and returns the durable winner.
@@ -221,6 +267,12 @@ type TaskRuntime[I, S, R any, H any] interface {
 	GetTask(ctx context.Context, id TaskId) (*TaskRecord[JsonValue, JsonValue, JsonValue], error)
 	// WaitForTask returns the task's terminal receipt; it fails when the invocation ends.
 	WaitForTask(ctx context.Context, id TaskId) (SettledTask[JsonValue], error)
+	// AbortOwned aborts a task this task owns, as Harness.AbortTask does, and returns once it is terminal. It fails
+	// for a task another owns, and returns at once for a terminal one.
+	AbortOwned(ctx context.Context, id TaskId) error
+	// OwnedTasks returns the live tasks this task owns directly, in ID order: also those an earlier invocation created,
+	// before a restart. Tasks in conversations it owns are not included. The records are copies of the committed ones.
+	OwnedTasks(ctx context.Context) ([]TaskRecord[JsonValue, JsonValue, JsonValue], error)
 	// Outcomes returns the outcomes of terminal tasks, in order; it fails when one is missing or not terminal.
 	Outcomes(ctx context.Context, ids []TaskId) ([]TaskOutcome[JsonValue], error)
 	// Conversation returns an invocation-bound handle of an existing conversation; nil when absent. Its operations
@@ -228,16 +280,37 @@ type TaskRuntime[I, S, R any, H any] interface {
 	Conversation(ctx context.Context, id ConversationId) (ConversationHandle, error)
 	// Entry returns a committed entry visible from the task's conversation; nil when absent.
 	Entry(ctx context.Context, id EntryId) (*EntryRecord, error)
-	// Context returns the committed raw active transcript and model context, cut off at the visible entry at when at
-	// is not nil.
-	Context(ctx context.Context, conversationId ConversationId, at *EntryId) (ContextView, error)
+	// Entries returns the committed raw history of the task's conversation, fork-aware, as Conversation.Entries: every
+	// entry, also those a compaction summary or reset left behind. Entries never change, so a range bounded by entry
+	// IDs reads the same before and after a compaction, and in a rerun after a crash. Only the query's MinEntryId,
+	// MaxEntryId and Order are used.
+	Entries(ctx context.Context, query EntryQuery, limit int, cursor Cursor) (Page[EntryRecord, Cursor], error)
+	// Context returns the committed raw active transcript and model context, cut off at the visible entry
+	// options.At when it is set.
+	Context(ctx context.Context, conversationId ConversationId, options *ContextOptions) (ContextView, error)
 	// Now returns the Harness clock.
 	Now() float64
-	// Report forwards a non-fatal failure to HarnessOptions.onReport.
-	Report(err error)
-	// Sleep returns once the Harness clock reaches until; it fails when the invocation or ctx is cancelled.
-	Sleep(ctx context.Context, until float64) error
+	// Report forwards a non-fatal failure to HarnessOptions.OnReport with this task in its info: a task_error about the
+	// task's own code, or, with from, an extension_error about extension code it called, such as a section, or a
+	// host_error about a host callback, such as the environment builder.
+	Report(err error, from ...ReportFrom)
+	// SetTimer calls callback once after about delayMs on the Harness's timer (HarnessOptions.SetTimer), for pacing
+	// work inside a phase, such as throttled progress commits. It is not durable: the invocation's end disarms it, and
+	// after its end nothing is armed. The returned function disarms it. Wait for time between phases with SleepUntil.
+	SetTimer(callback func(), delayMs float64) (disarm func())
+	// SleepUntil commits a sleep: the task holds no invocation until the Harness clock reaches until, then resumes at
+	// checkpoint. It returns once the sleep is stored, not when the time comes; the phase returns right after.
+	// Returning a TaskSleeping state from Commit is the same sleep, for one that must commit together with other
+	// writes.
+	SleepUntil(ctx context.Context, until float64, checkpoint S) error
 }
+
+// SetTimer is a host timer, given as HarnessOptions.SetTimer: call callback once, about delayMs from now, and return a
+// function that disarms it. Background timers only free memory, and a host may decline one by returning nil, for
+// example where a pending timer keeps the process from hibernating; the Harness then frees that memory at later
+// commits. Other timers pace or resume work: one the host panics on or declines is armed with a Go timer. A timer
+// should not fire early; callers check their clock again when it fires.
+type SetTimer func(callback func(), delayMs float64, background bool) (disarm func())
 
 // TaskDefinition is an executable durable state machine definition, registered in the registry by Name.
 type TaskDefinition[I, S, R any, H any] struct {
@@ -287,8 +360,21 @@ const (
 	JoinAllSettled JoinPolicy = "allSettled"
 )
 
+// TaskTrace is TaskOptions.trace, `TelemetryCarrier | "root"`: an explicit carrier override, or Root to start at the
+// adapter root without a stored carrier. A nil *TaskTrace is upstream's omitted or undefined trace.
+type TaskTrace struct {
+	// Root selects `"root"`; Carrier is then ignored.
+	Root    bool
+	Carrier telemetry.TelemetryCarrier
+}
+
 // TaskOptions holds the creation options for a durable task.
 type TaskOptions struct {
+	// Trace omitted (nil) inherits the creator's carrier; a Carrier overrides it; Root starts at the adapter root
+	// without a stored carrier.
+	Trace *TaskTrace
+	// Links are immutable creation-time links, attached to the spans of this task's first invocation.
+	Links []telemetry.TelemetryCarrier
 	// Ownership is required: a task always names its owner (spec §5.5).
 	Ownership TaskOwnership
 	// ConversationId defaults to the owner task's conversation, or the transaction's bound conversation; required for
@@ -297,6 +383,12 @@ type TaskOptions struct {
 	// Background applies to conversation-owned tasks only: excluded from ordinary idle waits, conversation aborts, and
 	// cascades.
 	Background bool
+	// AbandonOnRestart marks a task whose creator awaits it only in memory and does not resume after a restart, so it is
+	// pointless once the Harness that created it is gone. When scheduling starts in a later Harness, the task, if still
+	// live, is abort-marked with reason "restart", and the mark cascades to its ordinary owned work, before any of it
+	// runs again. Nil is unset: a task a tool that is not replay-safe creates through its api then defaults to true
+	// (tool.ts:338); false keeps it off.
+	AbandonOnRestart *bool
 }
 
 // ConversationOwnershipKind is "ownerless" or "task".
@@ -374,8 +466,9 @@ type EntryDraft struct {
 	Model []ai.Message  `json:"model,omitempty"`
 	Data  JsonValue     `json:"data,omitempty"`
 	Edits []ContextEdit `json:"edits,omitempty"`
-	// Head starts active context at an entry; HeadSelf starts it at the newly assigned entry ID.
-	Head     *EntryId `json:"-"`
+	// Head starts active context at an entry; HeadSelf starts it at the newly assigned entry ID. MarshalJSON writes either as the
+	// wire member head: an entry ID, or "self".
+	Head     *EntryId `json:"head,omitempty"`
 	HeadSelf bool     `json:"-"`
 }
 
@@ -402,12 +495,14 @@ type Entry[D any] struct {
 	Kind string
 }
 
-// SubmissionType is "input" or "write".
+// SubmissionType is "input", "write", or "continue".
 type SubmissionType string
 
 const (
 	SubmissionTypeInput SubmissionType = "input"
 	SubmissionTypeWrite SubmissionType = "write"
+	// SubmissionTypeContinue is a run started without a user message; it places no entry and is never queued.
+	SubmissionTypeContinue SubmissionType = "continue"
 )
 
 // SubmissionStatus is the lifecycle status of a submission.
@@ -425,14 +520,16 @@ const (
 	SubmissionUnanswered SubmissionStatus = "unanswered"
 )
 
-// SubmissionRecord is the durable lifecycle of one admitted user input or passive entry write.
+// SubmissionRecord is the durable lifecycle of one admitted user input, passive entry write, or continue.
 //
 // Upstream encodes each (type, status) pair as a union member; the Go struct carries every field and the Session
-// keeps them consistent: Entry is set for placed and done records and optional for unanswered input; Answer only for
-// done input; Reason and Detail only for unanswered records.
+// keeps them consistent: Entry is set for placed and done records and optional for unanswered input (a continue never
+// has one); Answer only for done input or continue; Reason and Detail only for unanswered records.
 type SubmissionRecord struct {
-	Id             SubmissionId   `json:"id"`
-	ConversationId ConversationId `json:"conversationId"`
+	// Trace is the adapter-owned context of the admission span; absent without propagation.
+	Trace          telemetry.TelemetryCarrier `json:"trace,omitzero"`
+	Id             SubmissionId               `json:"id"`
+	ConversationId ConversationId             `json:"conversationId"`
 	// RequestId is the host-provided deduplication key, scoped to the conversation; nil when absent.
 	RequestId *string          `json:"requestId,omitempty"`
 	Type      SubmissionType   `json:"type"`
@@ -454,20 +551,21 @@ type SubmissionSettlement struct {
 
 // SubmissionCreate holds the submission fields supplied before the Session assigns an ID.
 type SubmissionCreate struct {
-	ConversationId ConversationId   `json:"conversationId"`
-	RequestId      *string          `json:"requestId,omitempty"`
-	Type           SubmissionType   `json:"type"`
-	Status         SubmissionStatus `json:"status"`
-	Entry          *EntryId         `json:"entry,omitempty"`
-	Answer         *EntryId         `json:"answer,omitempty"`
-	Reason         *string          `json:"reason,omitempty"`
-	Detail         JsonValue        `json:"detail,omitempty"`
+	Trace          telemetry.TelemetryCarrier `json:"trace,omitzero"`
+	ConversationId ConversationId             `json:"conversationId"`
+	RequestId      *string                    `json:"requestId,omitempty"`
+	Type           SubmissionType             `json:"type"`
+	Status         SubmissionStatus           `json:"status"`
+	Entry          *EntryId                   `json:"entry,omitempty"`
+	Answer         *EntryId                   `json:"answer,omitempty"`
+	Reason         *string                    `json:"reason,omitempty"`
+	Detail         JsonValue                  `json:"detail,omitempty"`
 }
 
 // Record returns the submission record of a create with its assigned ID.
 func (create SubmissionCreate) Record(id SubmissionId) SubmissionRecord {
 	return SubmissionRecord{
-		Id: id, ConversationId: create.ConversationId, RequestId: create.RequestId, Type: create.Type,
+		Trace: create.Trace, Id: id, ConversationId: create.ConversationId, RequestId: create.RequestId, Type: create.Type,
 		Status: create.Status, Entry: create.Entry, Answer: create.Answer, Reason: create.Reason, Detail: create.Detail,
 	}
 }
@@ -514,6 +612,9 @@ const (
 	TaskRunning TaskStatus = "running"
 	// TaskWaiting is parked without an invocation until every task in On is terminal; then resumes at Checkpoint.
 	TaskWaiting TaskStatus = "waiting"
+	// TaskSleeping is parked without an invocation until the Harness clock reaches Until, in milliseconds on the
+	// HarnessOptions.Now clock; then resumes at Checkpoint. An abort mark does not wait for it.
+	TaskSleeping TaskStatus = "sleeping"
 	// TaskCompleting has its outcome decided; it becomes terminal once no ordinary owned work below is live and runs
 	// no more code.
 	TaskCompleting TaskStatus = "completing"
@@ -521,20 +622,147 @@ const (
 	TaskTerminal TaskStatus = "terminal"
 )
 
-// TaskState is the complete durable execution state of a task. Live statuses (pending, running, waiting) carry
-// Checkpoint; waiting also carries On and Policy; completing and terminal carry Outcome.
+// TaskState is the complete durable execution state of a task. Live statuses (pending, running, waiting, sleeping)
+// carry Checkpoint; waiting also carries On and Policy; sleeping also carries Until; completing and terminal carry
+// Outcome.
 type TaskState[S, R any] struct {
 	Status     TaskStatus      `json:"status"`
 	Checkpoint *S              `json:"checkpoint,omitempty"`
 	On         []TaskId        `json:"on,omitempty"`
 	Policy     JoinPolicy      `json:"policy,omitempty"`
+	Until      *float64        `json:"until,omitempty"`
 	Outcome    *TaskOutcome[R] `json:"outcome,omitempty"`
 }
 
+// ReportTask is the task a report is about.
+type ReportTask struct {
+	Id TaskId `json:"id"`
+	// Kind is the task's registered name.
+	Kind           string         `json:"kind"`
+	ConversationId ConversationId `json:"conversationId"`
+}
+
+// HostCallback is a host callback, by its HarnessOptions name; env is the environment builder, models a provider call,
+// and telemetry a telemetry adapter call made while a commit is published, which must not fail it.
+type HostCallback string
+
+// The host callbacks a report can name.
+const (
+	HostCallbackNow      HostCallback = "now"
+	HostCallbackSettings HostCallback = "settings"
+	HostCallbackRegistry HostCallback = "registry"
+	HostCallbackEnv      HostCallback = "env"
+	HostCallbackModels   HostCallback = "models"
+	HostCallbackSetTimer HostCallback = "setTimer"
+	HostCallbackOnWake   HostCallback = "onWake"
+	// HostCallbackTelemetry names a telemetry adapter that panicked while a commit was published.
+	HostCallbackTelemetry HostCallback = "telemetry"
+)
+
+// ReportKind is what a report to HarnessOptions.OnReport is about (Pi's `ReportInfo` tag, `kind`).
+type ReportKind string
+
+// The report kinds.
+const (
+	// ReportStorageFailed: the error failed the Session, which closes: a Storage error, often a platform reset.
+	ReportStorageFailed ReportKind = "storage_failed"
+	// ReportTaskFaulted: the task ended faulted: its phase threw (ReasonThrew), or its abort handler was cut off
+	// settings.restartLimit times (ReasonRestartLimit), as was a phase of a task of an extension's kind.
+	ReportTaskFaulted ReportKind = "task_faulted"
+	// ReportTaskInterrupted: crashes ended the task: it ended itself after being cut off settings.restartLimit times in a
+	// row (ReasonRestartLimit; a tool call, a compaction, a generation), or a generation's run ended because the host
+	// kept stopping while the model answered (ReasonInterrupted). ReportInfo.Restarts is the task's count when it ended.
+	ReportTaskInterrupted ReportKind = "task_interrupted"
+	// ReportMigrationFailed: the task's stored state could not be migrated; it is blocked until the registry changes.
+	ReportMigrationFailed ReportKind = "migration_failed"
+	// ReportTaskOutdated: a running task keeps running under its old definition, which was uninstalled (missing_task)
+	// or replaced by one that cannot take over its state: older than the task (task_too_old), or newer without a
+	// migrate (migration_failed).
+	ReportTaskOutdated ReportKind = "task_outdated"
+	// ReportTaskError: the task's own runtime.Report, or a failure in running it.
+	ReportTaskError ReportKind = "task_error"
+	// ReportExtensionError: a hook, a section, a wrapper, or a tool's invalid structured output; with the task that ran
+	// it, or, outside a task, the conversation whose agent was resolved.
+	ReportExtensionError ReportKind = "extension_error"
+	// ReportHostError: a host callback threw; with the task that called it, if one did.
+	ReportHostError ReportKind = "host_error"
+	// ReportListenerError: a commit, close, watch, view, or document listener threw.
+	ReportListenerError ReportKind = "listener_error"
+)
+
+// The reasons a report carries in ReportInfo.Reason.
+const (
+	ReasonThrew           = "threw"
+	ReasonRestartLimit    = "restart_limit"
+	ReasonInterrupted     = "interrupted"
+	ReasonMissingTask     = "missing_task"
+	ReasonTaskTooOld      = "task_too_old"
+	ReasonMigrationFailed = "migration_failed"
+)
+
+// BlockedReason is why a pending task cannot run here (Pi scheduler.ts BlockedReason): no registered definition takes
+// it (missing_task, task_too_old) or its state could not be migrated (migration_failed). Derived, never persisted;
+// TaskGraph nodes carry it as Blocked.
+type BlockedReason string
+
+const (
+	BlockedMissingTask     BlockedReason = "missing_task"
+	BlockedTaskTooOld      BlockedReason = "task_too_old"
+	BlockedMigrationFailed BlockedReason = "migration_failed"
+)
+
+// ReportInfo says, by Kind, what a report to HarnessOptions.OnReport is about (Report adds the error). Extension, where set, names the extension whose
+// code failed, when known; for a task's own code, the one that installed the definition the task ran. Task is set for
+// the task types, and for an extension_error or host_error that a task caused. ConversationId is set for an
+// extension_error outside a task. Reason is set for task_faulted, task_interrupted, and task_outdated, Restarts for
+// task_interrupted; Callback for host_error.
+type ReportInfo struct {
+	Kind           ReportKind
+	Task           *ReportTask
+	Extension      string
+	Reason         string
+	Restarts       int
+	Callback       HostCallback
+	ConversationId *ConversationId
+}
+
+// Report is one report to HarnessOptions.OnReport: what it is about (ReportInfo, by Kind) and the Error reported.
+type Report struct {
+	ReportInfo
+	Error error
+}
+
+// ReportFromKind is whose code a task's runtime.Report is about when not the task's own.
+type ReportFromKind string
+
+// The sources ReportFrom names.
+const (
+	ReportFromExtension ReportFromKind = "extension"
+	ReportFromHost      ReportFromKind = "host"
+)
+
+// ReportFrom is whose code a task's runtime.Report is about when not the task's own, by Kind: an extension's (Extension,
+// when known), or a host callback (Callback).
+type ReportFrom struct {
+	Kind      ReportFromKind
+	Extension string
+	Callback  HostCallback
+}
+
+// TaskAbortReason is why a task's abort mark was set when not by an abort request.
+type TaskAbortReason string
+
+// AbortedByRestart marks a task abandoned after a restart (TaskOptions.AbandonOnRestart), or below one.
+const AbortedByRestart TaskAbortReason = "restart"
+
 // TaskRecord is the complete replacement record for one durable task state machine.
 type TaskRecord[I, S, R any] struct {
-	Id             TaskId         `json:"id"`
-	ConversationId ConversationId `json:"conversationId"`
+	// Trace is the adapter-owned context that created this task; phase invocations extract it as their parent.
+	Trace telemetry.TelemetryCarrier `json:"trace,omitzero"`
+	// Links are the immutable creation-time links for the task's first invocation.
+	Links          []telemetry.TelemetryCarrier `json:"links,omitzero"`
+	Id             TaskId                       `json:"id"`
+	ConversationId ConversationId               `json:"conversationId"`
 	// Kind is the registered task definition name.
 	Kind string `json:"kind"`
 	// Version is the definition version used to migrate live input and checkpoints.
@@ -547,10 +775,27 @@ type TaskRecord[I, S, R any] struct {
 	// aborts, and cascades.
 	Background bool `json:"background"`
 	// AbortRequested is the durable abort mark checked before run-mode progress is committed.
-	AbortRequested bool            `json:"abortRequested"`
-	State          TaskState[S, R] `json:"state"`
+	AbortRequested bool `json:"abortRequested"`
+	// AbortReason is why the mark was set when not by an abort request: "restart" for a task abandoned after a restart
+	// (TaskOptions.AbandonOnRestart) or below one. Such a task waits for its definition instead of becoming orphaned. A
+	// later abort request clears it. Empty when absent.
+	AbortReason TaskAbortReason `json:"abortReason,omitempty"`
+	// AbandonOnRestart is set from TaskOptions.AbandonOnRestart. Immutable.
+	AbandonOnRestart bool            `json:"abandonOnRestart,omitempty"`
+	State            TaskState[S, R] `json:"state"`
 	// Memos are small first-writer-wins values retained while the task can run; nil once completing or terminal.
 	Memos map[string]JsonValue `json:"memos,omitempty"`
+	// StartedAt is the wall-clock time in milliseconds of the first change to running, stamped by the Session. It is
+	// kept through waits and recovery, so the span to EndedAt includes them. Nil before the task first runs, and on
+	// records written by earlier versions.
+	StartedAt *float64 `json:"startedAt,omitempty"`
+	// EndedAt is the wall-clock time in milliseconds of the change to terminal, stamped by the Session; nil while live.
+	EndedAt *float64 `json:"endedAt,omitempty"`
+	// Restarts is how many times in a row a crash, eviction, or reset cut the task off while it ran, without the task
+	// changing its state since; open counts them, and a close does not. At HarnessSettings.RestartLimit the task ends (the
+	// built-in tasks end themselves, visibly; the scheduler faults any other kind), and a generation reads it to charge an
+	// interrupted model request as a failed attempt. Zero when absent.
+	Restarts int `json:"restarts,omitempty"`
 }
 
 // DocumentRecordScope is the owner of a document incarnation.
@@ -597,22 +842,43 @@ type Page[T, C any] struct {
 	Next *C
 }
 
-// Cursor is backend-owned JSON continuation state that callers only round-trip to the same scan.
+// Cursor is backend-owned JSON continuation state that callers only round-trip to the same scan. It carries the scan's
+// order: a scan given a cursor continues in that order, and rejects a different Order in its query.
 type Cursor = map[string]JsonValue
+
+// ScanOrder is the ID order of a scan.
+type ScanOrder string
+
+const (
+	// ScanAscending is oldest first.
+	ScanAscending ScanOrder = "ascending"
+	// ScanDescending is newest first.
+	ScanDescending ScanOrder = "descending"
+)
+
+// ContextOptions is the optional argument of a context read.
+type ContextOptions struct {
+	// At cuts the context off at this visible entry: the view Fork(At) would start with.
+	At *EntryId
+}
 
 // ConversationQuery holds optional filters for an ordered conversation scan.
 type ConversationQuery struct {
 	OwnerConversationId *ConversationId
 	OwnerTaskId         *TaskId
+	// Order defaults to ScanAscending; with a cursor, the cursor's order.
+	Order *ScanOrder
 }
 
-// EntryQuery holds inclusive ID bounds for a newest-first scan of one conversation's fork-aware history.
+// EntryQuery holds inclusive ID bounds for a scan of one conversation's fork-aware history.
 type EntryQuery struct {
 	ConversationId ConversationId
 	// MinEntryId is the oldest entry ID that may be returned.
 	MinEntryId *EntryId
 	// MaxEntryId is the newest entry ID that may be returned.
 	MaxEntryId *EntryId
+	// Order defaults to ScanDescending; with a cursor, the cursor's order.
+	Order *ScanOrder
 }
 
 // TaskQuery holds optional filters for an ordered scan of durable task records.
@@ -622,12 +888,16 @@ type TaskQuery struct {
 	Status         *TaskStatus
 	AbortRequested *bool
 	Background     *bool
+	// Order defaults to ScanAscending; with a cursor, the cursor's order.
+	Order *ScanOrder
 }
 
 // SubmissionQuery holds optional filters for an ordered scan of submission records.
 type SubmissionQuery struct {
 	ConversationId *ConversationId
 	Status         *SubmissionStatus
+	// Order defaults to ScanAscending; with a cursor, the cursor's order.
+	Order *ScanOrder
 }
 
 // DocumentPoint is the current state (Current) or one historical commit sequence used for document membership and
@@ -759,18 +1029,28 @@ func (EntryWrite) commitChangeType() string        { return "entry" }
 func (TaskWrite) commitChangeType() string         { return "task" }
 func (SubmissionWrite) commitChangeType() string   { return "submission" }
 
-// DocumentChange is the committed change of one document incarnation.
+// DocumentChange is the committed change of one document incarnation, a creation or an update (Pi's `type: "document"`
+// with `kind: "change"`); a retirement is a DocumentRetireChange.
 type DocumentChange struct {
 	Record DocumentRecord
 	// ConversationId owns the document; task documents derive it from their task record. Nil only for Session
 	// documents.
 	ConversationId *ConversationId
-	// Version is the definition version of Value; nil when this commit retired the incarnation.
-	Version *int
-	// Value is the exact adopted immutable revision, or nil when this commit retired the incarnation.
+	// Version is the definition version of Value.
+	Version int
+	// Value is the exact adopted immutable revision.
 	Value JsonObject
-	// Ops are the exact adopted operations for an ordinary update; empty for creation and retirement.
+	// Ops are the exact adopted operations for an ordinary update; empty for creation.
 	Ops []Op
+}
+
+// DocumentRetireChange is the committed retirement of one document incarnation (Pi's `type: "document"` with
+// `kind: "retire"`): this commit retired it.
+type DocumentRetireChange struct {
+	Record DocumentRecord
+	// ConversationId owns the document; task documents derive it from their task record. Nil only for Session
+	// documents.
+	ConversationId *ConversationId
 }
 
 // DocumentCopyChange is a definition-free child initialization; consumers hydrate through state or watch acquisition.
@@ -780,22 +1060,27 @@ type DocumentCopyChange struct {
 	Source         DocumentCopySource
 }
 
-func (DocumentChange) commitChangeType() string     { return "document" }
-func (DocumentCopyChange) commitChangeType() string { return "document.copy" }
+func (DocumentChange) commitChangeType() string       { return "document" }
+func (DocumentRetireChange) commitChangeType() string { return "document" }
+func (DocumentCopyChange) commitChangeType() string   { return "document.copy" }
 
-// DocumentCommitChange is a DocumentChange or a DocumentCopyChange.
+// DocumentCommitChange is a DocumentChange, a DocumentRetireChange or a DocumentCopyChange.
 type DocumentCommitChange interface {
 	CommitChange
 	documentCommitChange()
 }
 
-func (DocumentChange) documentCommitChange()     {}
-func (DocumentCopyChange) documentCommitChange() {}
+func (DocumentChange) documentCommitChange()       {}
+func (DocumentRetireChange) documentCommitChange() {}
+func (DocumentCopyChange) documentCommitChange()   {}
 
 // CommitChangeType returns the upstream `type` discriminator of a change.
 func CommitChangeType(change CommitChange) string { return change.commitChangeType() }
 
-// CommitPublication holds every immutable change from one successful Session commit.
+// CommitPublication holds every immutable change one Session storage transaction stored, with its Seq. Change order is
+// unspecified. A commit held in memory (CommitPersistence) is published once it is stored: by the next commit that reads
+// or writes its document, alone (the Seq of its own), or with that commit, whose document change then carries the held
+// operations followed by its own.
 type CommitPublication struct {
 	Seq     Seq
 	Changes []CommitChange
@@ -807,7 +1092,8 @@ type CreateConversationOptions struct {
 }
 
 // Tx is the transaction surface of one Session commit callback. Table reads and creation results are trusted
-// immutable values and may be shared with internal commit state.
+// immutable values and may be shared with internal commit state; the Session may freeze them (its caches and context
+// ranges keep them), so mutating one can throw.
 //
 // Upstream overloads doc, retireDoc, entry, appendEntry, and createTask by token type; Go methods cannot take type
 // parameters, so the methods take erased tokens and the generic helpers (TxDoc, TxEntry, TxAppendEntry, CreateTask)
@@ -823,6 +1109,8 @@ type Tx interface {
 	ScanEntries(query EntryQuery, limit int, cursor Cursor) (Page[EntryRecord, Cursor], error)
 	// LatestHeadMarker returns the newest visible entry of the conversation that carries a Head; nil when none.
 	LatestHeadMarker(conversationId ConversationId) (*EntryRecord, error)
+	// LatestEntryId returns the ID of the newest entry visible from the conversation; nil when it has none.
+	LatestEntryId(conversationId ConversationId) (*EntryId, error)
 	ScanTasks(query TaskQuery, limit int, cursor Cursor) (Page[TaskRecord[JsonValue, JsonValue, JsonValue], Cursor], error)
 	// SubmissionByRequest returns the committed submission with a conversation-scoped request ID; nil when absent.
 	SubmissionByRequest(conversationId ConversationId, requestId string) (*SubmissionRecord, error)
@@ -839,9 +1127,9 @@ type Tx interface {
 	// inbox queueing, no placement. Use Conversation.Submit or a conversation handle unless the caller implements
 	// admission itself.
 	CreateSubmission(create SubmissionCreate) (SubmissionRecord, error)
-	// SettleSubmission settles a queued or placed submission; only a placed input can be answered, and a settled
-	// submission stays unchanged. Resolved against this transaction's latest record of the submission, so it works
-	// after table writes. Run tasks settle the inputs they answer.
+	// SettleSubmission settles a queued or placed submission; only a placed input or continue can be answered, and a
+	// settled submission stays unchanged. Resolved against this transaction's latest record of the submission, so it
+	// works after table writes. Run tasks settle the inputs they answer.
 	SettleSubmission(id SubmissionId, settlement SubmissionSettlement) error
 	// PlaceSubmission places a queued submission at entry: an input becomes placed, a write done. Resolved like
 	// SettleSubmission. Inbox boundaries place the submissions they select.
@@ -855,48 +1143,85 @@ type Tx interface {
 	RetireDoc(token AnyDocToken, args ...any) error
 }
 
-// DocumentState is disposable, read-only Chord state bound to one committed document incarnation of type T; its
-// value is nil once the incarnation is retired. The state holds the JSON value (T is phantom, as for Draft);
-// DecodeDoc[T](state.Value()) reads it as T.
-type DocumentState[T any] = *chord.AttachedReplicatedState[JsonObject]
-
-// AttachedReplicatedState is a synchronously hydrated publication-only Chord state backed by one source attachment.
-type AttachedReplicatedState[T any] = *chord.AttachedReplicatedState[T]
-
-// WatchEndReason is why a watch ended.
-type WatchEndReason string
+// WatchEndKind is why a watch ended; it is Chord's (index.ts re-exports Chord's WatchEnd and WatchHandle).
+type WatchEndKind = chord.WatchEndKind
 
 const (
-	WatchStopped       WatchEndReason = "stopped"
-	WatchCancelled     WatchEndReason = "cancelled"
-	WatchSessionClosed WatchEndReason = "session_closed"
-	WatchRetired       WatchEndReason = "retired"
-	WatchListenerError WatchEndReason = "listener_error"
+	WatchStopped       = chord.WatchStopped
+	WatchAborted       = chord.WatchAborted
+	WatchEnded         = chord.WatchEnded
+	WatchListenerError = chord.WatchListenerError
+	// WatchFailed ends a watch when the Session failed; Error is the failure, usually a Storage error (see SessionFailed).
+	WatchFailed = chord.WatchFailed
 )
 
-// WatchEnd is the terminal result of one document watch; Error is set only for listener_error.
-type WatchEnd struct {
-	Reason WatchEndReason
-	Error  error
+// WatchEnd is the terminal result of one watch, tagged by Kind.
+type WatchEnd = chord.WatchEnd
+
+// WatchCallKind tags a WatchCall; it is Chord's.
+type WatchCallKind = chord.WatchCallKind
+
+const (
+	WatchCallValue  = chord.WatchCallValue
+	WatchCallFailed = chord.WatchCallFailed
+)
+
+// WatchHandle is a serialized observation of an immutable value: one listener call at a time; changes made meanwhile arrive folded into the next call.
+type WatchHandle[T any] = chord.WatchHandle[T]
+
+// WatchCall is one call of a JSON watch's listener, tagged by Kind: the newest value, the ops that turn the previous value
+// into it, and whether the document the watch follows was retired since the previous value call, or a failure its source
+// may recover from; it is Chord's.
+type WatchCall[T any] = chord.WatchCall[T]
+
+// NativeWatchCall is one call of a native watch's listener: the new value, or a failure; it is Chord's.
+type NativeWatchCall[T any] = chord.NativeWatchCall[T]
+
+// DocumentWatch is a watch of one document address (kind, scope, and key), from the incarnation found at acquisition on.
+// A retirement is a call with Retired set, the last value the watch was given and no ops (a change made in the retiring
+// commit itself is not shown: that commit publishes the retirement only); the watch goes on, and a document created at
+// the address later arrives as [["r", value]], folded with what is pending. It ends ended when its scope's owner ends: a
+// task document's watch once the retirement call of the commit that makes its task terminal returned, every watch at
+// Session close (a pending retirement dropped); failed with the error that failed the Session.
+type DocumentWatch[T any] = WatchHandle[T]
+
+// Observer is a synchronous observer of committed Durable state, for adapters such as a Chord source
+// (Session.ObserveDocErased, Harness.ObserveConversation, Harness.ObserveTaskGraph), with the shapes of Chord's watch:
+// Advance gets a WatchCall, End a WatchEnd. Advance gets every change, unfolded, as
+// memory adopts it: for a stored commit at its publication once Storage stored it, for a deferred one before it is
+// stored. A view or the graph gets at most one call per commit, a document observer one per change at its address (two
+// for a commit that retires and recreates it); the task graph also advances outside any commit's publication, on the
+// Session line, when a registry change or a failed migration changes a blocked reason. Durable's failures are final, so every call is a value
+// call; a failure ends the observer. Calls may come before the attaching call returns; their ops apply from
+// Observation.Value. Advance must only record the call, synchronously and quickly, never wait, call the Session, or
+// panic. A panic is reported as listener_error, detaches the observer, and ends it listener_error with the error. End is
+// called once: ended when the Session closes or the observed scope's owner ends (a task document's task, after its
+// retirement change, inside that commit's publication), failed with the error that failed the Session; never after Detach.
+type Observer[T any] interface {
+	Advance(ctx context.Context, call WatchCall[T])
+	End(end WatchEnd)
 }
 
-// WatchHandle is a serialized exact-frame observation of an immutable value with bounded pending delivery.
-type WatchHandle[T any] interface {
-	// Value is the acquisition revision before Start and the latest delivered immutable revision afterward.
+// CommitObserver is a synchronous observer of stored commits (Session.ObserveCommits): Advance gets each
+// CommitPublication, End the Session's close.
+type CommitObserver interface {
+	Advance(ctx context.Context, publication CommitPublication)
+	End(end WatchEnd)
+}
+
+// CommitObservation is an attached CommitObserver: how to detach it.
+type CommitObservation interface {
+	// Detach is idempotent: no Advance or End follows it.
+	Detach()
+}
+
+// Observation is an attached Observer: the value at attachment, which every later Advance starts from, and how to detach
+// it.
+type Observation[T any] interface {
 	Value() T
-	// Start installs the sole asynchronous listener. It never invokes it inline.
-	Start(listener func(ctx context.Context, value T, ops []Op) error)
-	// Stop idempotently stops future callbacks and returns this watch's terminal result.
-	Stop() (WatchEnd, error)
-	// Closed returns a channel closed when the watch terminates and the terminal result; an already-running callback
-	// remains caller-owned.
-	Closed() <-chan struct{}
-	// End returns the terminal result once Closed is closed.
-	End() WatchEnd
+	// Detach is idempotent: no Advance or End follows it, not even for the rest of a commit underway.
+	Detach()
 }
-
-// DocumentWatch is a watch of one document incarnation; the value is nil once retired.
-type DocumentWatch[T any] = WatchHandle[*T]
 
 // DocumentReader holds committed document reads (Session.snapshot and snapshotAsOf).
 type DocumentReader interface {
@@ -914,33 +1239,110 @@ type DocumentObserver interface {
 	WatchDocErased(ctx context.Context, token AnyDocToken, args ...any) (WatchHandle[JsonObject], error)
 }
 
+// SessionEndKind is how a Session ended: closed by its owner, or failed.
+type SessionEndKind string
+
+const (
+	SessionEndClosed SessionEndKind = "closed"
+	SessionEndFailed SessionEndKind = "failed"
+)
+
+// SessionEnd is the terminal result of one Session, tagged by Kind; Error is the first error that failed it, set only for
+// failed.
+type SessionEnd struct {
+	Kind  SessionEndKind
+	Error error
+}
+
+// CommitPersistenceKind is when a commit reaches Storage.
+type CommitPersistenceKind string
+
+const (
+	// CommitImmediate, the default, stores a commit before Commit returns.
+	CommitImmediate CommitPersistenceKind = "immediate"
+	// CommitDeferred lets the Session adopt a commit in memory, show it to watches and views, and return, but store it
+	// later (CommitPersistence).
+	CommitDeferred CommitPersistenceKind = "deferred"
+)
+
+// CommitPersistence is when a commit reaches Storage. Immediate, the default: before the commit returns. Deferred: when
+// every write of the commit changes an existing conversation document with History latest and Fork initial (no
+// creation, migration, or retirement), the Session adopts it in memory, shows it to watches and views, and returns, but
+// stores it later: with the next commit that reads (tx.Doc) or writes that document, before the document leaves memory or
+// retires, at Close, and at the latest about WithinMs after the commit (default Settings.Progress.PersistWithinMs,
+// 1,000 ms; +Inf waits for one of the others). A commit that writes anything else is immediate. A crash loses what is
+// held, so only state whose loss is acceptable, such as streamed progress, should be deferred, and nothing durable may
+// depend on it without reading it in a commit.
+type CommitPersistence struct {
+	Kind CommitPersistenceKind
+	// WithinMs is how long a deferred commit may stay in memory, a number of milliseconds, 0 or more; nil selects the
+	// default. Anything else makes the commit return an error (upstream rejects with a TypeError).
+	WithinMs *float64
+}
+
+// CommitOptions are the options of one Session commit; the zero value is an immediate commit.
+type CommitOptions struct {
+	Persistence *CommitPersistence
+}
+
+// SingleCommitOptions is the options value of a Commit call, which takes at most one: upstream's optional argument,
+// variadic in Go so that a call without it is unchanged. More than one is an error, as is a deferred commit whose WithinMs
+// is not a number of milliseconds, 0 or more (upstream rejects with a TypeError).
+func SingleCommitOptions(options []CommitOptions) (CommitOptions, error) {
+	if len(options) > 1 {
+		return CommitOptions{}, fmt.Errorf("Commit takes at most one CommitOptions, got %d", len(options))
+	}
+	if len(options) == 0 {
+		return CommitOptions{}, nil
+	}
+	if persistence := options[0].Persistence; persistence != nil && persistence.Kind == CommitDeferred && persistence.WithinMs != nil && !(*persistence.WithinMs >= 0) {
+		return CommitOptions{}, errors.New("CommitPersistence.withinMs must be a number of milliseconds, 0 or more")
+	}
+	return options[0], nil
+}
+
 // Session owns one mutation line, its records, and its tracked documents.
 type Session interface {
 	DocumentObserver
 	DocumentReader
-	// Commit runs one atomic transaction on the Session mutation line.
-	Commit(ctx context.Context, change func(tx Tx) (any, error)) (any, error)
+	// ObserveDocErased attaches a synchronous Observer to one document address, atomically on the Session line, as
+	// WatchDocErased acquires a watch: the observation's value includes every commit before it, and Advance gets every
+	// later one, retirements and later incarnations included. The observation is nil when the address is absent. ctx
+	// governs only the attachment: cancelled while attaching, the call fails and nothing stays attached. args are the
+	// owner ID and family key as for WatchDocErased. Typed observers use ObserveDoc.
+	ObserveDocErased(ctx context.Context, token AnyDocToken, observer Observer[JsonObject], args ...any) (Observation[JsonObject], error)
+	// Commit runs one atomic transaction on the Session mutation line. Inside the callback read only through tx: Snapshot, WatchDoc, GetTask and the other Session and runtime reads may queue on the line the callback holds, and then never return. At most one options value may follow; Persistence may defer storing it (CommitPersistence). The callback may run while an earlier commit is being stored: at its first read or write of what an unpublished commit wrote, it waits until that commit is stored and published; code before that runs early, so act on what it computes only once the commit returns. It returns once the commit is stored and published, after every earlier commit's outcome.
+	Commit(ctx context.Context, change func(tx Tx) (any, error), options ...CommitOptions) (any, error)
 	// Close seals admission, settles admitted commits, then closes storage.
 	Close(ctx context.Context) error
-	// SubscribeCommits observes complete commits synchronously after adoption. The listener must not panic, block,
-	// or call Session APIs.
-	SubscribeCommits(listener func(ctx context.Context, publication CommitPublication)) func()
+	// ObserveCommits observes stored commits, each with exactly what it stored, except that a document the commit
+	// retires is published as its retirement only; a commit held in memory is published when it is stored
+	// (CommitPublication). Commits are published in line order once Storage stored them, a macrotask apart; a
+	// publication queues one dispatch, which runs a microtask later, before every wait the commit resolves and every
+	// abort it queues, and calls the observers attached by then; a commit published while none was attached has no
+	// dispatch. There is no order relative to watch listeners. Advance runs
+	// synchronously and must not block or call Session APIs; a panic is reported as listener_error, detaches the
+	// observer, and ends it listener_error. End is called once, when the Session closes (ended, after its last
+	// publication) or fails (failed), never after Detach. It attaches synchronously; the observation has no value:
+	// commits are events, not a state, and the Session does not know Storage's newest Seq before its own first commit.
+	ObserveCommits(observer CommitObserver) CommitObservation
 	// SubscribeClose observes close synchronously when it begins. The listener must not panic, block, or call
 	// Session APIs.
 	SubscribeClose(listener func()) func()
-	// DocumentStateErased returns a disposable state of the document's JSON value, or nil when absent. Typed states
-	// use the DocumentStateOf helper.
-	DocumentStateErased(ctx context.Context, token AnyDocToken, args ...any) (AttachedReplicatedState[JsonObject], error)
+	// Closed returns a channel closed once the Session ended: after close reached the backend, or a failure ended it.
+	Closed() <-chan struct{}
+	// End returns how the Session ended once Closed is closed.
+	End() SessionEnd
 }
 
 // Committer runs one atomic Session commit: a Session, a Conversation, or a tool's ToolExecutionApi.
 type Committer interface {
-	Commit(ctx context.Context, change func(tx Tx) (any, error)) (any, error)
+	Commit(ctx context.Context, change func(tx Tx) (any, error), options ...CommitOptions) (any, error)
 }
 
 // Commit runs change in one commit and returns its typed result.
-func Commit[T any](ctx context.Context, committer Committer, change func(tx Tx) (T, error)) (T, error) {
-	result, err := committer.Commit(ctx, func(tx Tx) (any, error) { return change(tx) })
+func Commit[T any](ctx context.Context, committer Committer, change func(tx Tx) (T, error), options ...CommitOptions) (T, error) {
+	result, err := committer.Commit(ctx, func(tx Tx) (any, error) { return change(tx) }, options...)
 	if err != nil {
 		var zero T
 		return zero, err
@@ -955,20 +1357,44 @@ type EntryAt struct {
 	CommitSeq Seq
 }
 
+// CommitResult is what Storage.Commit stored: the number of durable batches, and why the next one was refused, if one
+// was.
+type CommitResult struct {
+	Stored  int
+	Refused error
+}
+
+// PublishingStorage is the optional Publishing capability of a Storage. Publishing runs publish, the Session's
+// publication of one stored or held commit (its cache write-through, adoption, and observers), inside this storage's own
+// scope, such as a store's attached host batch, so what the publication marks lands together. It calls publish exactly
+// once, now or soon after; the Session publishes the next commit only once it ran. Without it, the Session publishes
+// directly.
+type PublishingStorage interface {
+	Publishing(ctx context.Context, publish func())
+}
+
 // Storage is the atomic persistence boundary for Session records.
 //
 // Storage trusts the owning Session to supply semantically valid records, references, ancestry, and transitions.
 // Implementations enforce atomicity, global ID ownership, immutable conversation/entry creation, document record
 // consistency, and detached values; Session serializes commits.
 type Storage interface {
-	// Commit atomically persists one batch and returns its sequence. Once it returns, later reads through this
-	// storage observe it.
-	Commit(ctx context.Context, writes []StorageWrite) (Seq, error)
-	// MintId returns a fresh candidate from the Session-global numeric ID namespace.
+	// Commit persists batches in order, each as one ordinary atomic commit with its own seq, checked against the state
+	// the earlier ones left, in as few round trips as the backend can. Every batch has at least one write: a commit
+	// without writes never reaches Storage, so the Session never sends an empty batch. It stops at the first batch
+	// Durable's own checks refuse (global IDs, document actions, copy resolution): the batches before it are durable, it
+	// and the ones after are not. It calls receive(index, seq) once per durable batch, in order, synchronously, after all
+	// of them are durable and before the next commit starts. It returns the number of durable batches and the refusal, if
+	// any, and fails for an unknown outcome (connection lost, statement or commit failed); receive calls made before the
+	// failure still stand. receive is a durability receipt, not publication: the Session publishes later. Once it
+	// returned, later reads through this storage observe the stored batches.
+	Commit(ctx context.Context, batches [][]StorageWrite, receive func(index int, seq Seq)) (CommitResult, error)
+	// MintId returns a fresh candidate from the Session-global numeric ID namespace, greater than every ID minted since
+	// this storage was opened and every ID stored, also across reopen.
 	MintId() (int64, error)
 	// Conversation looks up one conversation by exact ID; nil when absent.
 	Conversation(ctx context.Context, id ConversationId) (*ConversationRecord, error)
-	// ScanConversations scans conversations in ascending ID order.
+	// ScanConversations scans conversations in query.Order (default ascending) by ID.
 	ScanConversations(ctx context.Context, query ConversationQuery, limit int, cursor Cursor) (Page[ConversationRecord, Cursor], error)
 	// Entry looks up one global entry and the sequence of the commit that persisted it; nil when absent.
 	Entry(ctx context.Context, id EntryId) (*EntryAt, error)
@@ -977,15 +1403,15 @@ type Storage interface {
 	// FindLatestHeadMarker returns the newest visible entry with a Head at or below the optional inclusive cutoff.
 	// The returned entry is the marker; its Head is the range's actual lower bound.
 	FindLatestHeadMarker(ctx context.Context, conversationId ConversationId, atOrBeforeEntryId *EntryId) (*EntryRecord, error)
-	// ScanEntries scans the inclusive visible range newest-first, returning at most limit entries.
+	// ScanEntries scans the inclusive visible range in query.Order (default descending), returning at most limit entries.
 	ScanEntries(ctx context.Context, query EntryQuery, limit int, cursor Cursor) (Page[EntryRecord, Cursor], error)
 	// Task looks up the latest complete record for one task; nil when absent.
 	Task(ctx context.Context, id TaskId) (*TaskRecord[JsonValue, JsonValue, JsonValue], error)
-	// ScanTasks scans task records matching every supplied filter.
+	// ScanTasks scans task records matching every supplied filter in query.Order (default ascending) by ID.
 	ScanTasks(ctx context.Context, query TaskQuery, limit int, cursor Cursor) (Page[TaskRecord[JsonValue, JsonValue, JsonValue], Cursor], error)
 	// Submission looks up the latest complete record for one admitted submission; nil when absent.
 	Submission(ctx context.Context, id SubmissionId) (*SubmissionRecord, error)
-	// ScanSubmissions scans submissions matching every supplied filter in ascending ID order.
+	// ScanSubmissions scans submissions matching every supplied filter in query.Order (default ascending) by ID.
 	ScanSubmissions(ctx context.Context, query SubmissionQuery, limit int, cursor Cursor) (Page[SubmissionRecord, Cursor], error)
 	// SubmissionByRequest finds a submission by its conversation-scoped host deduplication key; nil when absent.
 	SubmissionByRequest(ctx context.Context, conversationId ConversationId, requestId string) (*SubmissionRecord, error)

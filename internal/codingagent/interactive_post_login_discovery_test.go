@@ -22,19 +22,19 @@ func TestPostLoginModelSelectionRules(t *testing.T) {
 		ids               []string
 		selected, problem string
 	}{
-		{"oauth default", "github-copilot", []string{"other", "gpt-5.4"}, "gpt-5.4", ""},
-		{"api key default", "openai", []string{"other", "gpt-5.5"}, "gpt-5.5", ""},
+		{"oauth default", "github-copilot", []string{"other", "gpt-6.1-sol"}, "gpt-6.1-sol", ""},
+		{"api key default", "openai", []string{"other", "gpt-6.1-sol"}, "gpt-6.1-sol", ""},
 		{"no default", "custom", []string{"first"}, "", `, but no default model is configured for provider "custom". Use /model to select a model.`},
 		{"empty no default", "custom", nil, "", `, but no default model is configured for provider "custom". Use /model to select a model.`},
 		{"empty catalog", "openai", nil, "", ", but no models are available for that provider. Use /model to select a model."},
-		{"missing default", "openai", []string{"other"}, "", `, but its default model "gpt-5.5" is not available. Use /model to select a model.`},
+		{"missing default", "openai", []string{"other"}, "", `, but its default model "gpt-6.1-sol" is not available. Use /model to select a model.`},
 		{"radius default", "radius", []string{"fast", "balanced"}, "balanced", ""},
 		{"radius catalog order", "radius", []string{"powerful", "fast"}, "powerful", ""},
 		{"llama empty", "llama.cpp", nil, "", ". No llama.cpp models are loaded. Use /llama to load a model, then /model to select it."},
 		{"llama loaded", "llama.cpp", []string{"local"}, "", ". Use /model to select a loaded llama.cpp model, or /llama to manage models."},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			models := []tui.ModelSelectorItem{{Provider: "other", ID: "gpt-5.5"}}
+			models := []tui.ModelSelectorItem{{Provider: "other", ID: "gpt-6.1-sol"}}
 			for _, id := range tc.ids {
 				models = append(models, tui.ModelSelectorItem{Provider: tc.provider, ID: id})
 			}
@@ -103,7 +103,7 @@ func TestPostLoginModelDiscovery(t *testing.T) {
 				for _, id := range ids {
 					models = append(models, json.RawMessage(fmt.Sprintf(`{"id":%q,"name":%q,"provider":"radius","api":"pi-messages","baseUrl":"https://local.invalid/v1","input":["text"],"contextWindow":1000,"maxTokens":100}`, id, id)))
 				}
-				if err := store.Write(t.Context(), "radius", ai.ModelsStoreEntry{Models: models}); err != nil {
+				if err := store.Write(t.Context(), "radius", ai.ModelsStoreEntry{Models: mustStoredModels(models)}); err != nil {
 					t.Fatal(err)
 				}
 				close(blocked.release)
@@ -221,7 +221,7 @@ func TestPostLoginPreservesKnownModelAndReportsSelectionFailure(t *testing.T) {
 					t.Fatal(got)
 				}
 			case "unknown sentinel":
-				waitPostLoginStatus(t, m, "Selected gpt-5.5.")
+				waitPostLoginStatus(t, m, "Selected gpt-6.1-sol.")
 			default:
 				reason := "cannot build"
 				if name == "persistence failure" {
@@ -244,12 +244,13 @@ func BenchmarkPostLoginModelSelection(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		selected, problem := postLoginModel("openai", "Saved API key for OpenAI", DefaultModelPerProvider()["openai"], models)
-		if selected != "gpt-5.5" || problem != "" {
+		if selected != "gpt-6.1-sol" || problem != "" {
 			b.Fatalf("selection = %s, %s", selected, problem)
 		}
 	}
 }
 
+// Pi: packages/coding-agent/src/core/settings-manager.ts:1429 (SettingsManager.getEnabledModels).
 func TestPostLoginPersistsDefaultIntoNonEmptyScope(t *testing.T) {
 	m := newPostLoginTestMode(t)
 	m.scopedModelIDs = []string{"openai/other"}
@@ -259,17 +260,17 @@ func TestPostLoginPersistsDefaultIntoNonEmptyScope(t *testing.T) {
 	if err := setPostLoginAPIKey(m, "openai", "test-key"); err != nil {
 		t.Fatal(err)
 	}
-	waitPostLoginStatus(t, m, "Selected gpt-5.5.")
-	if got := strings.Join(m.scopedModelIDs, ","); got != "openai/other,openai/gpt-5.5" {
+	waitPostLoginStatus(t, m, "Selected gpt-6.1-sol.")
+	if got := strings.Join(m.scopedModelIDs, ","); got != "openai/other,openai/gpt-6.1-sol" {
 		t.Fatalf("scope = %s", got)
 	}
-	if got := strings.Join(m.opts.SettingsManager.GetEnabledModels(), ","); got != "openai/other,openai/gpt-5.5" {
+	if got := strings.Join(m.opts.SettingsManager.GetEnabledModels(), ","); got != "openai/other,openai/gpt-6.1-sol" {
 		t.Fatalf("saved scope = %s", got)
 	}
 }
 
 type postLoginFailingHandle struct{ recordingCompactHandle }
 
-func (*postLoginFailingHandle) SetModelOnMain(_ *ai.Model, _ ModelMutationOptions, dispatch func(func() error) error) error {
+func (*postLoginFailingHandle) SetModelOnMain(_ context.Context, _ *ai.Model, _ ModelMutationOptions, dispatch func(func() error) error) error {
 	return dispatch(func() error { return errors.New("cannot persist") })
 }

@@ -8,8 +8,8 @@
 //
 //   - Chord's Context is context.Context and comes first in every signature. A Promise maps to a blocking call that
 //     returns (value, error); a rejection is the error.
-//   - JsonValue is any holding strict JSON (nil, bool, float64, string, []any, map[string]any); JsonObject is
-//     map[string]any. Chord delta operations are chord/delta Op tuples, and a document Draft[T] is the revocable
+//   - JsonValue is any holding strict JSON (nil, bool, float64, string, []any, or an object); JsonObject is
+//     *delta.JsonObject, an object that keeps JavaScript's property order. Chord delta operations are chord/delta Op tuples, and a document Draft[T] is the revocable
 //     chord/delta overlay handle (*delta.Object) that records them.
 //   - Branded numeric IDs are distinct named int64 types, so a TaskId does not assign to a ConversationId. TaskId does
 //     not carry its result type: Go methods cannot take type parameters, so typed results are recovered at the
@@ -27,4 +27,10 @@
 //     interfaces.
 //   - Definition-time TypeErrors (an empty entry kind, a non-positive document version) are panics, as package-level
 //     definitions cannot return errors.
+//   - A watch listener is a blocking call, where Pi's listener awaits and its synchronous part ends at its first await. The
+//     Harness waits and the Session's publication of the next commit of a call wait for that synchronous part (a listener call
+//     that returned, or went on to a wait of the host: chord.DeliveryEntered). A listener that blocks on something the host cannot
+//     see (a channel, a lock, network I/O, a child process) calls chord.DeliveryEntered first, or does the blocking on a goroutine
+//     of its own and returns; until then it holds those waits and every later publication of its Session back (pig divergence
+//     (D224)).
 package durable

@@ -13,6 +13,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+
+	"github.com/MichaelKinsy/PiG/internal/jsnumber"
 )
 
 // SystemThemeName is the reserved name of the theme generated from the terminal's own colors.
@@ -126,13 +129,13 @@ var systemTokenFamilies = []struct{ token, family string }{
 	{"thinkingMax", "thinkingRed"},
 }
 
-var systemTokenFamily = func() map[string]string {
+var systemTokenFamily = sync.OnceValue(func() map[string]string {
 	families := make(map[string]string, len(systemTokenFamilies))
 	for _, entry := range systemTokenFamilies {
 		families[entry.token] = entry.family
 	}
 	return families
-}()
+})
 
 // systemTokenSlots are palette slots for tokens that would otherwise share a hue with a similar token.
 var systemTokenSlots = map[string]int{"syntaxString": 2, "syntaxNumber": 5, "searchMatchBg": 3}
@@ -224,62 +227,89 @@ type systemRule struct {
 	level string
 }
 
+// systemPanels are the surfaces other tokens are drawn on, in the order their rules come.
+var systemPanels = []string{"userMessageBg", "toolPendingBg", "toolSuccessBg", "toolErrorBg", "selectedBg", "searchMatchBg", "customMessageBg"}
+
+// The surfaces a rule's token is drawn on. A rule's on slice is shared by the rules that name it and is never written.
 var (
-	systemToolPanels    = []string{"toolPendingBg", "toolSuccessBg", "toolErrorBg"}
-	systemMessagePanels = []string{"userMessageBg", "customMessageBg"}
-	systemPanels        = []string{"userMessageBg", "toolPendingBg", "toolSuccessBg", "toolErrorBg", "selectedBg", "searchMatchBg", "customMessageBg"}
-	systemThinking      = []string{"thinkingOff", "thinkingMinimal", "thinkingLow", "thinkingMedium", "thinkingHigh", "thinkingXhigh", "thinkingMax"}
-	systemThinkingLevel = []string{"thinking0", "thinking1", "thinking2", "thinking3", "thinking4", "thinking5", "thinking6"}
+	systemOnBackground                   = []string{"background"}
+	systemOnSelected                     = []string{"selectedBg"}
+	systemOnUserMessage                  = []string{"userMessageBg"}
+	systemOnSearchMatch                  = []string{"searchMatchBg"}
+	systemOnScrollbarTrack               = []string{"scrollbarTrack"}
+	systemOnTools                        = []string{"toolPendingBg", "toolSuccessBg", "toolErrorBg"}
+	systemOnCustomMessageTools           = []string{"customMessageBg", "toolPendingBg", "toolSuccessBg", "toolErrorBg"}
+	systemOnBackgroundTools              = []string{"background", "toolPendingBg", "toolSuccessBg", "toolErrorBg"}
+	systemOnBackgroundMessages           = []string{"background", "userMessageBg", "customMessageBg"}
+	systemOnBackgroundMessagesTools      = []string{"background", "userMessageBg", "customMessageBg", "toolPendingBg", "toolSuccessBg", "toolErrorBg"}
+	systemOnBackgroundSelectedTools      = []string{"background", "selectedBg", "toolPendingBg", "toolSuccessBg", "toolErrorBg"}
+	systemOnBackgroundSelectedCustom     = []string{"background", "selectedBg", "customMessageBg", "toolPendingBg", "toolSuccessBg", "toolErrorBg"}
+	systemOnBackgroundCustomSelectedTool = []string{"background", "customMessageBg", "selectedBg", "toolPendingBg", "toolSuccessBg", "toolErrorBg"}
 )
 
-func systemEach(tokens []string, on []string, level string) []systemRule {
-	rules := make([]systemRule, len(tokens))
-	for i, token := range tokens {
-		rules[i] = systemRule{token, on, level}
-	}
-	return rules
+// systemRuleTable is the contrast rules in the order their tokens are solved from: a package-level composite of constants, so the linker lays it
+// out as data and no code builds it.
+var systemRuleTable = [...]systemRule{
+	{"userMessageBg", systemOnBackground, "panel"},
+	{"toolPendingBg", systemOnBackground, "panel"},
+	{"toolSuccessBg", systemOnBackground, "panel"},
+	{"toolErrorBg", systemOnBackground, "panel"},
+	{"selectedBg", systemOnBackground, "panel"},
+	{"searchMatchBg", systemOnBackground, "panel"},
+	{"customMessageBg", systemOnBackground, "panel"},
+	{"text", systemOnBackground, "text"},
+	{"text", systemOnSelected, "textOnPanel"},
+	{"userMessageText", systemOnUserMessage, "textOnPanel"},
+	{"toolTitle", systemOnTools, "textOnPanel"},
+	{"accent", systemOnBackgroundSelectedTools, "readable"},
+	{"success", systemOnBackgroundSelectedTools, "readable"},
+	{"error", systemOnBackgroundSelectedTools, "readable"},
+	{"warning", systemOnBackgroundSelectedTools, "readable"},
+	{"muted", systemOnBackgroundSelectedCustom, "readable"},
+	{"dim", systemOnBackgroundSelectedCustom, "subtle"},
+	{"thinkingText", systemOnBackground, "readable"},
+	{"customMessageText", systemOnCustomMessageTools, "readable"},
+	{"customMessageLabel", systemOnBackgroundCustomSelectedTool, "readable"},
+	{"toolOutput", systemOnBackgroundTools, "readable"},
+	{"mdHeading", systemOnBackgroundMessages, "readable"},
+	{"mdLink", systemOnBackgroundMessages, "readable"},
+	{"mdLinkUrl", systemOnBackgroundMessages, "readable"},
+	{"mdCode", systemOnBackgroundMessages, "readable"},
+	{"mdQuote", systemOnBackgroundMessages, "readable"},
+	{"mdCodeBlockBorder", systemOnBackgroundMessages, "readable"},
+	{"mdListBullet", systemOnBackgroundMessages, "readable"},
+	{"mdCodeBlock", systemOnBackgroundMessagesTools, "readable"},
+	{"toolDiffAdded", systemOnBackgroundTools, "readable"},
+	{"toolDiffRemoved", systemOnBackgroundTools, "readable"},
+	{"toolDiffContext", systemOnBackgroundTools, "readable"},
+	{"syntaxComment", systemOnBackgroundMessagesTools, "readable"},
+	{"syntaxKeyword", systemOnBackgroundMessagesTools, "readable"},
+	{"syntaxFunction", systemOnBackgroundMessagesTools, "readable"},
+	{"syntaxVariable", systemOnBackgroundMessagesTools, "readable"},
+	{"syntaxString", systemOnBackgroundMessagesTools, "readable"},
+	{"syntaxNumber", systemOnBackgroundMessagesTools, "readable"},
+	{"syntaxType", systemOnBackgroundMessagesTools, "readable"},
+	{"syntaxOperator", systemOnBackgroundMessagesTools, "readable"},
+	{"syntaxPunctuation", systemOnBackgroundMessagesTools, "readable"},
+	{"searchMatchText", systemOnSearchMatch, "readable"},
+	{"bashMode", systemOnBackground, "readable"},
+	{"border", systemOnBackground, "readable"},
+	{"borderAccent", systemOnBackground, "readable"},
+	{"borderMuted", systemOnBackground, "subtle"},
+	{"mdQuoteBorder", systemOnBackgroundMessagesTools, "readable"},
+	{"mdHr", systemOnBackgroundMessagesTools, "readable"},
+	{"scrollbarTrack", systemOnBackground, "track"},
+	{"scrollbarThumb", systemOnScrollbarTrack, "thumb"},
+	{"thinkingOff", systemOnBackground, "thinking0"},
+	{"thinkingMinimal", systemOnBackground, "thinking1"},
+	{"thinkingLow", systemOnBackground, "thinking2"},
+	{"thinkingMedium", systemOnBackground, "thinking3"},
+	{"thinkingHigh", systemOnBackground, "thinking4"},
+	{"thinkingXhigh", systemOnBackground, "thinking5"},
+	{"thinkingMax", systemOnBackground, "thinking6"},
 }
 
-func systemConcat(parts ...[]string) []string {
-	var joined []string
-	for _, part := range parts {
-		joined = append(joined, part...)
-	}
-	return joined
-}
-
-var systemRules = func() []systemRule {
-	background := []string{"background"}
-	var rules []systemRule
-	add := func(more ...systemRule) { rules = append(rules, more...) }
-	add(systemEach(systemPanels, background, "panel")...)
-	add(systemRule{"text", background, "text"})
-	add(systemRule{"text", []string{"selectedBg"}, "textOnPanel"})
-	add(systemRule{"userMessageText", []string{"userMessageBg"}, "textOnPanel"})
-	add(systemRule{"toolTitle", systemToolPanels, "textOnPanel"})
-	add(systemEach([]string{"accent", "success", "error", "warning"}, systemConcat(background, []string{"selectedBg"}, systemToolPanels), "readable")...)
-	add(systemRule{"muted", systemConcat(background, []string{"selectedBg", "customMessageBg"}, systemToolPanels), "readable"})
-	add(systemRule{"dim", systemConcat(background, []string{"selectedBg", "customMessageBg"}, systemToolPanels), "subtle"})
-	add(systemRule{"thinkingText", background, "readable"})
-	add(systemRule{"customMessageText", systemConcat([]string{"customMessageBg"}, systemToolPanels), "readable"})
-	add(systemRule{"customMessageLabel", systemConcat(background, []string{"customMessageBg", "selectedBg"}, systemToolPanels), "readable"})
-	add(systemRule{"toolOutput", systemConcat(background, systemToolPanels), "readable"})
-	add(systemEach([]string{"mdHeading", "mdLink", "mdLinkUrl", "mdCode", "mdQuote", "mdCodeBlockBorder", "mdListBullet"}, systemConcat(background, systemMessagePanels), "readable")...)
-	add(systemRule{"mdCodeBlock", systemConcat(background, systemMessagePanels, systemToolPanels), "readable"})
-	add(systemEach([]string{"toolDiffAdded", "toolDiffRemoved", "toolDiffContext"}, systemConcat(background, systemToolPanels), "readable")...)
-	add(systemEach([]string{"syntaxComment", "syntaxKeyword", "syntaxFunction", "syntaxVariable", "syntaxString", "syntaxNumber", "syntaxType", "syntaxOperator", "syntaxPunctuation"},
-		systemConcat(background, systemMessagePanels, systemToolPanels), "readable")...)
-	add(systemRule{"searchMatchText", []string{"searchMatchBg"}, "readable"})
-	add(systemEach([]string{"bashMode", "border", "borderAccent"}, background, "readable")...)
-	add(systemRule{"borderMuted", background, "subtle"})
-	add(systemEach([]string{"mdQuoteBorder", "mdHr"}, systemConcat(background, systemMessagePanels, systemToolPanels), "readable")...)
-	add(systemRule{"scrollbarTrack", background, "track"})
-	add(systemRule{"scrollbarThumb", []string{"scrollbarTrack"}, "thumb"})
-	for index, token := range systemThinking {
-		add(systemRule{token, background, systemThinkingLevel[index]})
-	}
-	return rules
-}()
+func systemRules() []systemRule { return systemRuleTable[:] }
 
 // systemReadableFloor is the level relaxation compresses stronger levels toward before weakening all levels.
 func systemReadableFloor(appearance TerminalTheme) string {
@@ -299,14 +329,14 @@ var systemForegroundTokens = []string{"text", "userMessageText", "toolTitle"}
 const systemTextMinimumWcagContrast = 4.5
 
 // systemSolveOrder is the tokens in dependency order: every surface before the tokens drawn on it.
-var systemSolveOrder = func() []string {
+var systemSolveOrder = sync.OnceValue(func() []string {
 	var order []string
 	var visit func(token string)
 	visit = func(token string) {
 		if slices.Contains(order, token) {
 			return
 		}
-		for _, rule := range systemRules {
+		for _, rule := range systemRules() {
 			if rule.token != token {
 				continue
 			}
@@ -318,11 +348,11 @@ var systemSolveOrder = func() []string {
 		}
 		order = append(order, token)
 	}
-	for _, rule := range systemRules {
+	for _, rule := range systemRules() {
 		visit(rule.token)
 	}
 	return order
-}()
+})
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -340,7 +370,7 @@ func relativeLuminance(color RgbColor) float64 {
 		}
 		return math.Pow((value+0.055)/1.055, 2.4)
 	}
-	return 0.2126*linear(color.R) + 0.7152*linear(color.G) + 0.0722*linear(color.B)
+	return float64(0.2126*linear(color.R)) + float64(0.7152*linear(color.G)) + float64(0.0722*linear(color.B))
 }
 
 // WcagContrast is the WCAG 2 contrast ratio, 1-21.
@@ -383,7 +413,7 @@ func hexOfRgb(color RgbColor) string {
 	var hex strings.Builder
 	hex.WriteByte('#')
 	for _, channel := range [3]float64{color.R, color.G, color.B} {
-		digits := strconv.FormatInt(int64(jsRound(channel)), 16)
+		digits := strconv.FormatInt(int64(jsnumber.Round(channel)), 16)
 		if len(digits) < 2 {
 			digits = "0" + digits
 		}
@@ -404,7 +434,7 @@ func saturationCurve(family systemFamily, lightness float64) float64 {
 	if family.max > 0 {
 		floor = family.min / family.max
 	}
-	return floor + (1-floor)*bellWeight(lightness)
+	return floor + float64((1-floor)*bellWeight(lightness))
 }
 
 // levelTarget is the target lightness for a level on a surface, or false where the level cannot be reached.
@@ -415,7 +445,7 @@ func levelTarget(level string, appearance TerminalTheme, surfaceL float64) (floa
 	}
 	sum := 0.0
 	for power, coefficient := range curve.coefficients {
-		sum += coefficient * math.Pow(surfaceL, float64(power))
+		sum += float64(coefficient * math.Pow(surfaceL, float64(power)))
 	}
 	return sum, true
 }
@@ -519,9 +549,9 @@ func GenerateSystemThemeColors(input SystemThemeInput) SystemThemeColors {
 	// paint is a token's color at an OKLab lightness. With a palette, the palette color's saturation applies at its own lightness and falls off toward black and white along the family's curve, never rising above it.
 	paint := func(token string, oklabL float64) RgbColor {
 		lightness := OklabToOkhslLightness(oklabL)
-		family := systemFamilies[systemTokenFamily[token]]
+		family := systemFamilies[systemTokenFamily()[token]]
 		if palette == nil {
-			return okhslRgb(family.hue, (family.min+(family.max-family.min)*bellWeight(lightness))*saturation, lightness)
+			return okhslRgb(family.hue, (family.min+float64((family.max-family.min)*bellWeight(lightness)))*saturation, lightness)
 		}
 		slot, ok := systemTokenSlots[token]
 		if !ok {
@@ -547,9 +577,9 @@ func GenerateSystemThemeColors(input SystemThemeInput) SystemThemeColors {
 		floor := floorTarget - surfaceL
 		compressed := distance
 		if math.Abs(distance) > math.Abs(floor) {
-			compressed = distance - (distance-floor)*math.Min(t, 1)
+			compressed = distance - float64((distance-floor)*math.Min(t, 1))
 		}
-		return surfaceL + compressed*(1-math.Max(0, t-1)), true
+		return surfaceL + float64(compressed*(1-math.Max(0, t-1))), true
 	}
 
 	// limitPanel keeps a panel light enough (or dark enough) that white (or black) text still reaches the body text minimum on it. This only matters for backgrounds near mid-gray, where it barely does on the background.
@@ -583,9 +613,9 @@ func GenerateSystemThemeColors(input SystemThemeInput) SystemThemeColors {
 			}
 			return background
 		}
-		for _, token := range systemSolveOrder {
+		for _, token := range systemSolveOrder() {
 			var targets []float64
-			for _, rule := range systemRules {
+			for _, rule := range systemRules() {
 				if rule.token != token {
 					continue
 				}
@@ -632,7 +662,7 @@ func GenerateSystemThemeColors(input SystemThemeInput) SystemThemeColors {
 	}
 	surfacesOf := func(token string) []RgbColor {
 		var surfaces []RgbColor
-		for _, rule := range systemRules {
+		for _, rule := range systemRules() {
 			if rule.token != token {
 				continue
 			}

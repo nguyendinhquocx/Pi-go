@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"reflect"
 	"testing"
 )
 
@@ -59,8 +60,8 @@ func TestCalculateCostNilModelsAndUsage(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			usage := Usage{Input: 1_000_000, Output: 1_000_000}
-			if got := CalculateCost(model, &usage); got != (UsageCost{}) {
-				t.Fatalf("CalculateCost = %+v, want zero", got)
+			if got := CalculateCost(model, &usage); !reflect.DeepEqual(got, UsageCost{TotalFromProvider: new(false)}) {
+				t.Fatalf("CalculateCost = %+v, want a zero estimate", got)
 			}
 		})
 	}
@@ -72,7 +73,7 @@ func TestCalculateCostNilModelsAndUsage(t *testing.T) {
 // system-one-shared.ts:143 prices classifier usage with calculateCost(model, usage), so the model's cost tiers apply.
 func TestSystemOneUsageAppliesClassifierCostTiers(t *testing.T) {
 	model := ClassifierModel{Cost: ModelCost{Input: 1, Output: 2, Tiers: []CostTier{{InputTokensAbove: 1000, InputCostPer1M: 10, OutputCostPer1M: 20}}}}
-	usage := parseUsage([]byte(`{"input_tokens":2000,"output_tokens":1000}`), model)
+	usage := ParseClassifierUsage([]byte(`{"input_tokens":2000,"output_tokens":1000}`), model)
 	if usage == nil || usage.Cost.Input != .02 || usage.Cost.Output != .02 || usage.Cost.Total != .04 {
 		t.Fatalf("usage=%+v, want tier-priced cost", usage)
 	}

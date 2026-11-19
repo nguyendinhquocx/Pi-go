@@ -37,7 +37,7 @@ func TestResponseIDUpstream(t *testing.T) {
 		// .upstream/v0.87.1/packages/ai/test/responseid.test.ts:104
 		{"GitHub Copilot Provider/Anthropic path should expose responseId", "github-copilot", "claude-sonnet-4.6", APIAnthropicMessages, false},
 		// .upstream/v0.87.1/packages/ai/test/responseid.test.ts:115
-		{"OpenAI Codex Provider/should expose responseId", "openai-codex", "gpt-5.5", APIOpenAICodexResponses, false},
+		{"OpenAI Codex Provider/should expose responseId", "openai-codex", "gpt-6.1-sol", APIOpenAICodexResponses, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
@@ -71,13 +71,13 @@ func TestResponseIDUpstream(t *testing.T) {
 			case APIAzureOpenAIResponses:
 				provider = NewAzureOpenAIResponsesProvider(AzureOpenAIResponsesConfig{APIKey: "test-key", ProviderID: tc.provider, Model: tc.model, BaseURL: server.URL})
 			case APIMistralConversations:
-				provider = NewMistralProvider(MistralConfig{APIKey: "test-key", ProviderID: tc.provider, Model: tc.model, BaseURL: server.URL})
+				provider = newMistralTestProvider(MistralConfig{APIKey: "test-key", ProviderID: tc.provider, Model: tc.model, BaseURL: server.URL}, nil)
 			case APIGoogleVertex:
 				key := "test-key"
 				if tc.vertexADC {
 					key = ""
 				}
-				provider = NewGoogleVertexProvider(GoogleVertexConfig{APIKey: key, ProviderID: tc.provider, Model: tc.model, BaseURL: server.URL, Project: "test-project", Location: "us-central1"})
+				provider = newGoogleVertexTestProvider(GoogleVertexConfig{APIKey: key, ProviderID: tc.provider, Model: tc.model, BaseURL: server.URL, Project: "test-project", Location: "us-central1"}, nil)
 			case APIGoogleGenerativeAI:
 				provider = NewGoogleProvider(GoogleConfig{APIKey: "test-key", ProviderID: tc.provider, Model: tc.model, BaseURL: server.URL})
 			case APIOpenAICodexResponses:

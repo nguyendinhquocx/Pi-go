@@ -2,39 +2,71 @@ import { modelFetchCallbacks } from "./model-fetch.mjs";
 import { AutocompleteRuntime } from "./autocomplete.mjs";
 import { dispatchFacet, dispatchFacetSync, hasFacetBridge } from "./facet-bridge.mjs";
 import { syncTerminalGeometry } from "./terminal-geometry.mjs";
-import { mountedOverlayHandle } from "./overlay-handle.mjs";
+import { mountedOverlayHandle, overlayFocusTarget } from "./overlay-handle.mjs";
 import { disposeIndependentSessions } from "./independent-session-owner.mjs";
 import { dispatchNativeProvider, nativeDeclaration } from "./native-provider.mjs";
 import { dispatchProviderObjectSync, dispatchProviderObjectCallback, remoteProvider } from "./provider-object.mjs";
-import { isWaiting, ProviderSocket, setProviderSocketsRef } from "./provider-socket.mjs";
+import { isWaiting, ProviderSocket, setProviderSocketsRef, shareDecodedFrames } from "./provider-socket.mjs";
+import { constants as bufferConstants } from "node:buffer";
 import { MessageChannel } from "node:worker_threads";
 import net from "node:net";
 import { closeSync, openSync, readSync } from "node:fs";
 import { basename } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { importExtension } from "./jiti-loader.mjs";
 import { randomUUID } from "node:crypto";
 import { inspect } from "node:util";
-import { createRequire, flushCompileCache } from "node:module";
+import { runtimeRequire as requireModule } from "./runtime-modules.mjs";
 import { stringWidget } from "./widget-component.mjs";
+import { installTimerOrigin, originKind, originToolCallId, outsideTimer, setHandlersRunning, setTimerDefer, setToolCallIdSource } from "./timer-origin.mjs";
 import { currentRuntime, runWithRuntime, setRuntime } from "./state.mjs";
 import { getKeybindings, KeybindingsManager, setKeybindings } from "./shims/pi-dist/pi-tui/keybindings.js";
 import { EditorComponentHost } from "./editor-component.mjs";
 import { setCapabilities as setTerminalCapabilities } from "./shims/pi-dist/pi-tui/terminal-image.js";
 import { loadAllHighlightLanguages } from "./shims/syntax-highlight.mjs";
 import { themeFromPalette, wireColors } from "./theme-palette.mjs";
+import { Chalk } from "./shims/chalk/source/index.js";
 import { classifierErrorResult, imageErrorResult } from "./shims/pi-dist/pi-ai/utils/model-operations.js";
-import { backgroundAnsi, foregroundAnsi, styleTextWithAnsi } from "./shims/pi-dist/pi-tui/colors.js";
+import { backgroundAnsi, foregroundAnsi, parseColor, styleTextWithAnsi } from "./shims/pi-dist/pi-tui/colors.js";
 import { initTheme, setThemeInstance } from "./shims/pi-dist/pi-coding-agent/modes/interactive/theme/theme.js";
 import { createExtensionRuntime } from "./shims/pi-dist/pi-coding-agent/core/extensions/loader.js";
-import { installCloneHooks, Realm } from "./xref.mjs";
+import { installCloneHooks, installTestCollect, Realm } from "./xref.mjs";
 import { SharedBus } from "./event-bus.mjs";
+import { deriveView, surfaceTheme, VIEW_THEME_TOKENS } from "./view-walk.mjs";
+import { dispatchOverlayMouse, takesMouse } from "./mouse.mjs";
+import { EventReplicas } from "./event-stream.mjs";
+
+installTimerOrigin();
+setToolCallIdSource(() => {
+  for (const runtime of liveRuntimes) {
+    const toolCallId = runtime.requestContext.getStore()?.toolCallId;
+    if (toolCallId !== undefined) return toolCallId;
+  }
+  return undefined;
+});
+setHandlersRunning(() => {
+  for (const runtime of liveRuntimes) {
+    for (const request of runtime.requestRecords.values()) {
+      if (!request.settled) return true;
+    }
+  }
+  return false;
+});
 
 // Pi hands every extension one shared event bus (resource-loader.ts creates
 // one per loader and passes it to each extension). Every Node realm of this
 // Host shares it: this process's listeners stay in its own heap, and
 // payloads cross to other realms by reference (xref.mjs).
 const liveRuntimes = new Set();
+
+// siblingToolPending reports whether a tool call is still running in this process: its handler has not returned, so it may await real work, and Pi's loop turns while it does.
+function siblingToolPending() {
+  for (const runtime of liveRuntimes) {
+    for (const request of runtime.requestRecords.values()) {
+      if (request.toolCall && !request.settled) return true;
+    }
+  }
+  return false;
+}
 const xrefRealm = new Realm(() => {
   const preferred = currentRuntime();
   for (const runtime of preferred ? [preferred, ...liveRuntimes] : liveRuntimes) {
@@ -44,10 +76,13 @@ const xrefRealm = new Realm(() => {
   return undefined;
 });
 installCloneHooks(xrefRealm);
+installTestCollect(xrefRealm);
 const sharedBus = new SharedBus(xrefRealm, process.env.PIG_EVENT_BUS === "routed");
 const XREF_REQUESTS = new Set(["xref.op", "events.dispatch", "events.migrate"]);
 // Emissions whose foreign listener prefix ran while this process was idle. Pi runs such a listener's continuations only after the emitter's synchronous run, so this process waits for the emitter's first microtask (events.proceed) before its own microtasks run.
 const lockstep = new Set();
+// The host sends each model registry publication to every member of a cell. Its handler only reads the snapshot, and applyModelRegistryState copies what an extension can reach, so the members share one decoded publication.
+shareDecodedFrames((envelope) => envelope?.type === "notify" && envelope.notify?.method === "model_registry_update");
 
 // Marks the renderers of a definition from Pi's create<Tool>ToolDefinition
 // (shims/builtin-tools.mjs): the host draws those halves with its built-in
@@ -68,6 +103,13 @@ export function isHostCancellation(error) {
   return hostCancellations.has(error);
 }
 
+// A host call the host answered with an error: it ran the call and refused it, so the call took no effect. A caller that showed the effect ahead of the answer (RuntimeSessionManager.appendCustomEntry) takes it back. A cancelled call (isHostCancellation) has no answer, and whether it took effect is unknown.
+const hostRejections = new WeakSet();
+
+export function isHostRejection(error) {
+  return hostRejections.has(error);
+}
+
 process.on("unhandledRejection", (reason) => {
   if (hostCancellations.has(reason)) return;
   // Node raises only when no listener handles the event; this listener is registered before any extension loads.
@@ -82,20 +124,6 @@ process.on("unhandledRejection", (reason) => {
 const USER_BLOCKING_CALLS = new Set(["ui.select", "ui.confirm", "ui.input", "ui.editor", "ui.custom"]);
 const MAX_FRAME_SIZE = 128 * 1024 * 1024;
 const REMOTE_RENDER_INTERVAL_MS = 16;
-
-const BLOCKING_EVENTS = new Set([
-  "input",
-  "context",
-  "context_with_system",
-  "before_provider_request",
-  "before_agent_start",
-  "tool_call",
-  "tool_result",
-  "session_before_compact",
-  "session_before_tree",
-  "session_before_fork",
-  "session_before_switch",
-]);
 
 function uuid(prefix = "c") {
   return `${prefix}${Math.random().toString(16).slice(2)}${Date.now().toString(16)}`;
@@ -153,6 +181,59 @@ function modelRegistryKey(provider, modelId) {
   return `${provider}\u0000${modelId}`;
 }
 
+// virtual-models.ts: the api of a virtual model.
+const VIRTUAL_MODEL_API = "pi-virtual";
+
+// replaceProviderEntries returns entries (the catalog Map, or a list of models) with the models of provider name replaced by replacements, in the place of the provider's first entry, or last when it had none.
+function replaceProviderEntries(entries, name, replacements) {
+  if (entries instanceof Map) {
+    const next = new Map();
+    let placed = false;
+    const place = () => {
+      for (const model of replacements) next.set(modelRegistryKey(name, modelIDFromModel(model)), model);
+      placed = true;
+    };
+    for (const [key, model] of entries) {
+      if (model.provider !== name) next.set(key, model);
+      else if (!placed) place();
+    }
+    if (!placed) place();
+    return next;
+  }
+  const index = entries.findIndex((model) => model.provider === name);
+  const kept = entries.filter((model) => model.provider !== name);
+  kept.splice(index < 0 ? kept.length : index, 0, ...replacements);
+  return kept;
+}
+
+// models.ts EXTENDED_THINKING_LEVELS, getSupportedThinkingLevels and clampThinkingLevel; defaults.ts THINKING_LEVEL_OPTIONS.
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+function supportedThinkingLevels(model) {
+  if (!model.reasoning) return ["off"];
+  return THINKING_LEVELS.filter((level) => {
+    const mapped = model.thinkingLevelMap?.[level];
+    if (mapped === null) return false;
+    if (level === "xhigh" || level === "max") return mapped !== undefined;
+    return true;
+  });
+}
+
+// agent-session.ts setThinkingLevel: the level the session adopts for a requested one.
+function effectiveThinkingLevel(model, level) {
+  if (!model) return THINKING_LEVELS.includes(level) ? level : "off";
+  const available = supportedThinkingLevels(model);
+  if (available.includes(level)) return level;
+  const requested = THINKING_LEVELS.indexOf(level);
+  if (requested === -1) return available[0] ?? "off";
+  for (let i = requested; i < THINKING_LEVELS.length; i++) if (available.includes(THINKING_LEVELS[i])) return THINKING_LEVELS[i];
+  for (let i = requested - 1; i >= 0; i--) if (available.includes(THINKING_LEVELS[i])) return THINKING_LEVELS[i];
+  return available[0] ?? "off";
+}
+
+// normalizeModel returns the model object an extension reads. The host sends Pi's model object (extension.ModelObject), which
+// already has id, provider, name and api, so spreading it keeps its members and their order; a model the host only names gets
+// them filled in. No member Pi's object lacks is added (runner.ts:609 hands extensions the runtime's model object).
 function normalizeModel(model) {
   if (!model || typeof model !== "object") return undefined;
   const provider = providerIDFromModel(model);
@@ -161,19 +242,44 @@ function normalizeModel(model) {
   return {
     ...model,
     id: modelId,
-    modelId,
     provider,
     name: model.name ?? model.displayName ?? modelId,
-    displayName: model.displayName ?? model.name ?? modelId,
     api: model.api ?? inferAPIForProvider(provider),
   };
+}
+
+// catalogOf returns a registry snapshot's catalog: each model's normalized form under its registry key, in the order the runtime has always kept them (a key keeps its first position and takes its last model). The members of a cell receive one decoded snapshot (shareDecodedFrames below), so the catalog is built once per snapshot, and each member reads its own copy of a model (Runtime.modelFor) as an isolated extension holds its own.
+const catalogs = new WeakMap();
+const emptyCatalog = new Map();
+function catalogOf(models) {
+  if (!Array.isArray(models)) return emptyCatalog;
+  let catalog = catalogs.get(models);
+  if (catalog) return catalog;
+  catalog = new Map();
+  for (const raw of models) {
+    const model = normalizeModel(raw);
+    if (!model) continue;
+    const provider = providerIDFromModel(model);
+    const modelId = modelIDFromModel(model);
+    if (provider && modelId) catalog.set(modelRegistryKey(provider, modelId), model);
+  }
+  catalogs.set(models, catalog);
+  return catalog;
+}
+
+// The encoding a reply to a context event would carry for messages, or undefined when they do not encode: the reply then carries the list.
+function contextMessagesEncoding(messages) {
+  try {
+    return JSON.stringify(messages);
+  } catch {
+    return undefined;
+  }
 }
 
 // Pi's session projection and builtin provider modules load on first use:
 // most extensions never read them, and loading them costs every extension
 // process startup time. require() of an ES module is synchronous, as the
 // ctx.sessionManager and ctx.modelRegistry reads that need them are.
-const requireModule = createRequire(import.meta.url);
 let piSessionModule;
 function piSession() {
   piSessionModule ??= requireModule("./shims/pi-dist/pi-coding-agent/core/session-manager.js");
@@ -181,6 +287,13 @@ function piSession() {
 }
 function piProviderComposer() {
   return requireModule("./shims/pi-dist/pi-coding-agent/core/provider-composer.js");
+}
+// Renderers get the host's keyText and keyHint (Pi 9376c8d1, #4748) on the tool render context and the message and entry options. They load with the first render, not at startup: the module draws in pi-tui's bundle.
+function piKeybindingHints() {
+  return requireModule("./shims/pi-dist/pi-coding-agent/modes/interactive/components/keybinding-hints.js");
+}
+function piVirtualModels() {
+  return requireModule("./shims/pi-dist/pi-coding-agent/core/virtual-models.js");
 }
 let piBuiltinProviderMap;
 function piBuiltinProvider(id) {
@@ -198,6 +311,20 @@ function generateEntryId(byId) {
   return randomUUID();
 }
 
+// indexSessionEntry adds one log entry to upstream's byId, labelsById and labelTimestampsById.
+function indexSessionEntry(index, entry) {
+  if (!entry || entry.type === "session") return;
+  index.byId.set(entry.id, entry);
+  if (entry.type !== "label") return;
+  if (entry.label) {
+    index.labelsById.set(entry.targetId, entry.label);
+    index.labelTimestampsById.set(entry.targetId, entry.timestamp);
+  } else {
+    index.labelsById.delete(entry.targetId);
+    index.labelTimestampsById.delete(entry.targetId);
+  }
+}
+
 // 0.3.0: replaced by Pi runner wiring
 // ctx.sessionManager: upstream hands extensions its SessionManager, typed as
 // ReadonlySessionManager (session-manager.ts). The reads answer from the
@@ -210,30 +337,53 @@ class RuntimeSessionManager {
 
   // _entries is the replicated log followed by the entries appendCustomEntry
   // appended that the host has not yet sent back, so a read sees an append at
-  // once, as upstream's in-process log does.
+  // once, as upstream's in-process log does. The host's log is the truth: an
+  // appended entry stays only until the host sends it back (it then takes the
+  // host's record) or refuses it (retractPending).
   _entries() {
     this.runtime.ensureSessionLog();
     const entries = this.runtime.state.session?.entries || [];
     const pending = this.runtime.pendingEntries;
     if (pending.length === 0) return entries;
+    // The host confirms a pending entry only with a new replicated log, so while the log is unchanged an append only extends the view, as upstream's appendCustomEntry only pushes onto its log.
+    const view = this._view;
+    if (view && view.base === entries && view.baseLength === entries.length && view.pending === pending) {
+      for (let i = view.pendingLength; i < pending.length; i++) view.entries.push(pending[i]);
+      view.pendingLength = pending.length;
+      return view.entries;
+    }
     const replicated = new Map();
     entries.forEach((entry, index) => replicated.set(entry?.id, index));
     const unconfirmed = [];
+    let collided = false;
     for (const entry of pending) {
       const index = replicated.get(entry.id);
-      if (index === undefined) {
+      const hosted = index === undefined ? undefined : entries[index];
+      if (hosted === undefined) {
         unconfirmed.push(entry);
         continue;
       }
-      // The host's copy holds the same values; keep the object the caller
-      // holds, as upstream's log holds the entry it returned.
+      // A record of another kind under the id is not this entry: the host refuses an id its log holds, and the refusal retracts an append. The entries adoptHostLeafEntry adds (a label, a session name, a custom message) are the host's own records, so their copies match.
+      if (hosted.type !== entry.type || hosted.customType !== entry.customType) {
+        collided = true;
+        unconfirmed.push(entry);
+        continue;
+      }
+      // The host's copy holds the same values, except that it links the entry to its own leaf when it appends it, not to the entry this process showed last (an append the host refused, a message it appended meanwhile). Keep the object the caller holds, as upstream's log holds the entry it returned, with the host's parent.
+      entry.parentId = hosted.parentId;
       entries[index] = entry;
     }
     if (unconfirmed.length !== pending.length) {
       this.runtime.pendingEntries = unconfirmed;
-      this.runtime.branchCache = undefined;
+      this.runtime.dropBranchCache();
     }
-    return unconfirmed.length === 0 ? entries : entries.concat(unconfirmed);
+    if (unconfirmed.length === 0) {
+      this._view = undefined;
+      return entries;
+    }
+    const combined = entries.concat(unconfirmed);
+    this._view = { base: entries, baseLength: entries.length, pending: this.runtime.pendingEntries, pendingLength: unconfirmed.length, entries: combined, collided };
+    return combined;
   }
 
   // _index mirrors upstream's byId, labelsById and labelTimestampsById,
@@ -242,25 +392,16 @@ class RuntimeSessionManager {
     const base = this.runtime.state.session?.entries;
     const entries = this._entries();
     const cached = this._cachedIndex;
-    if (cached && cached.base === base && cached.entries.length === entries.length && cached.pending === this.runtime.pendingEntries.length) return cached;
-    const byId = new Map();
-    const labelsById = new Map();
-    const labelTimestampsById = new Map();
-    for (const entry of entries) {
-      if (!entry || entry.type === "session") continue;
-      byId.set(entry.id, entry);
-      if (entry.type === "label") {
-        if (entry.label) {
-          labelsById.set(entry.targetId, entry.label);
-          labelTimestampsById.set(entry.targetId, entry.timestamp);
-        } else {
-          labelsById.delete(entry.targetId);
-          labelTimestampsById.delete(entry.targetId);
-        }
-      }
+    // The log only grows while it stays the same array, so an append indexes only the new entries.
+    if (cached && cached.base === base && cached.entries === entries && cached.count <= entries.length) {
+      for (let i = cached.count; i < entries.length; i++) indexSessionEntry(cached, entries[i]);
+      cached.count = entries.length;
+      return cached;
     }
-    this._cachedIndex = { base, entries, pending: this.runtime.pendingEntries.length, byId, labelsById, labelTimestampsById };
-    return this._cachedIndex;
+    const index = { base, entries, count: entries.length, byId: new Map(), labelsById: new Map(), labelTimestampsById: new Map() };
+    for (const entry of entries) indexSessionEntry(index, entry);
+    this._cachedIndex = index;
+    return index;
   }
 
   _info() { return this.runtime.state.session?.info ?? {}; }
@@ -359,7 +500,9 @@ class RuntimeSessionManager {
   // appendCustomEntry is the write the host's session log takes from an
   // extension (upstream pi.appendEntry calls it). The id is generated here,
   // against the replicated log, so it returns synchronously as upstream's does.
-  appendCustomEntry(customType, data) {
+  // event marks pi.appendEntry, after which the host emits entry_appended as upstream's runtime action does (agent-session.ts:3406-3411); a direct ctx.sessionManager.appendCustomEntry only writes the log.
+  // Upstream's append cannot fail. Here the entry is shown before the host has appended it, so a host that answers with an error takes it back out.
+  appendCustomEntry(customType, data, event = false) {
     const entry = {
       type: "custom",
       customType,
@@ -368,9 +511,39 @@ class RuntimeSessionManager {
       parentId: this._leafId(),
       timestamp: new Date().toISOString(),
     };
-    this.runtime.pendingEntries = [...this.runtime.pendingEntries, entry];
-    this.runtime.fireAndForget("appendEntry", { customType, data, direct: { id: entry.id, timestamp: entry.timestamp } });
+    this.runtime.pendingEntries.push(entry);
+    const direct = { id: entry.id, timestamp: entry.timestamp };
+    if (event) direct.event = true;
+    this.runtime.fireAndForget("appendEntry", { customType, data, direct }, () => this.retractPending(entry.id));
     return entry.id;
+  }
+
+  // retractPending removes the entry appendCustomEntry showed when the host refused to append it, and only that entry: the others in flight stay. The entries appended after it were linked to it here, so they take its parent, where the host links them when it appends them; the host's copy corrects any other parent when it arrives. An entry the replicated log already holds is the host's and stays.
+  retractPending(id) {
+    // Confirm what the replicated log holds first, so the refusal drops only what the host does not have.
+    this._entries();
+    const pending = this.runtime.pendingEntries;
+    const at = pending.findIndex((entry) => entry.id === id);
+    if (at < 0) return;
+    const dropped = pending[at];
+    for (let i = at + 1; i < pending.length; i++) {
+      if (pending[i].parentId === dropped.id) pending[i].parentId = dropped.parentId;
+    }
+    pending.splice(at, 1);
+    // The view and the id index follow the removal, so a refusal costs the entries in flight and not the log. A view that does not match, or one that sits beside a host record of the same id, is rebuilt by the next read.
+    const view = this._view;
+    const position = view === undefined ? -1 : view.baseLength + at;
+    if (view === undefined || view.collided || view.pending !== pending || view.pendingLength !== pending.length + 1 || view.entries[position] !== dropped) {
+      this._view = undefined;
+      return;
+    }
+    view.entries.splice(position, 1);
+    view.pendingLength = pending.length;
+    const index = this._cachedIndex;
+    if (index !== undefined && index.entries === view.entries && index.count > position) {
+      index.count--;
+      if (index.byId.get(dropped.id) === dropped) index.byId.delete(dropped.id);
+    }
   }
 }
 
@@ -396,6 +569,18 @@ class ReplacedSessionManager {
   buildSessionProjection() { return this._read("buildSessionProjection"); }
 }
 
+// SetupSessionManager is the SessionManager of newSession's setup callback (types.ts:411, agent-session-runtime.ts:254-257): the reads of ReplacedSessionManager and the appends that seed the replacement Session. Each append is a synchronous sessionWrite host call of the setup request and returns the new entry's id, as Pi's do.
+class SetupSessionManager extends ReplacedSessionManager {
+  _write(method, args) { return this.runtime.conn.callSync("sessionWrite", { method, args }, this.parent()); }
+  appendMessage(message) { return this._write("appendMessage", { message }); }
+  appendCustomEntry(customType, data) { return this._write("appendCustomEntry", { customType, data }); }
+  appendCustomMessageEntry(customType, content, display, details) { return this._write("appendCustomMessageEntry", { customType, content, display, details }); }
+  appendSessionInfo(name) { return this._write("appendSessionInfo", { name }); }
+  appendModelChange(provider, modelId) { return this._write("appendModelChange", { provider, modelId }); }
+  appendThinkingLevelChange(thinkingLevel) { return this._write("appendThinkingLevelChange", { thinkingLevel }); }
+  appendLabelChange(targetId, label) { return this._write("appendLabelChange", { targetId, label: label ?? null }); }
+}
+
 // 0.3.0: replaced by Pi runner wiring
 // ctx.modelRegistry: upstream's ModelRegistry facade over the session's
 // ModelRuntime (model-registry.ts). Its synchronous reads answer from the
@@ -403,41 +588,47 @@ class ReplacedSessionManager {
 // getProviderAuth and request auth ask the host; registrations go to the host,
 // which shares them with every extension as upstream's one runtime does.
 class RuntimeModelRegistry {
-  constructor(runtime) { this.runtime = runtime; }
+  constructor(host) { this.host = host; }
 
-  _providerState(provider) { return this.runtime.registryState.providers?.[provider]; }
+  // model-registry.ts:48-52 keeps the ModelRuntime in a private field that createAgentSession's `modelRuntime` option takes: an extension that starts a nested Session shares the parent's auth and providers by passing `ctx.modelRegistry.runtime`.
+  get runtime() {
+    this.modelRuntime ??= new RuntimeModelRuntime(this);
+    return this.modelRuntime;
+  }
+
+  _providerState(provider) { return this.host.registryState.providers?.[provider]; }
 
   async refresh(options = {}) {
-    const result = await this.runtime.call("refreshModelRegistry", {
+    const result = await this.host.call("refreshModelRegistry", {
       allowNetwork: options?.allowNetwork,
       providers: options?.providers,
       force: options?.force,
     });
-    if (result?.state) this.runtime.applyModelRegistryState(result.state);
+    if (result?.state) this.host.applyModelRegistryState(result.state);
     const errors = new Map();
     for (const [provider, message] of Object.entries(result?.errors ?? {})) errors.set(provider, new Error(message));
     return { aborted: result?.aborted === true || options?.signal?.aborted === true, errors };
   }
-  getError() { return this.runtime.registryState.error || undefined; }
-  getAll() { return [...this.runtime.models.values()]; }
+  getError() { return this.host.registryState.error || undefined; }
+  getAll() { return [...this.host.allModels().values()]; }
   getAvailable() { return this.getAll().filter((model) => {const state=this._providerState(model.provider);return state?.configured===true&&(!state.availableModelIds||state.availableModelIds.includes(model.id))}); }
   find(provider, modelId) {
-    return this.runtime.getModel(provider, modelId);
+    return this.host.getModel(provider, modelId);
   }
   // model-registry.ts:71-79,135-177. Chat models come from the registry snapshot's models and the others from its typedModels, in the host's order (model-registry.ts:145-161); getAvailableOfType and classify ask the host.
   findOfType(type, provider, modelId) { return this.getModelOfType(type, provider, modelId); }
   getModelsOfType(type, provider) {
-    const typed = this.runtime.registryState.typedModels ?? [];
+    const typed = this.host.registryState.typedModels ?? [];
     return [...this.getAll(), ...typed].filter((model) => (model.type ?? "chat") === type && (provider === undefined || model.provider === provider));
   }
   async getAvailableOfType(type, provider, options) {
-    return (await this.runtime.call("getAvailableOfType", { type, provider })) ?? [];
+    return (await this.host.call("getAvailableOfType", { type, provider })) ?? [];
   }
   getModelOfType(type, provider, modelId) { return this.getModelsOfType(type, provider).find((model) => model.id === modelId); }
   // Never rejects: a failure, and an aborted request, are a result that names the model (model-registry.ts:168-177, model-runtime.ts:800-815). The result is aborted when the caller's signal aborted or, as in the Go, Rust and Python SDKs, when the calling request was cancelled.
   async classify(model, context, options) {
     const signal = options?.signal;
-    const owner = this.runtime.requestContext.getStore();
+    const owner = this.host.requestContext.getStore();
     let onAbort;
     try {
       // The signal and any callback of the options cannot cross the process boundary.
@@ -449,7 +640,7 @@ class RuntimeModelRegistry {
         else if (signal) { onAbort = reason; signal.addEventListener("abort", onAbort, { once: true }); }
       });
       aborted.catch(() => {});
-      const request = this.runtime.call("classify", { model, context, options: sent });
+      const request = this.host.call("classify", { model, context, options: sent });
       return await (signal ? Promise.race([request, aborted]) : request);
     } catch (error) {
       return classifierErrorResult(model, error, signal?.aborted === true || owner?.controller?.signal.aborted === true);
@@ -460,7 +651,7 @@ class RuntimeModelRegistry {
   // Never rejects: a failure, and an aborted request, are a result that names the model (model-registry.ts:181-188, model-runtime.ts:783-798). Like classify, the result is aborted when the caller's signal aborted or the calling request was cancelled.
   async generateImages(model, context, options) {
     const signal = options?.signal;
-    const owner = this.runtime.requestContext.getStore();
+    const owner = this.host.requestContext.getStore();
     let onAbort;
     try {
       // The signal and any callback of the options cannot cross the process boundary.
@@ -472,7 +663,7 @@ class RuntimeModelRegistry {
         else if (signal) { onAbort = reason; signal.addEventListener("abort", onAbort, { once: true }); }
       });
       aborted.catch(() => {});
-      const request = this.runtime.call("generateImages", { model, context, options: sent });
+      const request = this.host.call("generateImages", { model, context, options: sent });
       return await (signal ? Promise.race([request, aborted]) : request);
     } catch (error) {
       return imageErrorResult(model, error, signal?.aborted === true || owner?.controller?.signal.aborted === true);
@@ -481,29 +672,29 @@ class RuntimeModelRegistry {
     }
   }
   // model-registry.ts:211-213 and model-runtime.ts:955-963: the facade's registrations are the runtime's, and its route gets the request alone. pi.registerVirtualModel's route also gets a context (loader.ts:493-501).
-  registerVirtualModel(definition) { this.runtime.registerVirtualModel(Object.assign(Object.create(definition), { route: (request) => definition.route(request) })); }
-  unregisterVirtualModel(provider, id) { this.runtime.unregisterVirtualModel(provider, id); }
+  registerVirtualModel(definition) { this.host.registerVirtualModel(Object.assign(Object.create(definition), { route: (request) => definition.route(request) })); }
+  unregisterVirtualModel(provider, id) { this.host.unregisterVirtualModel(provider, id); }
   hasConfiguredAuth(model) { return this._providerState(model?.provider)?.configured === true; }
   async getApiKeyAndHeaders(model) {
-    return this.runtime.call("getModelAuth", { provider: providerIDFromModel(model), modelId: modelIDFromModel(model) });
+    return this.host.call("getModelAuth", { provider: providerIDFromModel(model), modelId: modelIDFromModel(model) });
   }
   getProviderAuthStatus(provider) {
     const status = this._providerState(provider)?.authStatus;
     return status ? { ...status } : { configured: false };
   }
-  getProvider(provider) { return this.runtime.getRegistryProvider(provider); }
+  getProvider(provider) { return this.host.getRegistryProvider(provider); }
   stream(model, context, options = {}) {
-    return this.runtime.startModelStream(model, context, options);
+    return this.host.startModelStream(model, context, options);
   }
   streamSimple(model, context, options = {}) {
-    return this.runtime.startModelStream(model, context, options,true);
+    return this.host.startModelStream(model, context, options,true);
   }
   complete(model, context, options = {}) {
     return this.stream(model, context, options).result();
   }
   getProviderDisplayName(provider) { return this._providerState(provider)?.name ?? this.getProvider(provider)?.name ?? provider; }
   async getProviderAuth(provider) {
-    return (await this.runtime.call("getProviderAuth", { provider })) ?? undefined;
+    return (await this.host.call("getProviderAuth", { provider })) ?? undefined;
   }
   async getApiKeyForProvider(provider) {
     try {
@@ -516,38 +707,116 @@ class RuntimeModelRegistry {
   registerProvider(providerOrName, config) {
     if (typeof providerOrName === "string") {
       if (!config) throw new Error("Provider config is required when registering by name");
-      this.runtime.registerProvider(providerOrName, config);
+      this.host.registerProvider(providerOrName, config);
       return;
     }
-    this.runtime.registerNativeProvider(providerOrName);
+    this.host.registerNativeProvider(providerOrName);
   }
-  unregisterProvider(providerName) { this.runtime.unregisterProvider(providerName); }
+  unregisterProvider(providerName) { this.host.unregisterProvider(providerName); }
   getRegisteredProviderConfig(providerName) {
-    const local = this.runtime.registeredProviderConfig(providerName);
+    const local = this.host.registeredProviderConfig(providerName);
     if (local) return local;
-    const entry = this.runtime.registryState.registered?.find((candidate) => candidate.name === providerName);
+    const entry = this.host.registryState.registered?.find((candidate) => candidate.name === providerName);
     if (!entry?.config) return undefined;
-    const foreign = this.runtime.foreignProviderConfig(providerName);
+    const foreign = this.host.foreignProviderConfig(providerName);
     if (foreign) return foreign;
     // pig divergence (D78): a registration from a native SDK author is snapshot data, not the author's live configuration object.
     return entry.config;
   }
   // Native Providers remain local when their owner shares the cell; other owners expose connection-bound method handles.
   getRegisteredNativeProvider(providerName) {
-    const native = this.runtime.nativeProviderObjects.get(providerName)?.provider;
+    const native = this.host.nativeProviderObjects.get(providerName)?.provider;
     if (native) return native;
-    const declaration = this.runtime.registryState.registered?.find(entry => entry.name === providerName)?.native;
-    return declaration ? remoteProvider(this.runtime, declaration, ModelEventStream) : undefined;
+    const declaration = this.host.registryState.registered?.find(entry => entry.name === providerName)?.native;
+    return declaration ? remoteProvider(this.host, declaration, ModelEventStream) : undefined;
   }
   getRegisteredProviderIds() {
     return [...new Set([
-      ...(this.runtime.registryState.registered ?? []).map((entry) => entry.name),
-      ...(this.runtime.loadState === "active" ? this.runtime.providerConfigObjects.keys() : this.runtime.registeredProviderConfigs.keys()),
-      ...this.runtime.nativeProviders.keys(),
+      ...(this.host.registryState.registered ?? []).map((entry) => entry.name),
+      ...(this.host.loadState === "active" ? this.host.providerConfigObjects.keys() : this.host.registeredProviderConfigs.keys()),
+      ...this.host.nativeProviders.keys(),
     ])];
   }
 }
 
+// The ModelRuntime behind ctx.modelRegistry (model-runtime.ts), as far as an AgentSession built from it reads it (agent-session.ts, sdk.ts, model-resolver.ts). Like the registry facade it answers from the host's registry snapshot and asks the host for auth, availability, refresh and streaming, so a nested Session shares the parent's credentials and providers.
+class RuntimeModelRuntime {
+  constructor(registry) { this.registry = registry; }
+
+  getModels(providerId) { return this.registry.getAll().filter((model) => providerId === undefined || model.provider === providerId); }
+  getModel(providerId, modelId) { return this.registry.find(providerId, modelId); }
+  // model-runtime.ts:759-762: a catalog chat model that is not virtual.
+  getPhysicalModel(providerId, modelId) {
+    const model = this.registry.find(providerId, modelId);
+    // virtual-models.ts: a virtual catalog entry has API id "pi-virtual".
+    return model && model.api !== "pi-virtual" ? model : undefined;
+  }
+  getAvailableSnapshot() { return this.registry.getAvailable(); }
+  // model-runtime.ts:489-505: a provider's availability is checked live.
+  async getAvailable(providerId) {
+    if (providerId === undefined) return this.registry.getAvailable();
+    return (await this.registry.getAvailableOfType("chat", providerId)).filter((model) => model.provider === providerId);
+  }
+  getError() { return this.registry.getError(); }
+  refresh(options) { return this.registry.refresh(options); }
+  getProvider(providerId) { return this.registry.getProvider(providerId); }
+  getProviderAuthStatus(providerId) { return this.registry.getProviderAuthStatus(providerId); }
+  getRegisteredProviderIds() { return this.registry.getRegisteredProviderIds(); }
+  // model-runtime.ts:543-553: the configured and OAuth state are the snapshot's.
+  isUsingOAuth(providerId) { return this.registry._providerState(providerId)?.usingOAuth === true; }
+  hasConfiguredAuth(providerId) { return this.registry._providerState(providerId)?.configured === true; }
+  // model-runtime.ts:310-312: the provider's credentials, or undefined when it has none.
+  async checkAuth(providerId) { return this.registry.getProviderAuth(providerId); }
+  // model-runtime.ts:369-385 getAuth(providerId | model): the model overload goes through the registry's request auth, whose "No API key" result is the absence of a resolution.
+  async getAuth(providerOrModel) {
+    if (typeof providerOrModel === "string") return this.registry.getProviderAuth(providerOrModel);
+    const resolved = await this.registry.getApiKeyAndHeaders(providerOrModel);
+    if (!resolved.ok) {
+      if (resolved.error === `No API key found for "${providerOrModel.provider}"`) return undefined;
+      throw new Error(resolved.error);
+    }
+    if (resolved.apiKey === undefined && resolved.headers === undefined) return undefined;
+    return { auth: { apiKey: resolved.apiKey, headers: resolved.headers, ...(resolved.baseUrl ? { baseUrl: resolved.baseUrl } : {}) }, env: resolved.env };
+  }
+  stream(model, context, options) { return this.registry.stream(model, context, options); }
+  streamSimple(model, context, options) { return this.registry.streamSimple(model, context, options); }
+  complete(model, context, options) { return this.registry.complete(model, context, options); }
+  completeSimple(model, context, options) { return this.registry.streamSimple(model, context, options).result(); }
+  registerProvider(providerId, config) { this.registry.registerProvider(providerId, config); }
+  registerNativeProvider(provider) { this.registry.registerProvider(provider); }
+  unregisterProvider(providerId) { this.registry.unregisterProvider(providerId); }
+  registerVirtualModel(definition) { this.registry.registerVirtualModel(definition); }
+  unregisterVirtualModel(providerId, id) { this.registry.unregisterVirtualModel(providerId, id); }
+  // model-runtime.ts:733-757: routes through the virtual models this Node process registered.
+  async resolveModel(model, messages, options) {
+    const name = `Virtual model ${model.provider}/${model.id}`;
+    const virtual = this.registry.host.virtualModels.get(JSON.stringify([model.provider, model.id]));
+    if (!virtual) throw new Error(`${name} is not registered by this extension; its route runs in the extension that registered it.`);
+    const { failed, ...request } = options;
+    // The Pi modules load on the first routing, not at startup.
+    const { findLatestResponse } = await import("./shims/pi-dist/pi-coding-agent/core/virtual-models.js");
+    const { clampThinkingLevel } = await import("./shims/pi-dist/pi-ai/sdk-bundle/index.js");
+    const latest = findLatestResponse(messages);
+    const previousModel = latest && this.getPhysicalModel(latest.provider, latest.model);
+    const failedModel = failed && this.getPhysicalModel(failed.provider, failed.model);
+    const route = await virtual.route({
+      ...request,
+      model,
+      previous: previousModel && { model: previousModel, thinkingLevel: latest?.thinkingLevel },
+      failed: failedModel && failed && { model: failedModel, thinkingLevel: failed.thinkingLevel, message: failed },
+      messages,
+    });
+    const target = this.getPhysicalModel(route.model.provider, route.model.id);
+    const routed = `${name} routed to ${route.model.provider}/${route.model.id}`;
+    if (!target) throw new Error(`${routed}, which is not a physical model.`);
+    if (!this.hasConfiguredAuth(target.provider)) throw new Error(`${routed}, which has no credentials.`);
+    return { model: target, thinkingLevel: clampThinkingLevel(target, route.thinkingLevel), state: route.state };
+  }
+}
+
+// The chalk ThemeShim draws modifiers with: whether they draw is the host's
+// palette.modifiers (chalk's level for the host's stdout), not this pipe's.
+const modifierChalk = new Chalk({ level: 1 });
 export class ThemeShim {
   constructor() {
     this.foregrounds = {};
@@ -568,7 +837,46 @@ export class ThemeShim {
     this.mode = palette.mode === "256color" ? "256color" : "truecolor";
     this.appearance = palette.appearance === "light" || palette.appearance === "dark" ? palette.appearance : undefined;
     this.colors = wireColors(palette.colors);
+    this.tokenColorPalettes = undefined;
     setThemeInstance(this);
+  }
+  // withTokenColors runs fn with the given [token, "#rrggbb"] entries
+  // overriding the palette, as the host derives a view's surface theme with
+  // tui.Theme.WithTokenColors (D107 §13.3): each color escaped in the
+  // palette's color mode, a faint token staying faint. The palette is
+  // restored afterwards, unless fn installed another one.
+  withTokenColors(entries, fn) {
+    const saved = { foregrounds: this.foregrounds, backgrounds: this.backgrounds, colors: this.colors };
+    const derived = this.tokenColorPalette(entries);
+    Object.assign(this, derived);
+    try {
+      return fn();
+    } finally {
+      if (this.foregrounds === derived.foregrounds) Object.assign(this, saved);
+    }
+  }
+  // tokenColorPalette is the overridden palette, kept per override so a
+  // steady surface reuses one palette (the view walk caches by its identity).
+  tokenColorPalette(entries) {
+    const key = JSON.stringify(entries);
+    this.tokenColorPalettes ??= new Map();
+    let derived = this.tokenColorPalettes.get(key);
+    if (derived) return derived;
+    const mode = this.getColorMode();
+    const foregrounds = { ...this.foregrounds };
+    const backgrounds = { ...this.backgrounds };
+    const colors = { ...this.colors };
+    for (const [token, value] of entries) {
+      const color = parseColor(value);
+      colors[token] = color;
+      if (VIEW_THEME_TOKENS[token] === "bg") backgrounds[token] = backgroundAnsi(color, mode);
+      else foregrounds[token] = foregroundAnsi(color, mode) + (this.foregrounds[token]?.endsWith?.("\x1b[2m") ? "\x1b[2m" : "");
+    }
+    derived = { foregrounds, backgrounds, colors: Object.freeze(colors) };
+    // A surface whose override changes every frame (a track color) must not grow this without bound.
+    if (this.tokenColorPalettes.size >= 32) this.tokenColorPalettes.clear();
+    this.tokenColorPalettes.set(key, derived);
+    return derived;
   }
   // Upstream Theme.style over the palette's escape sequences (theme.ts:342-367). The attributes are SGR drawn directly, whatever the host's chalk level is.
   style(text, options) {
@@ -584,28 +892,35 @@ export class ThemeShim {
     if (typeof ansi !== "string" || ansi === "") throw new Error(`Unknown theme color: ${token}`);
     return ansi;
   }
-  modifier(open, close, text) {
+  // Upstream's modifiers are chalk's (theme.ts bold, italic, ...): chalk
+  // re-opens a style after an inner close of it and around each line break.
+  modifier(style, text) {
     const value = String(text ?? "");
-    return this.modifiers ? `${open}${value}${close}` : value;
+    return this.modifiers ? modifierChalk[style](value) : value;
   }
   // The host sends each foreground as Pi's getFgAnsi opening, which ends in SGR 2 for a faint token (theme.ts:399-402). Pi's fg closes a faint token with SGR 22;39 (theme.ts:363), so the faint attribute does not leak past the text.
   fg(token, text) {
     const value = String(text ?? "");
     const open = this.foregrounds[token] || "";
-    if (!open) return value;
+    if (!open) return this.unknownOrUnstyled(token, value);
     return `${open}${value}${open.endsWith("\x1b[2m") ? "\x1b[22;39m" : "\x1b[39m"}`;
   }
   bg(token, text) {
     const value = String(text ?? "");
     const open = this.backgrounds[token] || "";
-    return open ? `${open}${value}\x1b[49m` : value;
+    return open ? `${open}${value}\x1b[49m` : this.unknownOrUnstyled(token, value);
   }
-  bold(text) { return this.modifier("\x1b[1m", "\x1b[22m", text); }
+  // A token the palette lacks is Pi's `Unknown theme color` throw (theme.ts:374); a theme the host has not sent a palette to has no tokens to lack.
+  unknownOrUnstyled(token, value) {
+    if (Object.keys(this.foregrounds).length === 0 && Object.keys(this.backgrounds).length === 0) return value;
+    throw new Error(`Unknown theme color: ${token}`);
+  }
+  bold(text) { return this.modifier("bold", text); }
   dim(text) { return `\x1b[2m${String(text ?? "")}\x1b[22m`; }
-  italic(text) { return this.modifier("\x1b[3m", "\x1b[23m", text); }
-  underline(text) { return this.modifier("\x1b[4m", "\x1b[24m", text); }
-  inverse(text) { return this.modifier("\x1b[7m", "\x1b[27m", text); }
-  strikethrough(text) { return this.modifier("\x1b[9m", "\x1b[29m", text); }
+  italic(text) { return this.modifier("italic", text); }
+  underline(text) { return this.modifier("underline", text); }
+  inverse(text) { return this.modifier("inverse", text); }
+  strikethrough(text) { return this.modifier("strikethrough", text); }
   // Upstream Theme.getFgAnsi, getBgAnsi, getColorMode, getThinkingBorderColor
   // and getBashModeBorderColor over the host's palette.
   getFgAnsi(color) {
@@ -615,7 +930,7 @@ export class ThemeShim {
   }
   getBgAnsi(color) {
     const ansi = this.backgrounds[color];
-    if (!ansi) throw new Error(`Unknown theme background color: ${color}`);
+    if (!ansi) throw new Error(`Unknown theme color: ${color}`);
     return ansi;
   }
   getColorMode() { return this.mode ?? "truecolor"; }
@@ -742,12 +1057,17 @@ export function closeInCloseCallbacks(fn, factory = () => new MessageChannel()) 
   });
 }
 
+// resumeRequestWindows rearms the windows that waited for short host calls, and the turn window of a request whose handler started or finished a host call since it last turned the event loop.
 function resumeRequestWindows() {
   for (const runtime of quitDrain.runtimes) {
     for (const request of runtime.requestRecords.values()) {
       if (request.windowWait && !windowPending(request)) {
         request.windowWait = false;
-        armRequestWindow(request);
+        if (request.turnWindow) armTurnWindow(request);
+        else armRequestWindow(request);
+      } else if (request.turnedAt !== undefined && request.turnedAt !== hostCallEpoch(request) && !windowPending(request)) {
+        request.turnedAt = undefined;
+        armTurnWindow(request);
       }
     }
   }
@@ -793,6 +1113,148 @@ function enterQuitDrain() {
   listenForQuitDrain();
 }
 
+// Pi's print and JSON modes await each prompt and go on in the same continuation: to the next prompt, or to disposing the runtime, which runs session_shutdown and then invalidates the runner (print-mode.ts:131-166, agent-session-runtime.ts:404-410, agent-session.ts:1393-1406). A prompt ends with its command, its handled input or agent_settled, so a timer, immediate or I/O callback an extension queued runs only once the next prompt reaches the agent's I/O, or after the ctx went stale. This process answers the host over IPC, which would give the event loop such a callback before the host's next step arrives: pi-goal-x's agent_settled continuation timer then started a run during disposal, which failed with the stale message. So in those modes, after answering a call that can end a prompt, or session_shutdown, while no run is in progress, the process stays in that call until the host's next step reaches it: a request, a run beginning, invalidate, reload_started, loop_turned, shutdown or a closed connection. Every Node generation of the process waits together, packed or isolated alike. State the host replicates meanwhile is applied in order after the wait.
+// The host sends invalidate and a run's run_signal frames to every connection, and a packed process reads its sockets in no fixed order: one member's copy can arrive after another member's, or after a later frame of another member. So invalidate and a run beginning end the wait only once every open connection of the process has read its own copy, and only a run newer than every run the process had read of before the wait begins one: a member that reads a finished run's frames late, before its first request, is not reading a run beginning. run is the newest run the process has read of on any connection; baseRun and broadcast are the wait's.
+const PROMPT_END_MODES = new Set(["print", "json"]);
+const PROMPT_END_EVENTS = new Set(["input", "agent_settled", "session_shutdown"]);
+const hostStep = { waiting: false, arrived: false, run: 0, baseRun: 0, broadcast: new Set() };
+
+// Pi's runner awaits each extension's handler in turn, on one event loop (runner.ts:1089-1116). When a later extension's handler awaits a timer, I/O or a child process, that loop turns and runs the callbacks an earlier extension queued, with a live ctx, before the handler resumes. A packed process shares that loop. Another process's handler suspends on its own loop, so in print and JSON mode a request's turn window tells the host when its handler yielded to the event loop: the window closes at the first check phase after the handler's synchronous run and microtasks (it is armed before the handler runs, ahead of every immediate the handler queues), or once the handler's pending short host calls settle (windowPending: Pi settles those in microtasks). If the request is unanswered then, the runtime sends loop_turned, and the host forwards it to every other Node process as its next step; the process stays in the turn until the host reports it taken (awaitTurnTaken). A host call the request starts or finishes after that is its handler running again, so the request gets a fresh window once its calls settle. A request that arrives during a run arms no window: the run's I/O already turns Pi's loop, and the run beginning ended every wait.
+function armTurnWindow(owner) {
+  owner.turnWindow = true;
+  // The process stays in the turn from the closing phase of this iteration: after every immediate of its check phase, such as a quit handler's suspension report, which goes out as early as before, and before the timers and I/O the handler awaits.
+  closeInCloseCallbacks(() => {
+    const turn = owner.turnSent;
+    owner.turnSent = undefined;
+    if (turn !== undefined && !owner.settled) awaitTurnTaken(owner.connection, turn);
+  });
+  setImmediate(() => {
+    if (owner.settled || owner.connection.closed) return;
+    if (windowPending(owner)) {
+      owner.windowWait = true;
+      return;
+    }
+    owner.turnedAt = hostCallEpoch(owner);
+    owner.turnSent = sendTurn(owner.connection);
+  });
+}
+
+// turnWait.turn is the turn this process waits to hear taken, 0 for none; turnWait.sent numbers the turns it sends.
+const turnWait = { sent: 0, turn: 0 };
+
+// sendTurn sends loop_turned and returns its number, or undefined when the connection closed meanwhile: the host forwards nothing for it.
+function sendTurn(conn) {
+  const turn = ++turnWait.sent;
+  try {
+    conn.notify("loop_turned", { turn });
+  } catch {
+    return undefined;
+  }
+  return turn;
+}
+
+// awaitTurnTaken stays in the turn until the host reports that every other Node process took it (loop_turn_taken), so the handler resumes from a timer or I/O only after the immediates and the due timers they had queued ran, as on Pi's one loop, however the OS schedules the processes: a stalled process otherwise read the turn after this handler had answered and ran its callbacks after the runner's invalidate. A request or shutdown for this process also ends the wait, since the host needs the process then, and so does the connection's close.
+function awaitTurnTaken(conn, turn) {
+  turnWait.turn = turn;
+  try {
+    conn.socket.waitUntil(() => turnWait.turn !== turn || conn.closed);
+  } catch {
+    // The connection closed while waiting; nothing waits for the turn.
+  } finally {
+    turnWait.turn = 0;
+  }
+}
+
+// A loop_turned that ends this process's wait stands for the other handler's yield. On Pi's one loop every immediate queued before that yield runs before anything the handler queues itself, so before its continuation and, after session_shutdown, the runner's invalidate. The host's frames after the turn follow that continuation, and they can arrive with the turn itself. So the process delivers each frame that arrives after the turn from an immediate it queues on the turn's arrival: the immediates queued before the turn run first, with a live ctx. It takes the turn from a zero-delay timer it queues then, after the timers already due, and the other handler's process stays in the turn from its closing phase until every process took it: on Pi's loop an earlier extension's due timer runs before the continuation of a handler that waits for a later timer or I/O, which therefore resumes after it here too. A handler that waits for an immediate resumes in its own check phase, before that wait, as before. A connection that closes delivers its held frames at once.
+const turnHold = { immediate: undefined, connections: new Set() };
+
+function holdAfterTurn() {
+  if (turnHold.immediate !== undefined) return;
+  turnHold.immediate = setImmediate(() => {
+    turnHold.immediate = undefined;
+    for (const conn of turnHold.connections) conn.releaseHeld();
+    turnHold.connections.clear();
+  });
+}
+
+// declaredMode is the mode the host declared in its ready payload, the run mode it drives. ctx.mode defaults an omitted mode to "print" (runner.ts:361), but a host that declares none, such as an embedding SDK host, has not promised print mode's continuation, so its runtime does not wait.
+// runActive is whether the host's run_signal, synced before every request, held a run in progress. A call answered during a run, such as the input of a steer or follow-up an extension sends with sendUserMessage (agent-session.ts:1968-2000, 2365-2394), ends no prompt: Pi's prompt() queues the message and returns while the run goes on doing I/O, so Pi's event loop turns.
+function endsPrompt(request, declaredMode, runActive) {
+  if (!PROMPT_END_MODES.has(declaredMode) || runActive) return false;
+  return request?.method === "command" || (request?.method === "event" && PROMPT_END_EVENTS.has(request.event));
+}
+
+// noteHostStep records env, read on conn, toward the host's next step: a request, shutdown or reload_started is the step; invalidate or a run beginning is the step once every open connection of the process has read its copy.
+// A run beginning stands for the loop turn Pi's run makes at the bash tool's I/O, which runs the immediates and due timers the prompt's last handler queued before anything the host does next. A process the OS scheduled late reads the run's later frames, the run's end and the shutdown request among them, in the same pass as the run beginning, and its serve loop would run that request in the microtasks that follow the wait, before the check phase and with the wait entered again, so the immediate never ran: the frames after the run beginning are held until an immediate queued now runs (holdAfterTurn), after those queued earlier.
+function noteHostStep(conn, env) {
+  let broadcast = false;
+  let runBeginning = false;
+  if (env.type === "notify" && env.notify?.method === "run_signal") {
+    let args = env.notify.args;
+    try {
+      if (typeof args === "string") args = JSON.parse(args);
+    } catch {
+      return;
+    }
+    const run = typeof args?.run === "number" ? args.run : 0;
+    broadcast = args?.active === true && run > hostStep.baseRun;
+    runBeginning = broadcast;
+    if (run > hostStep.run) hostStep.run = run;
+    if (!broadcast) return;
+  } else if (env.type === "notify" && env.notify?.method === "invalidate") {
+    broadcast = true;
+  } else if (env.type !== "request" && env.type !== "shutdown" && !(env.type === "notify" && env.notify?.method === "reload_started")) {
+    return;
+  }
+  if (!hostStep.waiting) return;
+  if (broadcast) {
+    hostStep.broadcast.add(conn);
+    if (!broadcastRead()) return;
+    if (runBeginning && !hostStep.arrived) holdAfterTurn();
+  }
+  hostStep.arrived = true;
+}
+
+// broadcastRead reports whether every open connection of the process has read the broadcast step the wait has begun to read.
+function broadcastRead() {
+  if (hostStep.broadcast.size === 0) return false;
+  for (const runtime of liveRuntimes) {
+    const conn = runtime.conn;
+    if (conn && !conn.closed && !hostStep.broadcast.has(conn)) return false;
+  }
+  return true;
+}
+
+// awaitHostStep returns at once while a request of this process is unanswered: its continuation needs the event loop, as Pi's would.
+function awaitHostStep(conn) {
+  if (conn.closed || isWaiting()) return;
+  for (const runtime of liveRuntimes) {
+    for (const request of runtime.requestRecords.values()) {
+      if (!request.responded) return;
+    }
+  }
+  hostStep.waiting = true;
+  hostStep.arrived = false;
+  hostStep.baseRun = hostStep.run;
+  hostStep.broadcast.clear();
+  try {
+    conn.socket.waitUntil(() => hostStep.arrived || conn.closed);
+  } catch {
+    // The connection closed while waiting; nothing remains to order.
+  } finally {
+    hostStep.waiting = false;
+    hostStep.broadcast.clear();
+  }
+}
+
+// awaitsWaitForIdle reports whether the request's handler waits on a waitForIdle host call. Pi's returns at once while the Session is idle (agent-session.ts waitForIdle: `if (this.isIdle) return`), so the handler goes on in microtasks and is not suspended; the host knows whether the call waits and reports the suspension then (Conn.settleBlockedCall).
+function awaitsWaitForIdle(conn, requestId) {
+  for (const pending of conn.pending.values()) {
+    if (pending.parentRequestId === requestId && pending.method === "waitForIdle") return true;
+  }
+  return false;
+}
+
 export class Connection {
   constructor(socket) {
     this.socket = socket;
@@ -800,6 +1262,7 @@ export class Connection {
     this.callEpochs = new Map();
     this.queue = [];
     this.waiters = [];
+    this.held = [];
     this.closed = false;
     this.streamStarts = new Map();
     socket.on("envelope", env => this.onEnvelope(env));
@@ -810,6 +1273,9 @@ export class Connection {
   onClose() {
     if (this.closed) return;
     this.closed = true;
+    // A member whose connection closes has no copy left to read.
+    if (hostStep.waiting && !hostStep.arrived && broadcastRead()) hostStep.arrived = true;
+    this.releaseHeld();
     for (const waiter of this.waiters.splice(0)) waiter(null);
     for (const [id, pending] of this.pending) {
       // A received result still belongs to the ordered receive loop, even if the peer closes before that loop reaches it.
@@ -831,27 +1297,67 @@ export class Connection {
       else sharedBus.release(env.notify.args ?? {});
       return;
     }
-    if (env.type === "request" && ["provider_sync", "provider_object_callback_sync", "autocomplete.sync", "facet_sync"].includes(env.request?.method)) {
+    if (env.type === "notify" && env.notify?.method === "loop_turn_taken") {
+      if (env.notify.args?.turn === turnWait.turn) turnWait.turn = 0;
+      return;
+    }
+    if (env.type === "notify" && env.notify?.method === "loop_turned") {
+      // Another Node process's handler turned the event loop (armTurnWindow) and stays in the turn until this process takes it. Only a process that waits for the host's next step acts on it: the frames after it wait for the turn (holdAfterTurn), and it takes the turn once the immediates and the due timers it queued before have run. Any other process takes it at once.
+      const turn = env.notify.args?.turn;
+      if (hostStep.waiting) {
+        if (!hostStep.arrived) {
+          hostStep.arrived = true;
+          holdAfterTurn();
+        }
+        setTimeout(() => this.takeTurn(turn), 0);
+      } else this.takeTurn(turn);
+      return;
+    }
+    // Pi runs an event's handlers inside the extension API call that emitted it (agent-session.ts setSessionName, setThinkingLevel: void runner.emit). The host admits such an event only once a handler starts, while its call lane still applies this process's earlier write, so an event that arrives during a synchronous call, after a write that has not settled, starts here, nested in the wait.
+    if (env.type === "request" && env.request?.method === "event" && this.syncWaits > 0 && this.nestedEvent?.(env)) return;
+    if (env.type === "request" && ["provider_sync", "provider_object_callback_sync", "autocomplete.sync", "facet_sync", "tool_reaches_tools"].includes(env.request?.method)) {
       this.requestState(env.id, "started");
       try { this.respond(env.id, this.syncHandler(env.request)); }
       catch (error) { this.respond(env.id, null, error); }
       return;
     }
+    // The host needs this process's event loop for any other request, and for shutdown: a wait for its own turn ends (awaitTurnTaken).
+    if (env.type === "request" || env.type === "shutdown") turnWait.turn = 0;
     if (env.type === "cancel") this.cancelParent(env.cancel?.request_id || env.id || "", true);
     if (env.type === "notify" && env.notify?.method === "model_stream_event" && env.notify.args?.started) {
       this.streamStarts.get(env.notify.args.streamId)?.();
       return;
     }
+    // The loading factory's connection has no serve loop: a stream it started (a pi-ai call at module load) takes its events as they arrive.
+    if (env.type === "notify" && env.notify?.method === "model_stream_event" && this.loading && this.loadingStreamEvent) {
+      this.loadingStreamEvent(env.notify);
+      return;
+    }
     if (env.type === "call_result") {
       const pending = this.pending.get(env.id);
-      if (pending?.synchronous || pending?.appliedOnReceipt) {
+      // The loading factory's connection has no serve loop yet: its awaited calls settle as their results arrive.
+      if (pending?.synchronous || pending?.appliedOnReceipt || (pending && this.loading)) {
         this.resolveCall(env);
         return;
       }
       if (pending) pending.responseQueued = true;
     }
+    noteHostStep(this, env);
+    if (turnHold.immediate !== undefined) {
+      this.held.push(env);
+      turnHold.connections.add(this);
+      return;
+    }
+    this.deliver(env);
+  }
+
+  deliver(env) {
     if (this.waiters.length > 0) this.waiters.shift()(env);
     else this.queue.push(env);
+  }
+
+  releaseHeld() {
+    for (const env of this.held.splice(0)) this.deliver(env);
   }
 
   resolveCall(env) {
@@ -865,6 +1371,7 @@ export class Connection {
       const info = env.call_result.error;
       const error = new Error(info.code ? `${info.code}: ${info.message}` : info.message);
       error.code = info.code || "";
+      hostRejections.add(error);
       pending.reject(error);
     } else pending.resolve(env.call_result?.result ?? null);
   }
@@ -874,14 +1381,9 @@ export class Connection {
     return () => this.socket.off("drain", handler);
   }
 
-  send(env) {
-    const data = Buffer.from(JSON.stringify(env));
-    if (data.length > MAX_FRAME_SIZE) {
-      throw new Error(`frame too large: ${data.length} bytes exceeds ${MAX_FRAME_SIZE}`);
-    }
-    const hdr = Buffer.alloc(4);
-    hdr.writeUInt32BE(data.length, 0);
-    return this.socket.write(Buffer.concat([hdr, data]));
+  // send writes the envelopes as consecutive frames in one socket write.
+  send(...envs) {
+    return this.socket.write(frameBytes(...envs));
   }
 
   next() {
@@ -898,12 +1400,19 @@ export class Connection {
   call(method, args = {}, parentRequestId = "") {
     if (this.closed) return Promise.reject(new Error("extension connection closed"));
     const id = uuid();
+    // pig additive (D189): a call made by a timer's or an immediate's callback after its request's handler returned (the call has no parent) says so, and the host holds it until Pi's loop would have run the callback. A callback that runs while the handler still awaits is a turn of Pi's loop already.
+    const kind = parentRequestId ? undefined : originKind();
+    // Pi's loop turns while a sibling tool awaits real work, so a timer callback runs right after the tool that queued it ends, with its process.nextTick callbacks; the host releases a "tick" call there.
+    const timer = kind !== undefined;
+    const tick = kind === "tick" || (timer && siblingToolPending());
+    // The host runs a tick call after the tool_execution_end of the tool call whose handler queued the callback, which this process cannot order against the call: it says which tool call that was.
+    const originTool = tick ? originToolCallId() : undefined;
     return new Promise((resolve, reject) => {
       this.touchRequest(parentRequestId);
       this.pending.set(id, { resolve, reject, parentRequestId, method });
       refreshQuitDrain();
       try {
-        this.send({ type: "call", id, call: { method, args, ...(parentRequestId ? { parent_request_id: parentRequestId } : {}) } });
+        this.send({ type: "call", id, call: { method, args, ...(parentRequestId ? { parent_request_id: parentRequestId } : {}), ...(timer ? { timer: true } : {}), ...(tick ? { tick: true } : {}), ...(originTool !== undefined ? { origin_tool_call_id: originTool } : {}) } });
       } catch (error) {
         this.pending.delete(id);
         reject(error);
@@ -937,8 +1446,9 @@ export class Connection {
       reject: cause => { error = cause; done = true; },
     });
     this.send({ type: "call", id, call: { method, args, parent_request_id: parentRequestId } });
+    this.syncWaits = (this.syncWaits ?? 0) + 1;
     try { this.socket.waitUntil(() => done); }
-    finally { this.pending.delete(id); }
+    finally { this.pending.delete(id); this.syncWaits--; }
     if (error) throw error;
     return value;
   }
@@ -978,13 +1488,22 @@ export class Connection {
     this.send({ type: "notify", notify: { method, args } });
   }
 
+  // takeTurn tells the host that this connection took the forwarded loop_turned numbered turn.
+  takeTurn(turn) {
+    if (this.closed) return;
+    try {
+      this.notify("loop_turn_taken", { turn });
+    } catch {
+      // The connection closed meanwhile; the host counts it as taken.
+    }
+  }
+
   respond(id, result = null, error = null) {
-    this.requestState(id, "completed");
-    this.send({
-      type: "response",
-      id,
-      response: error ? { result, error: errorInfo(error) } : { result },
-    });
+    // The completed state and the response leave in one write: the host reads them in one batch.
+    return this.send(
+      { type: "request_state", request_state: { request_id: id, state: "completed" } },
+      { type: "response", id, response: error ? { result, error: errorInfo(error) } : { result } },
+    );
   }
 
   requestState(id, state, reason = undefined) {
@@ -995,10 +1514,33 @@ export class Connection {
   }
 }
 
+// frameBytes is the envelopes as consecutive length-prefixed frames in one buffer. A frame above the limit throws before any is built.
+function frameBytes(...envs) {
+  const bodies = envs.map(env => Buffer.from(JSON.stringify(env)));
+  let size = 0;
+  for (const data of bodies) {
+    if (data.length > MAX_FRAME_SIZE) {
+      throw new Error(`frame too large: ${data.length} bytes exceeds ${MAX_FRAME_SIZE}`);
+    }
+    size += 4 + data.length;
+  }
+  const frames = Buffer.allocUnsafe(size);
+  let offset = 0;
+  for (const data of bodies) {
+    offset = frames.writeUInt32BE(data.length, offset);
+    offset += data.copy(frames, offset);
+  }
+  return frames;
+}
+
 // errorInfo is the wire form of a thrown error. The stack travels with it
 // because upstream reports a handler's `err.stack` alongside its message.
+// The message is upstream's `err instanceof Error ? err.message : String(err)`
+// (agent-loop.ts createErrorToolResult callers, runner.ts emitError): an Error
+// with an empty message stays empty, and a thrown object that only has a
+// `message` property is "[object Object]".
 export function errorInfo(error) {
-  const info = { message: error?.message || String(error) };
+  const info = { message: error instanceof Error ? error.message : String(error) };
   if (typeof error?.stack === "string" && error.stack !== "") info.stack = error.stack;
   return info;
 }
@@ -1049,7 +1591,7 @@ class RuntimeContext {
       signal: guarded(() => runtime.runSignal?.controller.signal),
     });
     this.theme = runtime.ui.theme;
-    values.model = normalizeModel(runtime.state.model) ?? (runtime.ready.model ? normalizeModel({ id: runtime.ready.model }) : undefined);
+    values.model = normalizeModel(runtime.state.model);
   }
 
   // Live terminal geometry. Getters rather than snapshots so a resize is
@@ -1058,10 +1600,28 @@ class RuntimeContext {
   get width() { return Number(this.runtime.ready?.width || 0); }
   get height() { return Number(this.runtime.ready?.height || 0); }
 
-  isIdle() { this.runtime.extensionRuntime.assertActive(); return this.runtime.state.isIdle; }
+  // pig additive (D19): the provenance the loader stamped on this extension (types.ts SourceInfo: path, source, scope, origin, baseDir), the value ExtensionRunner.getExtensionPaths reads; undefined when the host holds none.
+  extensionSourceInfo() {
+    this.runtime.extensionRuntime.assertActive();
+    const info = this.runtime.ready?.sourceInfo;
+    return info && typeof info === "object" ? { ...info } : undefined;
+  }
+
+  // Pi's runner.ts:createContext reads the Session live, including from I/O
+  // callbacks after the last subscribed event's busy snapshot.
+  isIdle() {
+    this.runtime.extensionRuntime.assertActive();
+    return this.runtime.callSync("isIdle")?.idle === true;
+  }
   isProjectTrusted() { this.runtime.extensionRuntime.assertActive(); return this.runtime.state.projectTrusted; }
-  abort() { this.runtime.extensionRuntime.assertActive(); this.runtime.fireAndForget("abort", {}); }
-  hasPendingMessages() { this.runtime.extensionRuntime.assertActive(); return this.runtime.state.hasPendingMessages; }
+  abort() { this.runtime.extensionRuntime.assertActive(); this.runtime.abortRun(); }
+  // Pi's hasPendingMessages is a live getter (agent-session.js:2728, `pendingMessageCount > 0`),
+  // so a cached snapshot would hide a queue transition that happens while a handler is awaited.
+  hasPendingMessages() {
+    this.runtime.extensionRuntime.assertActive();
+    const pending = this.runtime.callSync("hasPendingMessages");
+    return pending?.pending === true;
+  }
   // Pi's shutdown() stops the TUI only after the frame the current input
   // produced is painted (it drains input first), so a shutdown requested
   // from an editor's handleInput reaches the host after that frame.
@@ -1084,14 +1644,32 @@ class RuntimeContext {
       (err) => { if (typeof onError === "function") onError(err instanceof Error ? err : new Error(String(err))); },
     );
   }
-  getSystemPrompt() { this.runtime.extensionRuntime.assertActive(); return this.runtime.state.systemPrompt; }
-  getSystemPromptOptions() { this.runtime.extensionRuntime.assertActive(); return this.runtime.state.systemPromptOptions ?? {}; }
+  // agent-session.ts:1474-1476, 3495-3496 read the Session. The replicated prompt state lags this extension's own writes to the loadout, so once it has made one a read asks the Host (see Runtime.promptWritten).
+  getSystemPrompt() {
+    this.runtime.extensionRuntime.assertActive();
+    return this.runtime.promptWritten ? this.runtime.callSync("getSystemPrompt")?.prompt ?? "" : this.runtime.state.systemPrompt;
+  }
+  getSystemPromptOptions() {
+    this.runtime.extensionRuntime.assertActive();
+    return this.runtime.promptWritten ? this.runtime.callSync("getSystemPromptOptions") ?? {} : this.runtime.state.systemPromptOptions ?? {};
+  }
   // runner.ts:993-1016: the command context's methods throw synchronously when stale, so none is async.
-  waitForIdle() { this.runtime.extensionRuntime.assertActive(); return this.runtime.call("waitForIdle", {}); }
+  waitForIdle() {
+    this.runtime.extensionRuntime.assertActive();
+    const operation = this.runtime.call("waitForIdle", {});
+    // The command's acknowledgment waits for the call like any other host call of the handler, so a handler that goes on in microtasks once it returned is not taken for suspended (acknowledgeInvocation).
+    const owner = this.runtime.activeRequest();
+    if (owner) {
+      const tracked = operation.then(() => {}, () => {});
+      owner.pendingHostCalls.add(tracked);
+      void tracked.then(() => owner.pendingHostCalls.delete(tracked));
+    }
+    return operation;
+  }
   newSession(options = {}) {
     this.runtime.extensionRuntime.assertActive();
-    const { withSession, ...rest } = options ?? {};
-    return this.runtime.callReplacement("newSession", rest, withSession);
+    const { withSession, setup, ...rest } = options ?? {};
+    return this.runtime.callNewSession(rest, setup, withSession);
   }
   fork(entryId, options = {}) {
     this.runtime.extensionRuntime.assertActive();
@@ -1142,6 +1720,9 @@ function createNoOpUI(ui) {
     // pig divergence (D2): sprite validation remains owned by the host.
     registerSprite: ui.registerSprite,
     onWidthChange: ui.onWidthChange,
+    onThemeChange: ui.onThemeChange,
+    onToolsExpandedChange: ui.onToolsExpandedChange,
+    bell: ui.bell,
   };
 }
 
@@ -1152,25 +1733,33 @@ class RuntimeUI {
     this.theme = new ThemeShim();
   }
   async select(title, options, opts = {}) {
+    if (opts?.signal?.aborted) return undefined;
     this.runtime.blockForUser();
-    const result = await this.runtime.call("ui.select", { title, options, opts });
+    const result = await this.runtime.dialogCall("ui.select", { title, options, opts });
     return result?.ok ? result.selected : undefined;
   }
   async confirm(title, message, opts = {}) {
+    if (opts?.signal?.aborted) return false;
     this.runtime.blockForUser();
-    const result = await this.runtime.call("ui.confirm", { title, message, opts });
-    return Boolean(result?.confirmed);
+    const result = await this.runtime.dialogCall("ui.confirm", { title, message, opts });
+    // Pi's RPC confirm resolves `"confirmed" in r ? r.confirmed : false`: whatever JSON the client sent, `null` and non-booleans included.
+    return result && "confirmed" in result ? result.confirmed : false;
   }
-  async input(title, placeholder = "", opts = {}) {
+  // An omitted placeholder stays omitted, and an empty one is sent: RPC writes the member for the second only (rpc-mode.ts input).
+  async input(title, placeholder, opts = {}) {
+    if (opts?.signal?.aborted) return undefined;
     this.runtime.blockForUser();
-    const result = await this.runtime.call("ui.input", { title, placeholder, opts });
+    const result = await this.runtime.dialogCall("ui.input", { title, placeholder, opts });
     return result?.ok ? result.text : undefined;
   }
-  notify(message, type = "info") { this.runtime.fireAndForget("ui.notify", { message, level: type }); }
+  // ExtensionUIContext.notify has an optional type; an omitted one stays omitted (RPC writes no notifyType, rpc-mode.ts notify).
+  notify(message, type) { this.runtime.fireAndForget("ui.notify", { message, level: type }); }
   onTerminalInput(handler) {
     if (typeof handler !== "function") {
       throw new TypeError("onTerminalInput requires a handler function");
     }
+    // rpc-mode.ts onTerminalInput: raw terminal input is not supported in RPC mode; nothing is registered and no host call is made.
+    if (this.runtime.contextValues.mode === "rpc") return () => {};
     return this.runtime.addTerminalInputHandler(handler);
   }
   // Upstream Pi installs headers and footers as component factories whose
@@ -1184,6 +1773,22 @@ class RuntimeUI {
     }
     return this.runtime.addWidthChangeHandler(handler);
   }
+  // pig additive (D19): Pi calls a widget component's invalidate() on a theme change and the component reads ui.theme at its next render; a subprocess extension that pushes rows colored when it built them re-renders from this. The handler receives ui.theme after it took the new palette.
+  onThemeChange(handler) {
+    if (typeof handler !== "function") {
+      throw new TypeError("onThemeChange requires a handler function");
+    }
+    return this.runtime.addChangeHandler(this.runtime.themeChangeHandlers, handler);
+  }
+  // pig additive (D19): the original of a widget reads ui.getToolsExpanded() at every frame and Pi redraws on its expand key; the handler receives the new state after getToolsExpanded() reports it.
+  onToolsExpandedChange(handler) {
+    if (typeof handler !== "function") {
+      throw new TypeError("onToolsExpandedChange requires a handler function");
+    }
+    return this.runtime.addChangeHandler(this.runtime.toolsExpandedChangeHandlers, handler);
+  }
+  // pig additive (D19): a Pi extension rings the bell by writing BEL to process.stdout, which in this subprocess is not the terminal.
+  bell() { this.runtime.fireAndForget("ui.bell", {}); }
   setStatus(key, text) {
     // Upstream mutates FooterDataProvider synchronously before requesting a
     // render. Keep the subprocess replica current before sending the host call
@@ -1198,10 +1803,11 @@ class RuntimeUI {
     this.runtime.fireAndForget("ui.setStatus", { key, text });
     if (this.runtime.footerFactory) this.runtime.renderSpecialSurface("footer");
   }
-  setWorkingMessage(message) { this.runtime.fireAndForget("ui.setWorkingMessage", { message }); }
-  setWorkingIndicator(options = {}) { this.runtime.fireAndForget("ui.setWorkingIndicator", options); }
-  setWorkingVisible(visible) { this.runtime.fireAndForget("ui.setWorkingVisible", { visible }); }
-  setHiddenThinkingLabel(label) { this.runtime.fireAndForget("ui.setHiddenThinkingLabel", { label }); }
+  // rpc-mode.ts: working message, indicator, visibility and the hidden thinking label need the TUI loader and message rendering, so RPC mode makes no host call.
+  setWorkingMessage(message) { if (this.runtime.contextValues.mode !== "rpc") this.runtime.fireAndForget("ui.setWorkingMessage", { message }); }
+  setWorkingIndicator(options = {}) { if (this.runtime.contextValues.mode !== "rpc") this.runtime.fireAndForget("ui.setWorkingIndicator", options); }
+  setWorkingVisible(visible) { if (this.runtime.contextValues.mode !== "rpc") this.runtime.fireAndForget("ui.setWorkingVisible", { visible }); }
+  setHiddenThinkingLabel(label) { if (this.runtime.contextValues.mode !== "rpc") this.runtime.fireAndForget("ui.setHiddenThinkingLabel", { label }); }
   setWidget(key, content, options = {}) {
     if (content === undefined || content === null) {
       this.runtime.clearWidget(key);
@@ -1217,12 +1823,16 @@ class RuntimeUI {
       return;
     }
     if (typeof content === "function") {
+      // Pi's RPC mode ignores a component factory without calling it (rpc-mode.ts setWidget); print and JSON have no UI.
+      if (this.runtime.contextValues.mode !== "tui") return;
       this.runtime.setWidgetFactory(key, content, options);
       return;
     }
     throw new Error("setWidget content must be a component factory, string array, or undefined");
   }
+  // rpc-mode.ts setFooter/setHeader: a custom footer or header needs the TUI, so RPC mode ignores the factory without calling or keeping it.
   setFooter(factory) {
+    if (this.runtime.contextValues.mode === "rpc") return;
     this.runtime.specialSurfaceComponents.get("footer")?.component?.dispose?.();
     this.runtime.footerFactory = typeof factory === "function" ? factory : undefined;
     this.runtime.specialSurfaceComponents.delete("footer");
@@ -1230,6 +1840,7 @@ class RuntimeUI {
     else this.runtime.fireAndForget("ui.setFooter", { clear: true });
   }
   setHeader(factory) {
+    if (this.runtime.contextValues.mode === "rpc") return;
     this.runtime.specialSurfaceComponents.get("header")?.component?.dispose?.();
     this.runtime.headerFactory = typeof factory === "function" ? factory : undefined;
     this.runtime.specialSurfaceComponents.delete("header");
@@ -1242,13 +1853,20 @@ class RuntimeUI {
   async registerSprite(definition) { return this.runtime.call("ui.registerSprite", definition); }
   setTitle(title) { this.runtime.fireAndForget("ui.setTitle", { title }); }
   async custom(factory, options = {}) {
+    // rpc-mode.ts custom(): RPC mode has no custom UI, so it resolves undefined and the factory never runs; the host call keeps the ui_prompt scope.
+    if (this.runtime.contextValues.mode === "rpc") {
+      this.runtime.customOverlaySeq += 1;
+      await this.runtime.call("ui.custom", { key: `custom-${this.runtime.customOverlaySeq}` });
+      return undefined;
+    }
     this.runtime.blockForUser();
     return this.runtime.openCustomOverlay(factory, options);
   }
   pasteToEditor(text) { this.runtime.fireAndForget("ui.pasteToEditor", { text }); }
   setEditorText(text) { this.runtime.fireAndForget("ui.setEditorText", { text }); }
   getEditorText() { return this.runtime.state.editorText ?? ""; }
-  async editor(title, prefill = "") {
+  // An omitted prefill stays omitted, and an empty one is sent: RPC writes the member for the second only (rpc-mode.ts editor).
+  async editor(title, prefill) {
     this.runtime.blockForUser();
     const result = await this.runtime.call("ui.editor", { title, prefill });
     return result?.ok ? result.text : undefined;
@@ -1257,7 +1875,9 @@ class RuntimeUI {
   // 0.3.0: replaced by Pi runner wiring
   // Pi's setEditorComponent: the factory's editor replaces the host's editor
   // (editor-component.mjs); undefined restores it.
+  // rpc-mode.ts: RPC mode has no custom editor, so setEditorComponent is a no-op and getEditorComponent answers undefined.
   setEditorComponent(factory) {
+    if (this.runtime.contextValues.mode === "rpc") return;
     if (typeof factory !== "function") {
       this.runtime.editorFactory = undefined;
       this.runtime.editorHost.clear();
@@ -1266,15 +1886,17 @@ class RuntimeUI {
     this.runtime.editorFactory = factory;
     this.runtime.editorHost.install(factory);
   }
-  getEditorComponent() { return this.runtime.editorFactory; }
+  getEditorComponent() { return this.runtime.contextValues.mode === "rpc" ? undefined : this.runtime.editorFactory; }
   getAllThemes() { return this.runtime.state.allThemes ?? []; }
   getTheme(name) {
     return themeFromPalette(this.runtime.callSync("ui.getTheme", { name })?.theme);
   }
   setTheme(name) {
+    // rpc-mode.ts setTheme: RPC mode cannot switch themes, for a name or a Theme object alike, and never throws.
+    if (this.runtime.contextValues.mode === "rpc") return { success: false, error: "Theme switching not supported in RPC mode" };
     const result = this.runtime.callSync("ui.setTheme", { theme: name });
     const palette = this.runtime.callSync("ui.theme")?.theme;
-    if (palette) this.theme.setPalette(palette);
+    if (palette) this.runtime.applyThemePalette(palette);
     return result;
   }
   getToolsExpanded() { return this.runtime.state.toolsExpanded ?? false; }
@@ -1323,10 +1945,12 @@ function resolveOverlayWidth(opts, termWidth) {
 }
 
 // OAuthBridgeCancelled aborts a value-returning login callback when the user
-// dismissed the host prompt. It mirrors the Go/Rust/Python SDK cancel sentinels.
+// dismissed the host prompt. It mirrors the Go/Rust/Python SDK cancel sentinels
+// and carries Pi's "Login cancelled", the rejection of a cancelled login prompt
+// (interactive-mode.ts:6243-6300 showAuthSelect, showAuthPrompt).
 class OAuthBridgeCancelled extends Error {
   constructor() {
-    super("oauth prompt cancelled");
+    super("Login cancelled");
     this.name = "OAuthBridgeCancelled";
   }
 }
@@ -1342,9 +1966,9 @@ function oauthCredsFromWire(wire) {
 
 // OAuthLoginCallbacks presents the upstream config.oauth callback surface to a
 // provider's login() closure and forwards each call to the host over oauth.cb.*.
-// Value-returning callbacks resolve the host reply; a host cancel becomes an
-// undefined return (onSelect) or a thrown cancel (onPrompt/onManualCodeInput),
-// matching the upstream in-process callback semantics.
+// Value-returning callbacks resolve the host reply; a host cancel rejects each of
+// them with "Login cancelled", as Pi's adaptOAuth routes them to the login
+// interaction's prompt (provider-composer.ts:361-364).
 class OAuthLoginCallbacks {
   constructor(runtime, signal) {
     this.runtime = runtime;
@@ -1359,6 +1983,8 @@ class OAuthLoginCallbacks {
     this.runtime.fireAndForget("oauth.cb.onDeviceCode", {
       userCode: info.userCode ?? "",
       verificationUri: info.verificationUri ?? "",
+      openBrowserOnConfirm: info.openBrowserOnConfirm,
+      copyCodeOnConfirm: info.copyCodeOnConfirm,
       intervalSeconds: info.intervalSeconds,
       expiresInSeconds: info.expiresInSeconds,
     });
@@ -1382,7 +2008,7 @@ class OAuthLoginCallbacks {
       message: prompt.message ?? "",
       options: (prompt.options ?? []).map((o) => ({ id: o.id, label: o.label })),
     });
-    if (result?.cancel) return undefined;
+    if (result?.cancel) throw new OAuthBridgeCancelled();
     return result?.value ?? "";
   }
   async onManualCodeInput() {
@@ -1456,6 +2082,27 @@ function applyTerminalCapabilities(caps) {
   setTerminalCapabilities({ images: caps.images || null, trueColor: caps.trueColor === true, hyperlinks: caps.hyperlinks === true });
 }
 
+// FooterDataProvider is upstream's ReadonlyFooterDataProvider (footer-data-provider.ts:103-163,387): the host's footer data, read from the replicated state.
+class FooterDataProvider {
+  constructor(runtime) {
+    this.runtime = runtime;
+  }
+  getGitBranch() {
+    return this.runtime.state.footerData.gitBranch;
+  }
+  getExtensionStatuses() {
+    return new Map(Object.entries(this.runtime.state.footerData.extensionStatuses || {}));
+  }
+  getAvailableProviderCount() {
+    return this.runtime.state.footerData.availableProviderCount || 0;
+  }
+  onBranchChange(callback) {
+    if (typeof callback !== "function") return () => {};
+    this.runtime.branchChangeCallbacks.add(callback);
+    return () => this.runtime.branchChangeCallbacks.delete(callback);
+  }
+}
+
 export class Runtime {
   constructor(entry, nativeProviderObjects = new Map(), providerConfigObjects = new Map(), { name, socket } = {}) {
     seedHostTerminalCapabilities();
@@ -1472,10 +2119,14 @@ export class Runtime {
     this.extensionRuntime = createExtensionRuntime();
     this.hostReady = false;
     this.markdownTransformer = undefined;
+    // PiG-only: whether this extension owns the thinking runs of assistant messages. Recorded during load, carried by the register frame; later calls go to the host.
+    this.ownsThinkingRuns = false;
     this.requestContext = new AsyncLocalStorage();
     // withSession callbacks of replacement calls in flight, by the handle the call names.
     this.withSessionCallbacks = new Map();
     this.nextWithSessionHandle = 0;
+    this.setupCallbacks = new Map();
+    this.nextSetupHandle = 0;
     this.activeRequests = new Map();
     // requestRecords holds each outstanding host request's ownership record.
     this.requestRecords = new Map();
@@ -1497,11 +2148,23 @@ export class Runtime {
     this.virtualModels = new Map();
     // ctx.executeTool calls in flight, by the id the Host knows them by.
     this.nestedCalls = new Map();
+    // BashOperations objects a user_bash reply named by handle; the host releases one when it drops the object.
+    this.bashOperations = new Map();
+    this.bashOperationsSeq = 0;
     this.nextExecuteId = 1;
+    this.nextExecId = 1;
+    this.nextDialogId = 1;
     // Raw terminal-input handlers, consulted synchronously while the host
     // waits for a consume decision. Empty means the host never round-trips.
     this.terminalInputHandlers = [];
     this.widthChangeHandlers = [];
+    // pig additive (D19): subscribers to the host's theme and tool-expansion changes, and the pi.onLoaded handlers. themeSignature and toolsExpandedKnown say the host has sent a first value, so a later different one is a change.
+    this.themeChangeHandlers = [];
+    this.toolsExpandedChangeHandlers = [];
+    this.themeSignature = undefined;
+    this.toolsExpandedKnown = false;
+    this.loadedHandlers = [];
+    this.loadedPromise = undefined;
     this.commands = new Map();
     this.shortcuts = new Map();
     this.flags = new Map();
@@ -1530,8 +2193,8 @@ export class Runtime {
     this.nativeProviderObjects = nativeProviderObjects;
     // Pi keeps one effective registered configuration root per provider (model-runtime.ts:438-443,753-766). Members of one Node cell share that root and its original children, functions and descriptors.
     this.providerConfigObjects = providerConfigObjects;
-    // Entries ctx.sessionManager.appendCustomEntry appended that the host's
-    // replicated log does not hold yet.
+    // Entries ctx.sessionManager.appendCustomEntry showed that the host's
+    // replicated log does not hold yet and has not refused.
     this.pendingEntries = [];
     // After the register frame the host has this extension's providers, and
     // a registration applies immediately, as after upstream's bindCore.
@@ -1550,7 +2213,16 @@ export class Runtime {
     this.toolRenderCards = new Map();
     this.modelStreams = new Map();
     this.modelStreamCallbacks = new Map();
+    // ctx.modelRegistry's catalog and this extension's own copies of the models it has read (modelFor), every model once it has read them all.
+    this.catalog = emptyCatalog;
     this.models = new Map();
+    this.modelsComplete = true;
+    // The registry the Host last published: its catalog and its provider, error and registration state. ctx.modelRegistry reads catalog and registryState, which are these until this process writes the registry (holdRegistryWrite).
+    this.hostCatalog = emptyCatalog;
+    this.hostRegistry = this.registryState;
+    this.registryHolds = new Map();
+    // The virtual-model registrations and removals this process made that the Host's snapshot does not show yet, by provider and id (holdVirtualWrite).
+    this.virtualWrites = new Map();
     this.nextModelStreamId = 1;
     this.footerFactory = undefined;
     this.headerFactory = undefined;
@@ -1565,9 +2237,9 @@ export class Runtime {
     this.sessionLogRequested = false;
     this.sessionLogGeneration = 0;
     this.sessionLogSync = undefined;
+    // Whether this extension has changed the active tools or registered a tool since it loaded. The Host pushes the system prompt and its options with the next event, after the handler that wrote them, so from the first write on a read asks the Host instead of the push (Pi's getters read the Session, agent-session.ts:1474-1476, 3495-3496).
+    this.promptWritten = false;
     this.state = {
-      activeTools: [],
-      allTools: [],
       commands: [],
       thinkingLevel: "",
       model: undefined,
@@ -1583,11 +2255,15 @@ export class Runtime {
       systemPromptOptions: {},
       flags: {},
       hasUI: false,
+      // pig additive (D107): a D91 frontend draws the interactive mode (StatePayload.frontend); surfaces derive views only then.
+      frontend: false,
       // Replicated by the Host: pi.getSettings() reads it (StatePayload.settings). The MCP server registry and ctx.tools are read from the Host when they are read.
       settings: undefined,
       footerData: { gitBranch: null, extensionStatuses: {}, availableProviderCount: 0 },
     };
     this.autocomplete = new AutocompleteRuntime(this);
+    // pig additive (D107): image refs whose bytes this connection has sent; ui.view.evicted forgets them.
+    this.viewImageRefs = new Set();
     this.ui = new RuntimeUI(this);
     // 0.3.0: replaced by Pi runner wiring
     this.editorHost = new EditorComponentHost(this);
@@ -1619,22 +2295,75 @@ export class Runtime {
       registerCommand: (name, definition) => this.registerCommand(name, definition),
       registerShortcut: (key, definition) => this.registerShortcut(key, definition),
       registerFlag: (name, definition) => this.registerFlag(name, definition),
+      // pig additive (D19): runs handler(ctx) once the runtime registered and has its state, before it serves a request.
+      onLoaded: (handler) => {
+        if (typeof handler !== "function") throw new TypeError("onLoaded requires a handler function");
+        this.loadedHandlers.push(handler);
+      },
       registerMessageRenderer: (customType, handler) => this.registerMessageRenderer(customType, handler),
       registerEntryRenderer: (customType, handler) => this.registerEntryRenderer(customType, handler),
       registerMarkdownTransformer: (transformer) => {
         this.markdownTransformer = transformer;
       },
+      // pig additive (D214): the extension owns the thinking runs of assistant messages; recorded while loading, a host call afterwards.
+      ownThinkingRuns: (enabled = true) => {
+        if (typeof enabled !== "boolean") throw new TypeError("ownThinkingRuns requires a boolean");
+        this.ownsThinkingRuns = enabled;
+        if (this.providersSent) this.fireAndForget("ownThinkingRuns", { enabled });
+      },
       registerToolRenderer: (resolver) => this.registerToolRenderer(resolver),
       registerProvider: (name, config) => this.registerProvider(name, config),
       unregisterProvider: (name) => this.unregisterProvider(name),
-      sendMessage: action((message, options = {}) => this.fireAndForget("sendMessage", { message, options })),
-      sendUserMessage: action((content, options = {}) => this.fireAndForget("sendUserMessage", { content, options })),
-      appendEntry: action((customType, data) => this.fireAndForget("appendEntry", { customType, data })),
+      // agent-session.ts sendCustomMessage appends an idle, non-triggering message to the in-process log before pi.sendMessage returns, so a read in the same handler sees it; a triggering or nextTurn message stays fire-and-forget.
+      sendMessage: action((message, options = {}) => {
+        this.reportCommandYield();
+        if (options?.deliverAs === "nextTurn") return this.fireAndForget("sendMessage", { message, options });
+        // A triggering message marks the Session busy before pi.sendMessage returns (agent-session.ts sendCustomMessage awaits _startRun, which sets _isAgentRunActive before its first await), and Pi's loop runs nothing else until the code that sent it, a handler or a timer's or an I/O callback, awaits or returns. The host holds its isIdle answer busy, for every extension, from the send until this code yields (Host.syncRuns): the send carries a token and the first microtask checkpoint reports it (reportHandlerYield), whichever code sent. The Session holds back a message sent while the agent_settled handlers run (agent-session.ts:2344-2349) and stays idle: there the answer is the Host's and nothing is held.
+        if (options?.triggerTurn) {
+          const idle = this.state.isIdle;
+          const token = uuid("y");
+          try { this.writeSync("sendMessage", { message, options, yield_token: token }); }
+          catch (err) {
+            if (!isHostCancellation(err)) {
+              try { process.stderr.write(`pig: host call sendMessage failed: ${err && err.message ? err.message : String(err)}\n`); } catch {}
+            }
+            return;
+          }
+          if (this.activeRequest()?.event === "agent_settled") this.state.isIdle = this.callSync("isIdle")?.idle === true;
+          else {
+            if (idle) this.state.isIdle = false;
+            this.reportHandlerYield(token);
+          }
+          return;
+        }
+        try { this.writeSync("sendMessage", { message, options }); }
+        catch (err) {
+          if (!isHostCancellation(err)) {
+            try { process.stderr.write(`pig: host call sendMessage failed: ${err && err.message ? err.message : String(err)}\n`); } catch {}
+          }
+          return;
+        }
+        this.adoptHostLeafEntry((candidate) => candidate.type === "custom_message" && candidate.customType === message?.customType);
+      }),
+      sendUserMessage: action((content, options = {}) => {
+        this.reportCommandYield();
+        this.fireAndForget("sendUserMessage", { content, options });
+      }),
+      // Upstream appends to the in-process log at once (agent-session.ts:3406-3411), so a read in the same handler sees the entry.
+      appendEntry: action((customType, data) => { this.contextValues.sessionManager.appendCustomEntry(customType, data, true); }),
       messageRole: (data) => Runtime.messageRole(data),
       messageText: (data) => Runtime.messageText(data),
       getSessionName: action(() => this.state.session?.sessionName || undefined),
-      setSessionName: action((name) => this.fireAndForget("setSessionName", { name })),
-      setLabel: action((entryId, label) => this.fireAndForget("setLabel", { entryId, label })),
+      // Upstream appends the session_info and label entries to the in-process log at once (agent-session.ts setSessionName, session-manager.ts appendLabelChange, which throws to the caller for an unknown entry), so the host's answer is awaited and its entry adopted. setSessionName's session_info_changed starts nested in the wait, as upstream runs it inside the call.
+      setSessionName: action((name) => {
+        this.writeSync("setSessionName", { name });
+        const entry = this.adoptHostLeafEntry((candidate) => candidate.type === "session_info");
+        if (entry) this.state.session.sessionName = entry.name ?? "";
+      }),
+      setLabel: action((entryId, label) => {
+        this.writeSync("setLabel", { entryId, label });
+        this.adoptHostLeafEntry((candidate) => candidate.type === "label" && candidate.targetId === entryId);
+      }),
       exec: (command, args = [], options = undefined) => this.exec({ command, args, options }),
       getFlag: (name) => {
         if (!this.flags.has(name)) return undefined;
@@ -1644,7 +2373,9 @@ export class Runtime {
       // Tool registries can change in another extension while this handler is running.
       // The host call also carries PiG's legacy per-tool "source" for the Go,
       // Rust and Python SDKs; Pi's ToolInfo has only sourceInfo, so drop it.
-      getAllTools: action(() => (this.callSync("getAllTools")?.tools || []).map(({ source: _legacySource, ...tool }) => tool)),
+      // A function cannot cross the wire, so the host marks a tool whose definition has reachesTools (agent-session.ts:1507), and
+      // the mark becomes a function, in the mark's member position, that runs the hook through the host.
+      getAllTools: action(() => (this.callSync("getAllTools")?.tools || []).map(({ source: _legacySource, ...tool }) => (tool.reachesTools === true ? { ...tool, reachesTools: (input) => this.callSync("tool.reachesTools", { tool: tool.name, input }) } : tool))),
       // loader.ts:411-414: a copy of the effective settings, from the state the Host replicated.
       getSettings: action(() => {
         if (this.state.settings === undefined) throw new Error("settings are not available: the host has not sent them");
@@ -1658,12 +2389,12 @@ export class Runtime {
       getCommands: action(() => structuredClone(this.state.commands || [])),
       getThinkingLevel: action(() => this.state.thinkingLevel || ""),
       setThinkingLevel: action((level) => {
-        this.state.thinkingLevel = level;
+        this.state.thinkingLevel = effectiveThinkingLevel(this.state.model, level);
         this.fireAndForget("setThinkingLevel", { level });
       }),
       setActiveTools: action((tools) => {
-        this.state.activeTools = [...tools];
         this.fireAndForget("setActiveTools", { tools });
+        this.promptWritten = true;
       }),
       setModel: async (model) => {
         if (!this.conn || !this.hostReady) throw new Error("Extension runtime not initialized");
@@ -1774,16 +2505,32 @@ export class Runtime {
       if (entry.removed) return;
       entry.removed = true;
       if (this.conn) this.fireAndForget("event.unsubscribe", { event, handlerId: entry.id });
+      this.loadHighlightLanguagesAfterStartup();
     };
   }
 
+  // Starts the highlight.js load once no startup event this extension handles is still to come: finished is the event whose handling just
+  // ended, and an event the extension no longer has a handler for is not awaited.
+  loadHighlightLanguagesAfterStartup(finished) {
+    if (!this.highlightAfter) return;
+    this.highlightAfter.delete(finished);
+    for (const event of this.highlightAfter) {
+      if (!this.handlers.get(event)?.some((entry) => !entry.removed)) this.highlightAfter.delete(event);
+    }
+    if (this.highlightAfter.size > 0) return;
+    this.highlightAfter = undefined;
+    void loadAllHighlightLanguages();
+  }
+
   registerTool(definition) {
-    if (!definition || !definition.name) throw new Error("registerTool requires a definition with name");
     if (typeof definition.parameters !== "object" || definition.parameters === null || Array.isArray(definition.parameters)) {
       throw new Error(`Tool "${definition.name}" registered by extension "${this.entry}" must define an object parameter schema.`);
     }
     this.tools.set(definition.name, definition);
-    if (this.conn) this.applyState(this.callSync("registerTool", this.toolDeclaration(definition)));
+    if (this.conn) {
+      this.callSync("registerTool", this.toolDeclaration(definition));
+      this.promptWritten = true;
+    }
   }
 
   // A host call the factory may make before the extension registers: it opens the connection a loading factory needs, as the shared event bus does.
@@ -1794,17 +2541,69 @@ export class Runtime {
   }
 
   // loader.ts:411-414: pi.exec spawns the child whenever it is called. A callback the factory scheduled can call it after the factory returned and before the registered connection exists, while connect() opens it. That call waits for the register frame and runs as the loader's exec; opening a second connection would leave the call or the registration on a socket the Host does not read.
+  //
+  // core/exec.ts:46-52 kills the child when options.signal aborts, and the call has no other signal. An AbortSignal cannot cross the process boundary: the call names itself by an exec id and carries ownSignal, which detaches it from the calling request, and the abort reaches the Host as exec.cancel.
   exec(request) {
-    if (this.conn) return this.call("exec", request);
-    if (this.loadState === "loading") return this.loadingExec(request);
-    if (this.connecting) return this.connecting.then(() => this.call("exec.loading", request));
-    return this.call("exec", request);
+    // core/exec.ts rejects an invalid maxBuffer before it spawns. NaN and the infinities would reach the Host as null, which means undefined, so the check runs here with the runtime's own limit.
+    const maxBuffer = request.options?.maxBuffer;
+    if (maxBuffer != null && (!Number.isInteger(maxBuffer) || maxBuffer < 0 || maxBuffer > bufferConstants.MAX_STRING_LENGTH)) {
+      return Promise.reject(new RangeError(`maxBuffer must be an integer between 0 and ${bufferConstants.MAX_STRING_LENGTH} bytes`));
+    }
+    const signal = request.options?.signal;
+    if (!signal || typeof signal.addEventListener !== "function") return this.execCall(request, false, () => {});
+    const { signal: _signal, ...options } = request.options;
+    const execId = `x${this.nextExecId++}`;
+    let stopListening;
+    // After the call is sent: the Host applies a cancel only after the call it names started the child, so a signal that aborted already still spawns the child and then kills it, as exec.ts does.
+    const sent = () => {
+      const cancel = () => { this.cancelExec(execId); };
+      if (signal.aborted) cancel();
+      else {
+        signal.addEventListener("abort", cancel, { once: true });
+        stopListening = () => signal.removeEventListener("abort", cancel);
+      }
+    };
+    return this.execCall({ ...request, options, execId, ownSignal: true }, true, sent).finally(() => stopListening?.());
+  }
+
+  execCall(request, detached, sent) {
+    if (this.conn) { const result = this.call("exec", request, { detached }); sent(); return result; }
+    if (this.loadState === "loading") { const result = this.loadingExec(request); sent(); return result; }
+    if (this.connecting) return this.connecting.then(() => { const result = this.call("exec.loading", request, { detached }); sent(); return result; });
+    const result = this.call("exec", request, { detached });
+    sent();
+    return result;
+  }
+
+  // The abort of an exec call's signal. It has no failure path, as exec.ts's abort listener has none: a call that ended or a connection that closed leaves nothing to cancel.
+  cancelExec(execId) {
+    const connection = this.conn ?? this.earlyConn;
+    if (!connection || connection.closed) return;
+    const cancelled = connection === this.conn ? connection.call("exec.cancel", { execId }, "") : connection.callAppliedOnReceipt("exec.cancel", { execId });
+    cancelled.catch(() => {});
   }
 
   // loader.ts:411-414 gives a loading factory an exec that spawns the child itself, with no session bound. The Host runs it in the loader's working directory over the connection the factory opened. The Host's reply is applied when it arrives: nothing reads this connection's queue before the register frame, and the factory awaits the call.
   loadingExec(args) {
     this.ensureConnectionSync();
     return this.earlyConn.callAppliedOnReceipt("exec.loading", args);
+  }
+
+  // pig additive (D19): a file mutation queue call (shims/file-mutation-queue-bridge.mjs). Pi's queue is a module-level map every extension shares, so a factory may use it while it loads: like exec, the call opens the loading connection and is applied when its reply arrives. The call is detached from the request that makes it: an aborted request does not end the wait for the file or the release of its turn, as Pi's queue does not.
+  fileMutation(method, args) {
+    const owner = method === "fileMutation.enter" ? this.activeRequest() : undefined;
+    if (owner?.windowSettled) {
+      const settled = owner.windowSettled;
+      owner.windowSettled = undefined;
+      return settled.then(() => this.fileMutation(method, args));
+    }
+    if (this.conn) return this.call(method, args, { detached: true });
+    if (this.loadState === "loading") {
+      this.ensureConnectionSync();
+      return this.earlyConn.callAppliedOnReceipt(method, args);
+    }
+    if (this.connecting) return this.connecting.then(() => this.call(method, args, { detached: true }));
+    return this.call(method, args, { detached: true });
   }
 
   // loader.ts:456-468. The Host validates the config with Pi's own rules and refuses a name another extension owns, and Pi does both when the call is made: the throw reaches the factory, which may catch it. A registration the factory makes is queued once it passed, and reaches the Host in the register frame, as Pi commits it when the factory returns; later ones apply at once.
@@ -1858,6 +2657,7 @@ export class Runtime {
       else this.virtualModels.set(key, previous);
       throw error;
     }
+    this.holdVirtualWrite(declaration.provider, declaration.id, declaration);
   }
 
   // loader.ts:492-495.
@@ -1868,14 +2668,19 @@ export class Runtime {
       this.virtualModelUnregistrations.push({ provider, id });
     } else {
       this.callSync("unregisterVirtualModel", { provider, id });
+      this.holdVirtualWrite(provider, id, undefined);
     }
     this.virtualModels.delete(key);
   }
 
   // runner.ts:952-985 (createToolContext). The context of a tool call also lists the tools executeTool can call and runs one. An explicit signal replaces the calling tool's, so the call is not tied to the calling request; without one the Host cancels the call with the request.
-  addToolContext(ctx, toolCallId) {
+  addToolContext(ctx, toolCallId, toolCallIndex, params) {
     const runtime = this;
     return Object.defineProperties(ctx, {
+      // pig additive (D19): the call's position among the tool calls of the assistant message that issued it (its batch); undefined for a call no assistant message issued, such as a nested executeTool call.
+      toolCallIndex: { value: typeof toolCallIndex === "number" ? toolCallIndex : undefined, enumerable: true },
+      // pig additive (D19): the JSON text of the call's arguments, members in the order the model wrote them. Pi's execute params is that object; this is its JSON.stringify.
+      toolInput: { value: JSON.stringify(params), enumerable: true },
       tools: {
         get() {
           runtime.extensionRuntime.assertActive();
@@ -1919,26 +2724,22 @@ export class Runtime {
     }
   }
 
+  // types.ts:621 reachesTools: the hook is synchronous and answers "all" or the words of the input that may name the tools a call
+  // reaches. The connection runs it on receipt, as it runs the other synchronous hooks, because getAllTools hands the hook to every
+  // extension (types.ts:2122-2130): one that runs its own tool's hook, or a packed neighbor's, waits for this answer in a
+  // synchronous host call.
+  toolReachesTools(request) {
+    const tool = this.tools.get(request.tool);
+    if (typeof tool?.reachesTools !== "function") throw new Error(`tool ${request.tool} has no reachesTools`);
+    return tool.reachesTools(request.args || {});
+  }
+
   toolDeclaration(tool) {
     return {
       name: tool.name,
       label: tool.label,
       description: tool.description || "",
       parameters: tool.parameters,
-      // TypeBox kinds are non-enumerable and remain host-only validation metadata.
-      validation_parameters: JSON.parse(JSON.stringify(tool.parameters || {}, (_key, value) => {
-        if (value && typeof value === "object" && !Array.isArray(value) && value["~kind"]) {
-          const copy = { ...value, "~kind": value["~kind"] };
-          if (["Intersect", "Enum", "TemplateLiteral"].includes(value["~kind"])) {
-            const { Evaluate, Instantiate } = requireModule("./shims/typebox.mjs");
-            copy["~convert"] = Evaluate(value["~kind"] === "Intersect" ? Instantiate({}, value) : value);
-          }
-          if (value === tool.parameters && Object.getOwnPropertySymbols(value).includes(Symbol.for("TypeBox.Kind"))) copy["~skipCoercion"] = true;
-          return copy;
-        }
-        if (value === tool.parameters && Object.getOwnPropertySymbols(value).includes(Symbol.for("TypeBox.Kind"))) return { ...value, "~skipCoercion": true };
-        return value;
-      })),
       constrained_sampling: tool.constrainedSampling,
       execution_mode: tool.executionMode,
       prompt_snippet: tool.promptSnippet,
@@ -1950,6 +2751,7 @@ export class Runtime {
       default_active: tool.defaultActive,
       prepares_loadout: typeof tool.prepareLoadout === "function" || undefined,
       prepares_arguments: typeof tool.prepareArguments === "function" || undefined,
+      reaches_tools: typeof tool.reachesTools === "function" || undefined,
       source: tool.source,
       render_shell: tool.renderShell === "self" ? "self" : undefined,
       renders_call: (typeof tool.renderCall === "function" && !tool.renderCall[builtInToolRenderer]) || undefined,
@@ -1966,11 +2768,31 @@ export class Runtime {
     if (typeof definition?.handler !== "function") {
       throw new Error(`Command "/${name}" registered by extension "${this.entry}" must define handler().`);
     }
-    this.commands.set(name, { name, ...definition });
+    const command = { name, ...definition };
+    this.commands.set(name, command);
+    this.registerLate({ commands: [this.commandDeclaration(command)] });
+  }
+
+  // A registration made after the register frame went out reaches the host as registerDeclaration: loader.ts writes it into the extension's own Map, which the runner reads live (loader.ts:303-318).
+  // getCommands answers from the list the host replicates, and the host pushes it with its next state, so a command registered here is read back before the call returns, as agent-session.ts:3391-3414 reads the runner's Map at the moment of the call.
+  registerLate(declarations) {
+    if (!this.conn) return;
+    this.callSync("registerDeclaration", declarations);
+    if (declarations.commands !== undefined) this.state.commands = this.callSync("getCommands")?.commands ?? [];
+  }
+
+  commandDeclaration(cmd) {
+    return {
+      name: cmd.name,
+      description: cmd.description || "",
+      argument_completions: typeof cmd.getArgumentCompletions === "function" || undefined,
+    };
   }
 
   registerShortcut(key, definition) {
-    this.shortcuts.set(key, { key, ...definition });
+    const shortcut = { key, ...definition };
+    this.shortcuts.set(key, shortcut);
+    this.registerLate({ shortcuts: [{ key, description: shortcut.description || "" }] });
   }
 
   registerFlag(name, definition) {
@@ -1980,6 +2802,7 @@ export class Runtime {
     const flag = { name, ...definition };
     this.flags.set(name, flag);
     this.flagRegistrations.push(flag);
+    this.registerLate({ flags: [{ name, description: flag.description || "", type: flag.type || "string", default: flag.default }] });
     if (definition.default !== undefined && !this.flagValues.has(name)) {
       this.flagValues.set(name, definition.default);
     }
@@ -1987,10 +2810,12 @@ export class Runtime {
 
   registerMessageRenderer(customType, handler) {
     this.renderers.set(customType, handler);
+    this.registerLate({ message_renderers: [{ custom_type: customType }] });
   }
 
   registerEntryRenderer(customType, handler) {
     this.entryRenderers.set(customType, handler);
+    this.registerLate({ entry_renderers: [{ custom_type: customType }] });
   }
 
   // pi.registerToolRenderer: resolvers run in registration order; a registration after loading reports the count.
@@ -2036,6 +2861,7 @@ export class Runtime {
     socket.waitUntil(() => socket.highWaterMark !== undefined || failure !== undefined);
     if (failure) throw failure;
     this.earlyConn = this.attachConnection(socket);
+    this.earlyConn.loading = true;
   }
 
   ensureXrefHello() {
@@ -2065,7 +2891,7 @@ export class Runtime {
     let emission;
     try {
       conn.requestState(env.id, "started");
-      runWithRuntime(this, () => this.requestContext.run(request, () => {
+      runWithRuntime(this, () => this.requestContext.run(request, outsideTimer(() => {
         try {
           const args = env.request.args ?? {};
           if (env.request.method === "xref.op") result = xrefRealm.serve(args);
@@ -2077,7 +2903,7 @@ export class Runtime {
         } catch (error) {
           failure = error;
         }
-      }));
+      })));
     } finally {
       request.settled = true;
     }
@@ -2112,6 +2938,19 @@ export class Runtime {
 
   attachConnection(socket) {
     const conn = new Connection(socket);
+    conn.nestedEvent = (env) => {
+      if (!((conn.nestedWrites ?? 0) > 0 || this.activeRequest()?.pendingHostCalls.size > 0) || conn.queue.some((queued) => queued.type !== "notify" && queued.type !== "call_result")) return false;
+      // The host sent these notifications, such as a state push, and the results of earlier asynchronous calls, such as an appendEntry, before the event: they apply first, as the serve loop would.
+      for (const queued of conn.queue.splice(0)) {
+        if (queued.type === "call_result") conn.resolveCall(queued);
+        else if (queued.notify) this.handleNotify(queued.notify);
+      }
+      this.startRequest(env);
+      // The handler's synchronous prefix has run; the rest waits for the synchronous call that emitted the event to return, as Pi's handler suspends inside that call (agent-session.ts sendCustomMessage, setSessionName). The host hears the suspension it waits for before it answers the call (Session.dispatchUnawaitedEvent, the RPC run preparation), unless the handler reported it already.
+      const request = this.requestRecords.get(env.id);
+      if (request && !request.settled && !request.suspensionReported) conn.requestState(env.id, "blocked", "host_call");
+      return true;
+    };
     liveRuntimes.add(this);
     this.xrefTransport = {
       call: (method, args) => this.xrefCall(method, args),
@@ -2121,8 +2960,9 @@ export class Runtime {
       },
     };
     conn.xrefHandler = env => this.serveXref(conn, env);
+    conn.loadingStreamEvent = notify => this.handleNotify(notify);
     quitDrain.runtimes.add(this);
-    conn.syncHandler = request => request.method === "facet_sync" ? dispatchFacetSync(this, request) : request.method === "autocomplete.sync" ? this.autocomplete.sync(request.args) : dispatchProviderObjectSync(this, request);
+    conn.syncHandler = request => request.method === "facet_sync" ? dispatchFacetSync(this, request) : request.method === "autocomplete.sync" ? this.autocomplete.sync(request.args) : request.method === "tool_reaches_tools" ? this.toolReachesTools(request) : dispatchProviderObjectSync(this, request);
     this.removeDrainListener = conn.onDrain(() => {
       for (const [key, widget] of this.widgets) {
         if (widget.renderRequested) this.requestWidgetRender(key);
@@ -2136,8 +2976,10 @@ export class Runtime {
 
   async connect() {
     if (!this.conn) {
-      if (this.earlyConn) this.conn = this.earlyConn;
-      else {
+      if (this.earlyConn) {
+        this.conn = this.earlyConn;
+        this.conn.loading = false;
+      } else {
         const sockPath = this.socketPath;
         if (!sockPath) throw new Error("PIG_EXT_SOCKET not set");
         this.conn = this.attachConnection(await ProviderSocket.connect(sockPath));
@@ -2150,21 +2992,17 @@ export class Runtime {
         name: this.name,
         version: this.version,
         tools: [...this.tools.values()].map((tool) => this.toolDeclaration(tool)),
-        commands: [...this.commands.values()].map((cmd) => ({
-          name: cmd.name,
-          description: cmd.description || "",
-          args: cmd.args,
-          argument_completions: typeof cmd.getArgumentCompletions === "function" || undefined,
-        })),
+        commands: [...this.commands.values()].map((cmd) => this.commandDeclaration(cmd)),
         shortcuts: [...this.shortcuts.values()].map((s) => ({ key: s.key, description: s.description || "" })),
         handlers: [...this.handlers.entries()].flatMap(([event, handlers]) =>
-          handlers.filter(({ removed }) => !removed).map(({ id }) => ({ event, can_block: BLOCKING_EVENTS.has(event), handler_id: id })),
+          handlers.filter(({ removed }) => !removed).map(({ id }) => ({ event, handler_id: id })),
         ),
         flags: this.flagRegistrations.map((f) => ({ name: f.name, description: f.description || "", type: f.type || "string", default: f.default })),
         providers: [...this.providers.entries()].map(([name, config]) => this.providerDeclaration(name, config)).concat([...this.nativeProviders.values()].map(provider=>({name:provider.id,config:{},native:nativeDeclaration(provider, this.nativeProviderKeys.get(provider))}))),
         message_renderers: [...this.renderers.keys()].map((customType) => ({ custom_type: customType })),
         entry_renderers: [...this.entryRenderers.keys()].map((customType) => ({ custom_type: customType })),
         markdown_transformer: typeof this.markdownTransformer === "function" || undefined,
+        owns_thinking_runs: this.ownsThinkingRuns || undefined,
         tool_renderers: this.toolRendererResolvers.length || undefined,
         mcp_servers: this.mcpServersPending.size > 0 ? [...this.mcpServersPending].map(([name, config]) => ({ name, config })) : undefined,
         virtual_models: this.virtualModelsPending.length > 0 ? this.virtualModelsPending : undefined,
@@ -2178,6 +3016,12 @@ export class Runtime {
         // enrols it before building the ready state. Same interface, same
         // answers, different means.
         wants_session_log: true,
+        // ctx.modelRegistry's getAll/find/getAvailable answer synchronously
+        // from the snapshot the host pushes (ready.models and
+        // model_registry_update). The Go, Rust and Python SDKs read
+        // getModelRegistryState when asked, so the host builds and sends the
+        // catalog only to a runtime that asks for it here.
+        wants_model_registry: true,
       },
     });
     this.providersSent = true;
@@ -2190,6 +3034,57 @@ export class Runtime {
     } finally {
       this.conn?.socket?.destroy?.();
     }
+  }
+
+  // startRequest starts a host request's handler; it runs synchronously until the handler's first await.
+  startRequest(env) {
+    // The delta of an event stream applies where the frame is read, in arrival order (event-stream.mjs).
+    if (env.request?.stream) (this.eventReplicas ??= new EventReplicas()).apply(env.request);
+    this.conn.requestState(env.id, "started");
+    const controller = new AbortController();
+    this.activeRequests.set(env.id, controller);
+    // Pi's context getters are enumerable own properties. Forward reads to the live context instead of snapshotting values or hiding them on a prototype; extensions can spread a context and retain ui/session/model access.
+    const requestCtx = Object.create(Object.getPrototypeOf(this.ctx));
+    for (const key of Object.keys(this.ctx)) {
+      // The descriptor decides, so a guarded getter is not read until the extension reads it (runner.ts:982-988).
+      const descriptor = typeof Object.getOwnPropertyDescriptor(this.ctx, key).value === "function" ? { value: this.ctx[key], writable: true } : { get: () => this.ctx[key] };
+      Object.defineProperty(requestCtx, key, { enumerable: true, configurable: true, ...descriptor });
+    }
+    // The request's own cancellation is not ctx.signal, which is the run's. The runtime's internals read it through this key, which no extension can enumerate or collide with.
+    Object.defineProperty(requestCtx, requestSignal, { value: controller.signal });
+    // Dispatch concurrently so long-running interactive calls
+    // (e.g. ui.custom blocking on done()) don't starve incoming
+    // notifications such as ui.custom.input. The handler will
+    // serialize its response back through the connection on its
+    // own when it resolves.
+    const quitting = env.request?.method === "event" && env.request.event === "session_shutdown" && env.request.args?.reason === "quit";
+    const quitTail = quitDrain.active && env.request?.method === "event" && ["turn_end", "agent_settled"].includes(env.request.event);
+    const request = { id: env.id, toolCall: env.request?.method === "tool_call", toolCallId: env.request?.method === "tool_call" ? env.request.tool_call_id : undefined, controller, connection: this.conn, pendingHostCalls: new Set(), settled: false, responded: false, cancelled: false, quit: quitting, quitTail, command: env.request?.method === "command", event: env.request?.method === "event" ? env.request.event : undefined };
+    this.requestRecords.set(env.id, request);
+    this.conn?.callEpochs?.set(env.id, 0);
+    if (quitting) enterQuitDrain();
+    refreshQuitDrain();
+    if (PROMPT_END_MODES.has(this.ready?.mode) && this.runSignal === undefined) armTurnWindow(request);
+    const task = this.requestContext.run(request, outsideTimer(async () => {
+      try {
+        if (this.loadedPromise && env.request?.method !== "events.dispatch") await this.loadedPromise;
+        await this.handleRequest(env.id, env.request || {}, requestCtx);
+      } finally {
+        if (env.request?.method === "event") this.loadHighlightLanguagesAfterStartup(env.request.event);
+        request.cancelled ||= !request.settled && controller.signal.aborted;
+        request.settled = true;
+        this.activeRequests.delete(env.id);
+        this.requestRecords.delete(env.id);
+        request.connection?.callEpochs?.delete(env.id);
+        refreshQuitDrain();
+      }
+      if (request.responded && endsPrompt(env.request, this.ready?.mode, this.runSignal !== undefined)) awaitHostStep(request.connection);
+    }));
+    this.requestTasks.add(task);
+    void task.then(
+      () => this.requestTasks.delete(task),
+      () => this.requestTasks.delete(task),
+    );
   }
 
   async serve() {
@@ -2212,14 +3107,19 @@ export class Runtime {
           this.replaceModels(this.ready.models);
           this.contextValues.cwd = this.ready.cwd || this.contextValues.cwd;
           this.contextValues.mode = this.ready.mode || this.contextValues.mode;
-          this.contextValues.model = this.ready.model ? { id: this.ready.model } : this.contextValues.model;
-          if (env.ready?.state) this.applyState(env.ready.state);
-          // Pi's interactive mode loads every highlight.js language at
-          // startup (interactive-mode.ts); print, JSON and RPC mode keep the
-          // eager set.
-          if (this.contextValues.mode === "tui") void loadAllHighlightLanguages();
-          // The host owns process teardown, so flush bytecode when processing ready rather than relying on normal Node exit. Factory/module state is not persisted.
-          flushCompileCache();
+          if (env.ready?.state) {
+            // StatePayload is whole here, so an absent frontend is false.
+            this.setFrontend(env.ready.state.frontend === true);
+            this.applyState(env.ready.state);
+          }
+          // Pi's interactive mode loads every highlight.js language once startup has emitted session_start and resources_discover
+          // (interactive-mode.ts:1100-1122); print, JSON and RPC mode keep the eager set. The load evaluates every grammar on this thread,
+          // so it starts when this extension's handling of those startup events ends, not while its handlers wait behind it.
+          if (this.contextValues.mode === "tui") {
+            this.highlightAfter = new Set(["session_start", "resources_discover"]);
+            this.loadHighlightLanguagesAfterStartup();
+          }
+          if (this.loadedHandlers.length > 0) this.loadedPromise = this.runLoadedHandlers();
           continue;
         }
         if (env.type === "ping") {
@@ -2237,49 +3137,7 @@ export class Runtime {
           this.conn.cancelParent(requestId);
           continue;
         }
-        if (env.type === "request") {
-          this.conn.requestState(env.id, "started");
-          const controller = new AbortController();
-          this.activeRequests.set(env.id, controller);
-          // Pi's context getters are enumerable own properties. Forward reads to the live context instead of snapshotting values or hiding them on a prototype; extensions can spread a context and retain ui/session/model access.
-          const requestCtx = Object.create(Object.getPrototypeOf(this.ctx));
-          for (const key of Object.keys(this.ctx)) {
-            // The descriptor decides, so a guarded getter is not read until the extension reads it (runner.ts:982-988).
-            const descriptor = typeof Object.getOwnPropertyDescriptor(this.ctx, key).value === "function" ? { value: this.ctx[key], writable: true } : { get: () => this.ctx[key] };
-            Object.defineProperty(requestCtx, key, { enumerable: true, configurable: true, ...descriptor });
-          }
-          // The request's own cancellation is not ctx.signal, which is the run's. The runtime's internals read it through this key, which no extension can enumerate or collide with.
-          Object.defineProperty(requestCtx, requestSignal, { value: controller.signal });
-          // Dispatch concurrently so long-running interactive calls
-          // (e.g. ui.custom blocking on done()) don't starve incoming
-          // notifications such as ui.custom.input. The handler will
-          // serialize its response back through the connection on its
-          // own when it resolves.
-          const quitting = env.request?.method === "event" && env.request.event === "session_shutdown" && env.request.args?.reason === "quit";
-          const quitTail = quitDrain.active && env.request?.method === "event" && ["turn_end", "agent_settled"].includes(env.request.event);
-          const request = { id: env.id, controller, connection: this.conn, pendingHostCalls: new Set(), settled: false, responded: false, cancelled: false, quit: quitting, quitTail, command: env.request?.method === "command" };
-          this.requestRecords.set(env.id, request);
-          this.conn?.callEpochs?.set(env.id, 0);
-          if (quitting) enterQuitDrain();
-          refreshQuitDrain();
-          const task = this.requestContext.run(request, async () => {
-            try {
-              await this.handleRequest(env.id, env.request || {}, requestCtx);
-            } finally {
-              request.cancelled ||= !request.settled && controller.signal.aborted;
-              request.settled = true;
-              this.activeRequests.delete(env.id);
-              this.requestRecords.delete(env.id);
-              request.connection?.callEpochs?.delete(env.id);
-              refreshQuitDrain();
-            }
-          });
-          this.requestTasks.add(task);
-          void task.then(
-            () => this.requestTasks.delete(task),
-            () => this.requestTasks.delete(task),
-          );
-        }
+        if (env.type === "request") this.startRequest(env);
       }
     } finally {
       quitDrain.runtimes.delete(this);
@@ -2351,11 +3209,7 @@ export class Runtime {
   setWidgetFactory(key, factory, options = {}) {
     if (this.widgets.has(key)) this.clearWidget(key);
     let requestFrame = () => {};
-    const tuiShim = {
-      requestRender: () => requestFrame(),
-      get width() { return Number(thisRuntime.ready?.width || 80); },
-      get height() { return Number(thisRuntime.ready?.height || 24); },
-    };
+    const tuiShim = this.factoryTui(() => requestFrame());
     const thisRuntime = this;
     const component = factory(tuiShim, this.ui.theme);
     if (!component || typeof component.render !== "function") {
@@ -2402,17 +3256,105 @@ export class Runtime {
       return;
     }
     const width = Number(this.ready?.width || 80);
-    const rendered = widget.component.render(width);
-    const lines = Array.isArray(rendered) ? rendered.map((line) => String(line)) : [];
-    if (width === widget.lastWidth && lines.length === widget.lastLines.length && lines.every((line, index) => line === widget.lastLines[index])) return;
+    const { lines, derived } = this.withSurfaceTheme(widget.component, () => {
+      const rendered = widget.component.render(width);
+      const lines = Array.isArray(rendered) ? rendered.map((line) => String(line)) : [];
+      return { lines, derived: this.state.frontend ? this.surfaceView(widget.component, lines, width) : undefined };
+    });
+    if (width === widget.lastWidth && derived?.key === widget.lastViewKey && lines.length === widget.lastLines.length && lines.every((line, index) => line === widget.lastLines[index])) return;
     widget.lastLines = lines;
     widget.lastWidth = width;
-    this.fireAndForget("ui.setWidget", { key, content: lines, options: widget.options, width });
+    widget.lastViewKey = derived?.key;
+    widget.viewRefs = derived?.images;
+    const args = { key, content: lines, options: widget.options, width };
+    if (derived) args.view = this.viewWithImages(derived);
+    this.fireAndForget("ui.setWidget", args);
+  }
+
+  // withSurfaceTheme runs fn, which renders the surface whose root is
+  // component, with the root's viewTheme overriding the theme (D107 §13.3),
+  // in every mode. An invalid viewTheme is applied nowhere. Components read
+  // the runtime's theme or coding-agent's shared one (getSelectListTheme),
+  // which another runtime of this process may have installed: both apply it.
+  withSurfaceTheme(component, fn) {
+    const colors = surfaceTheme(component)?.colors;
+    if (!colors) return fn();
+    const shared = globalThis[Symbol.for("@earendil-works/pi-coding-agent:theme")];
+    const run = shared !== this.ui.theme && shared instanceof ThemeShim ? () => shared.withTokenColors(colors, fn) : fn;
+    return this.ui.theme.withTokenColors(colors, run);
+  }
+
+  // surfaceView derives the view of component, which just rendered lines at
+  // width (D107). key is the encoded view, which dedup compares with the
+  // lines; images are the image bytes by ref, sent once per connection.
+  surfaceView(component, lines, width, focusRoot = false) {
+    let derived;
+    try {
+      derived = deriveView(component, lines, width, this.ui.theme, { focusRoot, viewTheme: surfaceTheme(component)?.theme });
+    } catch {
+      return undefined;
+    }
+    if (!derived) return undefined;
+    return { view: derived.view, key: JSON.stringify(derived.view), images: derived.images };
+  }
+
+  // viewWithImages is the view to send: the bytes of every image the
+  // connection has not sent yet ride along, and count as sent.
+  viewWithImages(derived) {
+    if (derived.images.size === 0) return derived.view;
+    const images = [];
+    for (const [ref, image] of derived.images) {
+      if (this.viewImageRefs.has(ref)) continue;
+      this.viewImageRefs.add(ref);
+      images.push({ ref, mimeType: image.mimeType, data: image.data });
+    }
+    return images.length > 0 ? { ...derived.view, images } : derived.view;
+  }
+
+  // rendererResult is a render_* result: the lines, and the component's view
+  // while a frontend draws (D107).
+  rendererResult(component, lines, width) {
+    const result = { lines };
+    if (!this.state.frontend || !component || Array.isArray(component) || typeof component.render !== "function") return result;
+    const derived = this.surfaceView(component, lines, Number(width) || 0);
+    if (derived) result.view = this.viewWithImages(derived);
+    return result;
+  }
+
+  // setFrontend applies StatePayload.frontend. A change re-renders the
+  // dedup'd surfaces, so a frontend gets their structure without waiting for
+  // their next change; header and footer re-render with every state.
+  setFrontend(frontend) {
+    if (this.state.frontend === frontend) return;
+    this.state.frontend = frontend;
+    for (const key of this.widgets.keys()) this.requestWidgetRender(key);
+    for (const overlay of this.customOverlays?.values() || []) overlay.renderFrame();
+  }
+
+  // evictViewImages forgets refs whose bytes the host dropped
+  // (ui.view.evicted), and sends again every surface whose last view named
+  // one, now with the data.
+  evictViewImages(refs) {
+    if (!Array.isArray(refs)) return;
+    const evicted = new Set(refs.filter((ref) => this.viewImageRefs.delete(ref)));
+    if (evicted.size === 0) return;
+    const named = (images) => images !== undefined && [...images.keys()].some((ref) => evicted.has(ref));
+    for (const [key, widget] of this.widgets) {
+      if (!named(widget.viewRefs)) continue;
+      widget.lastViewKey = undefined;
+      this.requestWidgetRender(key);
+    }
+    for (const overlay of this.customOverlays?.values() || []) {
+      if (named(overlay.viewRefs)) overlay.resendFrame();
+    }
+    for (const kind of ["header", "footer"]) {
+      if (named(this.specialSurfaceComponents.get(kind)?.viewRefs)) this.renderSpecialSurface(kind);
+    }
   }
 
   applyState(snapshot) {
     if (!snapshot || typeof snapshot !== "object") return;
-    for (const key of ["activeTools", "allTools", "commands", "allThemes"]) {
+    for (const key of ["commands", "allThemes"]) {
       if (Object.hasOwn(snapshot, key)) this.state[key] = [...(snapshot[key] ?? [])];
     }
     if (typeof snapshot.thinkingLevel === "string") this.state.thinkingLevel = snapshot.thinkingLevel;
@@ -2425,6 +3367,7 @@ export class Runtime {
       if (snapshot.session.sessionId && snapshot.session.sessionId !== this.state.session.sessionId) {
         this.pendingEntries = [];
         this.contextValues.sessionManager._cachedIndex = undefined;
+        this.dropBranchCache();
         this.state.session = { entries: [] };
         this.sessionLogRequested = false;
         this.sessionLogGeneration++;
@@ -2434,6 +3377,7 @@ export class Runtime {
           (!persistedSession && typeof snapshot.session.entryCount === "number")) {
         this.sessionLogRequested = true;
       }
+      const previousEntries = this.state.session.entries;
       this.state.session = {
         ...this.state.session,
         sessionId: snapshot.session.sessionId ?? this.state.session.sessionId,
@@ -2443,7 +3387,8 @@ export class Runtime {
         info: snapshot.session.info ?? this.state.session.info,
         entries: this.applyEntryAppend(snapshot.session),
       };
-      this.branchCache = undefined;
+      // The branch cache and its index belong to one log array, which an append extends in place; a replaced log releases them.
+      if (this.state.session.entries !== previousEntries) this.dropBranchCache();
     }
     if (typeof snapshot.isIdle === "boolean") this.state.isIdle = snapshot.isIdle;
     if (typeof snapshot.projectTrusted === "boolean") this.state.projectTrusted = snapshot.projectTrusted;
@@ -2458,7 +3403,12 @@ export class Runtime {
     }
     if (typeof snapshot.hasPendingMessages === "boolean") this.state.hasPendingMessages = snapshot.hasPendingMessages;
     if (typeof snapshot.editorText === "string") this.state.editorText = snapshot.editorText;
-    if (typeof snapshot.toolsExpanded === "boolean") this.state.toolsExpanded = snapshot.toolsExpanded;
+    if (typeof snapshot.toolsExpanded === "boolean") {
+      const changed = this.toolsExpandedKnown && this.state.toolsExpanded !== snapshot.toolsExpanded;
+      this.state.toolsExpanded = snapshot.toolsExpanded;
+      this.toolsExpandedKnown = true;
+      if (changed) this.fireChangeHandlers(this.toolsExpandedChangeHandlers, snapshot.toolsExpanded);
+    }
     if (Object.hasOwn(snapshot, "contextUsage")) {
       this.state.contextUsage = snapshot.contextUsage == null ? undefined : { ...snapshot.contextUsage };
     }
@@ -2476,7 +3426,7 @@ export class Runtime {
     // Markdown reads.
     // The host's active theme colors ctx.ui.theme and the pi-coding-agent
     // theme helpers, as Pi's global theme does in its own process.
-    if (snapshot.theme && typeof snapshot.theme === "object") this.ui.theme.setPalette(snapshot.theme);
+    if (snapshot.theme && typeof snapshot.theme === "object") this.applyThemePalette(snapshot.theme);
     applyTerminalCapabilities(snapshot.terminalCapabilities);
     if (snapshot.keybindings && typeof snapshot.keybindings === "object") this.applyKeybindings(snapshot.keybindings);
     if (typeof snapshot.hasUI === "boolean") this.state.hasUI = snapshot.hasUI;
@@ -2546,7 +3496,7 @@ export class Runtime {
     this.sessionLogRequested = true;
     const entries = this.readSessionFile();
     this.state.session.entries = entries;
-    this.branchCache = undefined;
+    this.dropBranchCache();
     const owner = this.activeRequest();
     let operation;
     operation = this.syncSessionLog(entries.length, this.sessionLogGeneration).catch((error) => {
@@ -2594,44 +3544,97 @@ export class Runtime {
     if (total === 0 && appended.length === 0) return local;
     if (total < local.length || total === appended.length) return appended;
     if (appended.length === 0) return local;
-    return local.concat(appended);
+    // The log only grows while it stays the same array, so the id index and the branch cache extend with the new entries instead of being rebuilt.
+    for (const entry of appended) local.push(entry);
+    return local;
+  }
+
+  dropBranchCache() {
+    this.branchCache = undefined;
+    this.branchIndex = undefined;
+  }
+
+  // branchById is the id → entry map of the replicated log, extended with the entries appended since it was last read. It is
+  // dropped whenever the log array is replaced or an entry in it is swapped (dropBranchCache). repeated marks a log in which
+  // one id occurs twice: the later entry wins, so nothing cached over the earlier one is valid.
+  branchById(entries) {
+    let index = this.branchIndex;
+    if (!index || index.entries !== entries || index.count > entries.length) {
+      index = { entries, count: 0, byId: new Map(), repeated: false };
+      this.branchIndex = index;
+    }
+    for (; index.count < entries.length; index.count++) {
+      const entry = entries[index.count];
+      if (!entry || entry.id === undefined) continue;
+      if (index.byId.has(entry.id)) index.repeated = true;
+      index.byId.set(entry.id, entry);
+    }
+    return index;
   }
 
   // branchFromEntries walks parent links back from the leaf, the same path
-  // upstream derives in process. Cached until the next entry append or leaf
-  // move so repeated reads within a turn stay O(1).
+  // upstream derives in process. The path is cached per log array and leaf. An
+  // append below the cached leaf extends it with the new entries only; a leaf
+  // anywhere else (fork, rewind, a different log) rebuilds it.
   branchFromEntries() {
     const session = this.state.session;
     const entries = session.entries || [];
-    if (this.branchCache && this.branchCacheLeaf === session.leafId) return [...this.branchCache];
     const leafId = session.leafId || undefined;
-    const byId = new Map();
-    for (const entry of entries) {
-      if (entry && entry.id !== undefined) byId.set(entry.id, entry);
+    const index = this.branchById(entries);
+    const cache = this.branchCache;
+    if (cache && cache.entries === entries && !index.repeated) {
+      // A leaf named before its entry arrived has an empty path that a later page can fill, so only a non-empty path outlives growth.
+      if (cache.leafId === leafId && (cache.path.length > 0 || cache.scanned === entries.length)) {
+        cache.scanned = entries.length;
+        return [...cache.path];
+      }
+      const tail = cache.path.at(-1);
+      if (tail !== undefined && leafId !== undefined) {
+        // The new entries are the only ones that can lie between the leaf and the cached tail.
+        const budget = entries.length - cache.scanned;
+        const fresh = [];
+        let current = index.byId.get(leafId);
+        while (current && current !== tail && fresh.length < budget) {
+          fresh.push(current);
+          current = current.parentId === undefined || current.parentId === null ? undefined : index.byId.get(current.parentId);
+        }
+        if (current === tail) {
+          for (let i = fresh.length - 1; i >= 0; i--) cache.path.push(fresh[i]);
+          cache.leafId = leafId;
+          cache.scanned = entries.length;
+          return [...cache.path];
+        }
+      }
     }
     const path = [];
     const seen = new Set();
-    let current = leafId === undefined ? undefined : byId.get(leafId);
+    let current = leafId === undefined ? undefined : index.byId.get(leafId);
     while (current && !seen.has(current.id)) {
       seen.add(current.id);
       path.push(current);
       current = current.parentId === undefined || current.parentId === null
         ? undefined
-        : byId.get(current.parentId);
+        : index.byId.get(current.parentId);
     }
     path.reverse();
-    this.branchCache = path;
-    this.branchCacheLeaf = session.leafId;
+    this.branchCache = index.repeated ? undefined : { entries, leafId, path, scanned: entries.length };
     return [...path];
   }
 
-  // specialSurfaceTui is the TUI handed to a footer/header factory. Upstream
-  // passes the real TUI, so a factory may call requestRender or size itself
-  // from terminal.columns/rows; pig passed {} and those threw.
-  specialSurfaceTui(kind) {
+  // factoryTui is the TUI a component factory receives. Pi hands every one the TUI itself: setWidget's (interactive-mode.ts:2432),
+  // setFooter's (2537), setHeader's (2568) and ui.custom's (3008). requestRender draws the whole TUI again, so it renders the
+  // factory's own surface (requestOwn) and every component this extension shows; showOverlay, hideOverlay and setFocus act on the
+  // host's TUI (tui.ts:598-842).
+  factoryTui(requestOwn = () => {}) {
     const self = this;
     return {
-      requestRender: () => self.renderSpecialSurface(kind),
+      requestRender: () => {
+        requestOwn();
+        self.requestOverlayFrames();
+      },
+      showOverlay: (child, childOptions) => self.showChildOverlay(child, childOptions),
+      hideOverlay: () => self.hideTopOverlay(),
+      setFocus: target => self.setTuiFocus(target),
       get width()  { return self.ready?.width || 80; },
       get height() { return self.ready?.height || 24; },
       terminal: {
@@ -2641,22 +3644,17 @@ export class Runtime {
     };
   }
 
+  // specialSurfaceTui is the TUI handed to a footer/header factory.
+  specialSurfaceTui(kind) {
+    return this.factoryTui(() => this.renderSpecialSurface(kind));
+  }
+
   // footerDataProvider mirrors upstream's ReadonlyFooterDataProvider
   // (footer-data-provider.ts:387), the third argument a ui.setFooter factory
   // receives. Upstream hands over an object with methods, not a data bag, and
   // footers call onBranchChange to subscribe.
   footerDataProvider() {
-    const self = this;
-    return {
-      getGitBranch() { return self.state.footerData.gitBranch; },
-      getExtensionStatuses() { return new Map(Object.entries(self.state.footerData.extensionStatuses || {})); },
-      getAvailableProviderCount() { return self.state.footerData.availableProviderCount || 0; },
-      onBranchChange(callback) {
-        if (typeof callback !== "function") return () => {};
-        self.branchChangeCallbacks.add(callback);
-        return () => self.branchChangeCallbacks.delete(callback);
-      },
-    };
+    return new FooterDataProvider(this);
   }
 
   notifyBranchChange() {
@@ -2688,20 +3686,201 @@ export class Runtime {
         this.specialSurfaceComponents.set(kind, surface);
       }
       const width = this.ready.width || 80;
-      const lines = surface.component?.render?.(width);
-      this.fireAndForget(kind === "footer" ? "ui.setFooter" : "ui.setHeader", {
+      const { lines, derived } = this.withSurfaceTheme(surface.component, () => {
+        const rendered = surface.component?.render?.(width);
+        const lines = Array.isArray(rendered) ? rendered.map((v) => String(v)) : [];
+        return { lines, derived: this.state.frontend ? this.surfaceView(surface.component, lines, width) : undefined };
+      });
+      const args = {
         clear: false,
-        lines: Array.isArray(lines) ? lines.map((v) => String(v)) : [],
+        lines,
         width,
         surfaceId: surface.id,
         updateOnly: !replace,
-      });
+      };
+      surface.viewRefs = derived?.images;
+      if (derived) args.view = this.viewWithImages(derived);
+      this.fireAndForget(kind === "footer" ? "ui.setFooter" : "ui.setHeader", args);
     } catch (err) {
       this.fireAndForget("ui.notify", {
         message: `${kind} render failed: ${err?.message || String(err)}`,
         level: "error",
       });
     }
+  }
+
+  // attachOverlayFrames gives a mounted component its frame pipeline: renderFrame (throttled), renderImmediate and resendFrame send
+  // "ui.custom.render" frames under overlay.key while the overlay is active, registered and open() holds. fail receives a render
+  // or send error. renderWidth maps the terminal width to the width the component draws at.
+  attachOverlayFrames(overlay, renderWidth, open, fail) {
+    const key = overlay.key;
+    const component = overlay.component;
+    const live = () => overlay.active && open() && this.customOverlays.get(key) === overlay;
+    let lastLines = [];
+    let lastWidth;
+    let lastViewKey;
+    let lastMouse = false;
+    let lastCaptures = false;
+    // ui.view.evicted: the next frame goes out with the image data again.
+    overlay.resendFrame = () => {
+      lastViewKey = undefined;
+      overlay.renderFrame();
+    };
+    const renderNow = () => {
+      if (!live()) return;
+      // termWidth tags the frame's terminal geometry so the host can drop
+      // frames laid out for a stale terminal width; the component itself is
+      // rendered at the resolved overlay width.
+      const termWidth = this.ready.width || 80;
+      const width = renderWidth(termWidth);
+      let out;
+      let derived;
+      try {
+        ({ out, derived } = this.withSurfaceTheme(component, () => {
+          const lines = component.render?.(width);
+          const out = Array.isArray(lines) ? lines.map((value) => String(value)) : [];
+          return { out, derived: this.state.frontend ? this.surfaceView(component, out, width, true) : undefined };
+        }));
+      } catch (err) {
+        fail(new Error(`ui.custom render failed: ${err?.message || String(err)}`));
+        return;
+      }
+      // The frame says whether the component takes the
+      // mouse, so the host hands it fullscreen mouse events.
+      const mouse = takesMouse(component);
+      // Component.capturesViewportInput is read as Pi reads it, when the frame is drawn: the host keeps the viewport keys from the transcript while it is true.
+      const captures = component.capturesViewportInput === true;
+      if (termWidth === lastWidth && mouse === lastMouse && captures === lastCaptures && derived?.key === lastViewKey && out.length === lastLines.length && out.every((value, index) => value === lastLines[index])) return;
+      lastLines = out;
+      lastWidth = termWidth;
+      lastViewKey = derived?.key;
+      lastMouse = mouse;
+      lastCaptures = captures;
+      overlay.viewRefs = derived?.images;
+      overlay.seq += 1;
+      try {
+        const args = { key, lines: out, width: termWidth, seq: overlay.seq };
+        if (derived) args.view = this.viewWithImages(derived);
+        if (mouse) args.mouse = true;
+        if (captures) args.capturesViewportInput = true;
+        this.notify("ui.custom.render", args);
+      } catch (err) {
+        fail(err);
+      }
+    };
+    const flushFrame = () => {
+      overlay.renderTimer = undefined;
+      if (!overlay.active || !open() || !overlay.renderRequested) return;
+      if (this.conn?.socket?.writableNeedDrain) return;
+      overlay.renderRequested = false;
+      overlay.lastRenderAt = performance.now();
+      renderNow();
+      if (overlay.renderRequested) requestFrame();
+    };
+    const requestFrame = () => {
+      if (!live()) return;
+      overlay.renderRequested = true;
+      if (overlay.renderTimer !== undefined || this.conn?.socket?.writableNeedDrain) return;
+      const elapsed = performance.now() - overlay.lastRenderAt;
+      const delay = Math.max(0, REMOTE_RENDER_INTERVAL_MS - elapsed);
+      overlay.renderTimer = setTimeout(flushFrame, delay);
+    };
+    overlay.renderFrame = requestFrame;
+    overlay.renderImmediate = () => {
+      if (!live()) return;
+      if (overlay.renderTimer !== undefined) {
+        clearTimeout(overlay.renderTimer);
+        overlay.renderTimer = undefined;
+      }
+      overlay.renderRequested = false;
+      overlay.lastRenderAt = performance.now();
+      renderNow();
+    };
+  }
+
+  // requestOverlayFrames is Pi's TUI.requestRender for a factory's tui: the whole TUI draws again, so every mounted component of
+  // this extension renders.
+  requestOverlayFrames() {
+    for (const overlay of this.customOverlays.values()) overlay.renderFrame();
+  }
+
+  // syncOverlayFocus applies the host's answer to a call that moved TUI focus: the component under focusedKey has it and every other
+  // one of this extension does not, as Pi's setFocus clears the focused flag of the component that loses focus (tui.ts:602-665).
+  // except is the overlay whose own state the answer already carries.
+  syncOverlayFocus(focusedKey, except = undefined) {
+    if (typeof focusedKey !== "string") return;
+    for (const overlay of this.customOverlays.values()) {
+      if (overlay.key !== except) overlay.setFocused?.(overlay.key === focusedKey);
+    }
+  }
+
+  // showChildOverlay is Pi's TUI.showOverlay (tui.ts:729-826) on the tui a ui.custom factory receives. The host mounts the component
+  // as a raw overlay before this returns, so the handle works at once, inside the factory, before the ui.custom component itself is
+  // shown; the component's frames, input and focus use the ui.custom messages under its own key. No ui.custom call waits on it:
+  // the handle's hide ends it. Without a TUI (the host answers ok: false) the handle controls nothing, as no overlay was shown.
+  showChildOverlay(component, options) {
+    this.customOverlaySeq += 1;
+    const key = `custom-${this.customOverlaySeq}`;
+    const layout = serializeOverlayOptions(options) ?? {};
+    const overlay = {
+      key,
+      component,
+      child: true,
+      renderFrame: () => {},
+      renderImmediate: () => {},
+      resendFrame: () => {},
+      seq: 0,
+      active: true,
+      renderRequested: false,
+      renderTimer: undefined,
+      lastRenderAt: Number.NEGATIVE_INFINITY,
+      // Pi's TUI never disposes an overlay component; its owner does.
+      dispose: () => {},
+    };
+    const retire = () => {
+      overlay.active = false;
+      clearTimeout(overlay.renderTimer);
+      if (this.customOverlays.get(key) === overlay) this.customOverlays.delete(key);
+    };
+    this.customOverlays.set(key, overlay);
+    let shown;
+    try {
+      shown = this.callSync("ui.custom.showOverlay", { key, overlayOptions: layout });
+    } catch (error) {
+      retire();
+      throw error;
+    }
+    if (shown?.ok !== true) {
+      retire();
+      return mountedOverlayHandle(this, overlay, { hidden: false, focused: false, visible: false });
+    }
+    this.attachOverlayFrames(overlay, termWidth => resolveOverlayWidth(layout, termWidth), () => true, error => {
+      // pig divergence (D73): Pi's TUI throws a component's render or input error out of its render loop; here the overlay leaves
+      // the screen and the error is reported, since the component cannot draw or take keys any more.
+      this.fireAndForget("ui.notify", { message: error?.message || String(error), level: "error" });
+      overlay.handle?.hide();
+    });
+    overlay.reject = error => {
+      this.fireAndForget("ui.notify", { message: error?.message || String(error), level: "error" });
+      overlay.handle?.hide();
+    };
+    const { ok: _ok, focusedKey, ...state } = shown;
+    overlay.handle = mountedOverlayHandle(this, overlay, state, { onHide: retire });
+    this.syncOverlayFocus(focusedKey, key);
+    overlay.renderImmediate();
+    return overlay.handle;
+  }
+
+  // hideTopOverlay is Pi's TUI.hideOverlay (tui.ts:829-841) on a factory's tui: the host pops its topmost overlay, whichever
+  // component it shows.
+  hideTopOverlay() {
+    this.syncOverlayFocus(this.callSync("ui.custom.hideOverlay", {})?.focusedKey);
+  }
+
+  // setTuiFocus is Pi's TUI.setFocus (tui.ts:598-600) on a factory's tui.
+  setTuiFocus(component) {
+    const target = overlayFocusTarget(this, component, "tui.setFocus(component)");
+    this.syncOverlayFocus(this.callSync("ui.custom.setFocus", { target })?.focusedKey);
   }
 
   // openCustomOverlay implements ctx.ui.custom(factory) over the
@@ -2724,6 +3903,7 @@ export class Runtime {
       component: undefined,
       renderFrame: () => {},
       renderImmediate: () => {},
+      resendFrame: () => {},
       reject: undefined,
       seq: 0,
       active: true,
@@ -2768,17 +3948,7 @@ export class Runtime {
     const isOverlay = Boolean(sizing.overlay);
     let overlayOpts;
 
-    let requestFrame = () => {};
-    const self = this;
-    const tuiShim = {
-      requestRender: () => requestFrame(),
-      get width()  { return self.ready?.width || 80; },
-      get height() { return self.ready?.height || 24; },
-      terminal: {
-        get columns() { return self.ready?.width || 80; },
-        get rows()    { return self.ready?.height || 24; },
-      },
-    };
+    const tuiShim = this.factoryTui();
 
     let component;
     overlay.dispose = () => {
@@ -2818,7 +3988,8 @@ export class Runtime {
     // Pi focuses the component it shows (TUI.setFocus), unless it is a
     // non-capturing overlay, so focusable components such as Input and
     // Editor render their cursor marker.
-    if (requireModule("./shims/pi-dist/pi-tui/tui.js").isFocusable(component) && !(isOverlay && overlayOpts?.nonCapturing)) component.focused = true;
+    const focusable = requireModule("./shims/pi-dist/pi-tui/tui.js").isFocusable(component);
+    if (focusable && !(isOverlay && overlayOpts?.nonCapturing)) component.focused = true;
     const openArgs = {
       key,
       title: String(overlayOpts?.title || ""),
@@ -2827,6 +3998,8 @@ export class Runtime {
       overlay: isOverlay,
       hasHandle: isOverlay && typeof sizing.onHandle === "function",
     };
+    // Pi's showExtensionCustom hands options.blocked to pushExtensionDialog for an inline component; the host ignores it for an overlay.
+    if (sizing.blocked !== undefined) openArgs.blocked = sizing.blocked;
     // Upstream showOverlay(component, overlayOptions ?? { width: component.width })
     // renders the component at the resolved overlay width, not the terminal
     // width. Serialise the same options so the host resolves the same frame.
@@ -2845,67 +4018,28 @@ export class Runtime {
       if (!openArgs.overlayOptions) return termWidth;
       return resolveOverlayWidth(openArgs.overlayOptions, termWidth);
     };
-    let lastLines = [];
-    let lastWidth;
-    const renderNow = () => {
-      if (!overlay.active || doneCalled || !this.customOverlays.has(key)) return;
-      // termWidth tags the frame's terminal geometry so the host can drop
-      // frames laid out for a stale terminal width; the component itself is
-      // rendered at the resolved overlay width.
-      const termWidth = this.ready.width || 80;
-      const width = renderWidth(termWidth);
-      let lines;
-      try {
-        lines = component.render?.(width);
-      } catch (err) {
-        closeWithError(new Error(`ui.custom render failed: ${err?.message || String(err)}`));
-        return;
-      }
-      const out = Array.isArray(lines) ? lines.map((value) => String(value)) : [];
-      if (termWidth === lastWidth && out.length === lastLines.length && out.every((value, index) => value === lastLines[index])) return;
-      lastLines = out;
-      lastWidth = termWidth;
-      overlay.seq += 1;
-      try {
-        this.notify("ui.custom.render", { key, lines: out, width: termWidth, seq: overlay.seq });
-      } catch (err) {
-        closeWithError(err);
-      }
-    };
-    const flushFrame = () => {
-      overlay.renderTimer = undefined;
-      if (!overlay.active || doneCalled || !overlay.renderRequested) return;
-      if (this.conn?.socket?.writableNeedDrain) return;
-      overlay.renderRequested = false;
-      overlay.lastRenderAt = performance.now();
-      renderNow();
-      if (overlay.renderRequested) requestFrame();
-    };
-    requestFrame = () => {
-      if (!overlay.active || doneCalled || !this.customOverlays.has(key)) return;
-      overlay.renderRequested = true;
-      if (overlay.renderTimer !== undefined || this.conn?.socket?.writableNeedDrain) return;
-      const elapsed = performance.now() - overlay.lastRenderAt;
-      const delay = Math.max(0, REMOTE_RENDER_INTERVAL_MS - elapsed);
-      overlay.renderTimer = setTimeout(flushFrame, delay);
-    };
-    overlay.renderFrame = requestFrame;
-    overlay.renderImmediate = () => {
-      if (!overlay.active || doneCalled || !this.customOverlays.has(key)) return;
-      if (overlay.renderTimer !== undefined) {
-        clearTimeout(overlay.renderTimer);
-        overlay.renderTimer = undefined;
-      }
-      overlay.renderRequested = false;
-      overlay.lastRenderAt = performance.now();
-      renderNow();
-    };
+    this.attachOverlayFrames(overlay, renderWidth, () => !doneCalled, closeWithError);
 
     overlay.onMounted = state => {
       if (!overlay.active || overlay.handle) return;
       overlay.handle = mountedOverlayHandle(this, overlay, state);
       try { sizing.onHandle?.(overlay.handle); } catch (error) { closeWithError(error); }
     };
+    // ui.custom.focus: the host moved TUI focus to or from the mounted component, as when another custom component opens over it or
+    // closes; Pi's setFocus clears and sets the focused flag. A mounted handle replaces this to keep isFocused() in step.
+    overlay.focused = !(isOverlay && overlayOpts?.nonCapturing);
+    overlay.applyFocus = focused => {
+      if (!overlay.active) return;
+      overlay.focused = focused;
+      if (focusable) component.focused = focused;
+      overlay.renderFrame();
+    };
+    overlay.setFocused = focused => {
+      if (overlay.focused !== focused) overlay.applyFocus(focused);
+    };
+    // Pi's showOverlay focuses a capturing overlay, and an editor-slot component takes focus (tui.ts:739-741,
+    // interactive-mode.ts:3033), so every other component of this extension loses its focused flag before this one draws.
+    if (overlay.focused) this.syncOverlayFocus(key);
     hostCallStarted = true;
     const hostCallP = this.call("ui.custom", openArgs);
     overlay.renderImmediate();
@@ -2930,21 +4064,224 @@ export class Runtime {
   }
 
   getModel(provider, modelId) {
-    return this.models.get(modelRegistryKey(provider, modelId));
+    return this.modelFor(modelRegistryKey(provider, modelId));
+  }
+
+  // modelFor returns this extension's copy of a catalog model, made the first time it reads that model.
+  modelFor(key) {
+    let model = this.models.get(key);
+    if (model !== undefined || this.modelsComplete) return model;
+    const template = this.catalog.get(key);
+    if (template === undefined) return undefined;
+    model = structuredClone(template);
+    this.models.set(key, model);
+    return model;
+  }
+
+  // allModels returns this extension's copies of every catalog model, in catalog order, keeping each copy it has already read.
+  allModels() {
+    if (!this.modelsComplete) {
+      const models = new Map();
+      for (const [key, template] of this.catalog) models.set(key, this.models.get(key) ?? structuredClone(template));
+      this.models = models;
+      this.modelsComplete = true;
+    }
+    return this.models;
+  }
+
+  hasModelsOf(provider) {
+    for (const model of this.modelsComplete ? this.models.values() : this.catalog.values()) {
+      if (model.provider === provider) return true;
+    }
+    return false;
   }
 
   // applyModelRegistryState installs a host registry snapshot: the catalog
   // and the provider, error and registration state ctx.modelRegistry reads.
+  // The members of a cell share the decoded snapshot, so each takes its own
+  // copy of what an extension can reach. A write this process made that the Host has not answered yet stays on the snapshot.
   applyModelRegistryState(state) {
     if (!state || typeof state !== "object") return;
     if (Array.isArray(state.models)) this.replaceModels(state.models);
     this.registryProviders.clear();
-    this.registryState = {
-      typedModels: Array.isArray(state.typedModels) ? state.typedModels.map((model) => ({ ...model })) : [],
-      providers: state.providers && typeof state.providers === "object" ? state.providers : {},
-      registered: Array.isArray(state.registered) ? state.registered : [],
+    this.hostRegistry = {
+      typedModels: Array.isArray(state.typedModels) ? state.typedModels.map((model) => ({ ...structuredClone(model) })) : [],
+      providers: state.providers && typeof state.providers === "object" ? structuredClone(state.providers) : {},
+      registered: Array.isArray(state.registered) ? structuredClone(state.registered) : [],
       error: typeof state.error === "string" && state.error !== "" ? state.error : undefined,
     };
+    this.registryState = this.hostRegistry;
+    for (const [key, write] of this.virtualWrites) if (this.hostShowsVirtualWrite(write)) this.virtualWrites.delete(key);
+    for (const name of this.overlayNames()) this.overlayProvider(name);
+  }
+
+  // Pi's registerProvider and unregisterProvider recompose the provider and rewrite the model snapshot before they return, so the next read of ctx.modelRegistry holds the write (model-runtime.ts:928-957, model-registry.ts:64-74). The Host's registry reaches this process later, and a publication that predates the write would undo it, so the view keeps the write over the snapshot until the Host answers it. The Host publishes the registry with the write, ahead of its answer on the connection's one ordered stream: by the answer the snapshot holds the write, and it stands alone again. Every member of a packed process holds the write, as every extension holds one registry. answered is the Host call's settled operation, or undefined when no call was made, which no answer ends.
+  holdRegistryWrite(name, answered) {
+    const members = new Set([this, ...liveRuntimes]);
+    for (const runtime of members) {
+      runtime.registryHolds.set(name, (runtime.registryHolds.get(name) ?? 0) + 1);
+      runtime.overlayProvider(name);
+    }
+    if (answered === undefined) return;
+    void answered.then(() => {
+      for (const runtime of members) runtime.releaseRegistryHold(name);
+    });
+  }
+
+  releaseRegistryHold(name) {
+    const held = (this.registryHolds.get(name) ?? 1) - 1;
+    if (held > 0) {
+      this.registryHolds.set(name, held);
+      return;
+    }
+    this.registryHolds.delete(name);
+    this.setCatalog(this.hostCatalog);
+    this.registryProviders.clear();
+    this.registryState = this.hostRegistry;
+    for (const other of this.overlayNames()) this.overlayProvider(other);
+  }
+
+  // holdVirtualWrite records a virtual-model registration (model) or removal (undefined) this process made, and rewrites the provider's view from it. Pi's registerVirtualModel and unregisterVirtualModel update the model snapshot before they return (model-runtime.ts:964-992). The Host registers the model before it answers, but publishes the registry later, from its refresh, so the write stays on the view until a Host snapshot shows it (hostShowsVirtualWrite): a publication that predates the write cannot undo it. Every member of a packed process holds the write, as every extension holds one registry.
+  holdVirtualWrite(provider, id, model) {
+    const written = model === undefined ? undefined : normalizeModel(piVirtualModels().createVirtualModel(model));
+    for (const runtime of new Set([this, ...liveRuntimes])) {
+      runtime.virtualWrites.set(modelRegistryKey(provider, id), { provider, id, model: written });
+      runtime.overlayProvider(provider);
+    }
+  }
+
+  // hostShowsVirtualWrite is whether the Host's snapshot already holds the write: the registered definition, or the model gone.
+  hostShowsVirtualWrite(write) {
+    const shown = this.hostCatalog.get(modelRegistryKey(write.provider, write.id));
+    const virtual = shown?.api === VIRTUAL_MODEL_API;
+    if (write.model === undefined) return !virtual;
+    return virtual && shown.name === write.model.name && shown.contextWindow === write.model.contextWindow && shown.maxTokens === write.model.maxTokens;
+  }
+
+  virtualModelsOf(name) {
+    let virtual = [...this.hostCatalog.values()].filter((model) => model.provider === name && model.api === VIRTUAL_MODEL_API);
+    for (const write of this.virtualWrites.values()) {
+      if (write.provider !== name) continue;
+      const at = virtual.findIndex((model) => model.id === write.id);
+      if (write.model === undefined) virtual = virtual.filter((model) => model.id !== write.id);
+      else if (at >= 0) virtual[at] = write.model;
+      else virtual.push(write.model);
+    }
+    return virtual;
+  }
+
+  // overlayNames are the providers whose view this process rewrites: the ones it registered, the ones it registered virtual models of, and the keyless virtual providers.
+  overlayNames() {
+    const names = new Set(this.registryHolds.keys());
+    for (const write of this.virtualWrites.values()) names.add(write.provider);
+    for (const model of this.hostCatalog.values()) {
+      if (model.api === VIRTUAL_MODEL_API && this.keylessVirtualProvider(model.provider)) names.add(model.provider);
+    }
+    return names;
+  }
+
+  // keylessVirtualProvider is whether name is a provider of only virtual models that the Host's state does not report configured. withVirtualModels lists such a provider keyless (virtual-models.ts:187-199), so Pi has it configured and available as soon as a virtual model is registered (model-runtime.ts:974-982), and keeps it so. The Host's provider state lists only the providers a registration, a models.json entry or a credential defines, so it has none for this one.
+  keylessVirtualProvider(name) {
+    const state = this.hostRegistry.providers?.[name];
+    return state?.configured !== true && state?.modelsConfig === undefined && piBuiltinProvider(name) === undefined && !(this.hostRegistry.registered ?? []).some((entry) => entry.name === name) && this.nativeProviderObjects.get(name) === undefined && this.nativeProviders.get(name) === undefined;
+  }
+
+  // overlayProvider rewrites one provider of the view from this process's own registration of it, as Pi's recompose and snapshot update do (model-runtime.ts:298-340, 910-957): its models, whether it is configured and what its auth status reports, and for a provider with no registration left, the registration layer the snapshot still lists.
+  overlayProvider(name) {
+    const hostState = this.hostRegistry.providers?.[name];
+    const native = this.nativeProviderObjects.get(name)?.provider ?? this.nativeProviders.get(name);
+    const extension = native === undefined ? this.registeredProviderConfig(name) : undefined;
+    const registered = native !== undefined || extension !== undefined;
+
+    // composeProvider (model-runtime.ts:316-336): the registration over the built-in provider and the models.json layer; a composition that fails leaves the built-in provider.
+    let provider = native;
+    if (provider === undefined) {
+      provider = piBuiltinProvider(name);
+      if (extension !== undefined || hostState?.modelsConfig !== undefined) {
+        try {
+          provider = piProviderComposer().composeModelProvider(name, provider, { getProvider: () => hostState?.modelsConfig }, extension);
+        } catch {
+          // The built-in provider stands, as in Pi's composeProvider.
+        }
+      }
+    }
+    const listed = provider === undefined ? [] : (provider.getAllModels?.() ?? provider.getModels());
+    const chat = [];
+    const typed = [];
+    for (const model of listed) ((model.type ?? "chat") === "chat" ? chat : typed).push(model);
+    // withVirtualModels (virtual-models.ts:201-234): the provider's virtual models stay, and hide a physical chat model of the same id.
+    // The Host's virtual models of the provider, with the registrations and removals this process made that the Host's snapshot does not show yet.
+    const virtual = this.virtualModelsOf(name);
+    const hidden = new Set(virtual.map((model) => model.id));
+    const physical = chat.filter((model) => !hidden.has(model.id)).map(normalizeModel).filter(Boolean);
+    this.setCatalog(replaceProviderEntries(this.catalog, name, [...physical, ...virtual]));
+
+    const providers = { ...this.hostRegistry.providers };
+    let listedRegistration = this.hostRegistry.registered;
+    if (registered) {
+      // markProvisionallyConfigured (model-runtime.ts:910-925): a provider with a stored credential or a configured key is configured at once, and an existing check result is never replaced. getProviderAuthStatus (model-runtime.ts:645-660) reads the registration live after the runtime key and the stored credential.
+      const status = piProviderComposer().configuredRequestAuthStatus(hostState?.modelsConfig, extension);
+      const stored = hostState?.authStatus?.source === "stored";
+      const marked = hostState?.configured !== true && (stored || status?.configured === true);
+      const oauthOnly = native ? Boolean(native.auth?.oauth && !native.auth?.apiKey) : Boolean(extension.oauth && !extension.apiKey);
+      const checked = hostState?.configured === true;
+      let authStatus = hostState?.authStatus;
+      if (hostState?.authStatus?.source !== "runtime" && !stored) {
+        authStatus = status ?? (checked ? hostState.authStatus : marked ? { configured: true, source: "environment", label: "configured provider" } : { configured: false });
+      }
+      providers[name] = { ...hostState, configured: checked || marked, usingOAuth: hostState?.usingOAuth === true || (marked && oauthOnly), authStatus };
+    } else {
+      // unregisterProvider (model-runtime.ts:951-957) recomposes without the registration layer and rewrites the models; its configured mark and check result stay until the next availability pass.
+      listedRegistration = listedRegistration.filter((entry) => entry.name !== name);
+      if (hostState !== undefined) {
+        const { extensionConfig: _dropped, ...rest } = hostState;
+        const status = piProviderComposer().configuredRequestAuthStatus(hostState.modelsConfig, undefined);
+        let authStatus = hostState.authStatus;
+        if (hostState.authStatus?.source !== "runtime" && hostState.authStatus?.source !== "stored") {
+          authStatus = status ?? (hostState.configured === true ? (hostState.authStatus?.source === "environment" ? hostState.authStatus : { configured: true, source: "environment", label: "configured provider" }) : { configured: false });
+        }
+        providers[name] = { ...rest, composed: rest.modelsConfig !== undefined, authStatus };
+      }
+    }
+    // A provider of only virtual models needs no credentials: withVirtualModels lists it keyless (virtual-models.ts:187-199), and registerVirtualModel marks it configured at once, before its refresh lands (model-runtime.ts:974-982).
+    if (provider === undefined && virtual.length > 0) {
+      const state = providers[name];
+      providers[name] = { ...state, configured: true, usingOAuth: state?.usingOAuth === true, authStatus: state?.authStatus?.configured === true ? state.authStatus : { configured: true, source: "environment", label: "virtual" } };
+    }
+    // Availability follows the provider's auth (virtual-models.ts withVirtualModels): a virtual model this process registered is available when its provider is configured, and one it removed is not.
+    const available = providers[name]?.availableModelIds;
+    if (Array.isArray(available)) {
+      const ids = new Set(available);
+      for (const write of this.virtualWrites.values()) {
+        if (write.provider !== name) continue;
+        if (write.model === undefined) ids.delete(write.id);
+        else if (providers[name].configured === true) ids.add(write.id);
+      }
+      providers[name] = { ...providers[name], availableModelIds: [...ids] };
+    }
+    this.registryProviders.delete(name);
+    this.registryState = {
+      ...this.hostRegistry,
+      typedModels: replaceProviderEntries(this.hostRegistry.typedModels ?? [], name, typed.map((model) => ({ ...structuredClone(model) }))),
+      providers,
+      registered: listedRegistration,
+    };
+  }
+
+  // setCatalog installs a catalog and keeps this extension's copies of the models that did not change.
+  setCatalog(next) {
+    if (next === this.catalog) return;
+    const copies = new Map();
+    for (const [key, copy] of this.models) {
+      if (next.get(key) === this.catalog.get(key)) copies.set(key, copy);
+    }
+    if (this.modelsComplete) {
+      for (const [key, template] of next) {
+        if (!copies.has(key)) copies.set(key, structuredClone(template));
+      }
+    }
+    this.catalog = next;
+    this.models = copies;
   }
 
   // Compose the same built-in, models.json and extension layers as Pi. Auth
@@ -2953,10 +4290,10 @@ export class Runtime {
     const native = this.contextValues.modelRegistry.getRegisteredNativeProvider(id);
     if (native) return native;
     const state = this.registryState.providers?.[id];
-    const models = [...this.models.values()].filter((model) => model.provider === id);
+    const hasModels = this.hasModelsOf(id);
     const config = this.registeredProviderConfig(id) ?? this.registryState.registered?.find(entry => entry.name === id)?.config ?? state?.extensionConfig;
     // A registration held here is a provider even when the snapshot and the model list have none yet.
-    if (!state && models.length === 0 && config === undefined) return undefined;
+    if (!state && !hasModels && config === undefined) return undefined;
     // The snapshot predates a registration this process made since, and Pi recomposes inside registerProvider (model-runtime.ts:919-940), so a registration held here makes the provider composed whatever the snapshot says.
     if (!state?.composed && config === undefined) {
       const builtin = piBuiltinProvider(id);
@@ -2971,14 +4308,10 @@ export class Runtime {
   }
 
   replaceModels(models) {
-    this.models.clear();
-    for (const raw of Array.isArray(models) ? models : []) {
-      const model = normalizeModel(raw);
-      if (!model) continue;
-      const provider = providerIDFromModel(model);
-      const modelId = modelIDFromModel(model);
-      if (provider && modelId) this.models.set(modelRegistryKey(provider, modelId), model);
-    }
+    this.hostCatalog = catalogOf(models);
+    this.catalog = this.hostCatalog;
+    this.models = new Map();
+    this.modelsComplete = this.catalog.size === 0;
   }
 
   // The signal of a tool's execute(). Pi hands every tool the run's signal, which is also ctx.signal (agent-loop.ts, runner.ts:917-920), except a nested call whose caller passed options.signal: that call runs with it (runner.ts:979-981), which this runtime holds when the caller is one of its own extensions (the call's executeId) and otherwise sees as the request's own cancellation. Without a run, as when a host executes a tool outside one, the request's cancellation is all there is.
@@ -2997,6 +4330,13 @@ export class Runtime {
     if (aborted) this.runSignal.controller.abort();
   }
 
+  // ctx.abort(). Pi's abort is synchronous up to agent.abort(), which aborts the active run's controller before it returns (agent-session.ts:2464-2474, 3472-3478; agent.ts:340-342), so a handler that aborts and reads ctx.signal, or the signal its tool received, in the same turn sees it aborted. The host's abort and its run_signal frame follow; the frame finds the controller aborted. Every member of a packed process holds the same run, as every extension holds one agent.
+  abortRun() {
+    this.runSignal?.controller.abort();
+    for (const runtime of liveRuntimes) runtime.runSignal?.controller.abort();
+    this.fireAndForget("abort", {});
+  }
+
   handleNotify(notify) {
     if (notify.method?.startsWith("ui.editor.")) {
       let args = notify.args;
@@ -3009,6 +4349,38 @@ export class Runtime {
       return;
     }
     switch (notify.method) {
+      case "tool_window_settled": {
+        let args = notify.args;
+        try {
+          if (typeof args === "string") args = JSON.parse(args);
+        } catch {
+          return;
+        }
+        this.requestRecords.get(args?.request_id)?.settleWindow?.();
+        return;
+      }
+      case "bash_operations_release": {
+        let args = notify.args;
+        try {
+          if (typeof args === "string") args = JSON.parse(args);
+        } catch {
+          return;
+        }
+        this.bashOperations.delete(args?.handle);
+        return;
+      }
+      case "timer_defer": {
+        let args = notify.args;
+        try {
+          if (typeof args === "string") args = JSON.parse(args);
+        } catch {
+          return;
+        }
+        setTimerDefer(args?.on === true);
+        // The host waits for this ack before it dispatches the command's first event (Turns.Arm): every call this runtime made before the hold is on the wire ahead of it.
+        this.conn?.notify("timer_defer_ack", { seq: args?.seq ?? 0 });
+        return;
+      }
       case "run_signal": {
         let args = notify.args;
         try {
@@ -3092,7 +4464,9 @@ export class Runtime {
       case "state_update":
         try {
           const args = typeof notify.args === "string" ? JSON.parse(notify.args) : notify.args;
-          this.applyState(args?.state ?? args);
+          const state = args?.state ?? args;
+          if (state && typeof state === "object") this.setFrontend(state.frontend === true);
+          this.applyState(state);
         } catch {}
         return;
       case "width_change": {
@@ -3150,7 +4524,7 @@ export class Runtime {
         } catch {
           args = {};
         }
-        this.ui.theme.setPalette(args || {});
+        this.applyThemePalette(args || {});
         for (const key of this.widgets.keys()) this.renderWidget(key);
         for (const overlay of this.customOverlays?.values() || []) overlay.renderFrame();
         this.renderSpecialSurface("header");
@@ -3161,6 +4535,15 @@ export class Runtime {
       case "ui.custom.opened": {
         const args = typeof notify.args === "string" ? JSON.parse(notify.args) : notify.args;
         this.customOverlays.get(args?.key)?.onMounted?.(args);
+        return;
+      }
+      case "ui.custom.focus": {
+        const args = typeof notify.args === "string" ? JSON.parse(notify.args) : notify.args;
+        const overlay = this.customOverlays.get(args?.key);
+        if (!overlay?.applyFocus) return;
+        overlay.applyFocus(Boolean(args?.focused));
+        // Pi draws the whole TUI after a focus change, so a component that shows another's focus draws it too.
+        this.requestOverlayFrames();
         return;
       }
       case "ui.custom.input": {
@@ -3181,6 +4564,35 @@ export class Runtime {
         }
         return;
       }
+      case "ui.custom.mouse": {
+        // A fullscreen mouse event inside the
+        // component's bounds, as Pi's renderer hands it to handleMouse.
+        let args = notify.args;
+        try {
+          if (typeof args === "string") args = JSON.parse(args);
+        } catch {
+          args = {};
+        }
+        const overlay = this.customOverlays?.get(args?.key);
+        if (!overlay?.component || !args?.event) return;
+        try {
+          const result = dispatchOverlayMouse(overlay, args.event);
+          // Pi's renderer draws again as the result asks, by default after
+          // press, click, drag and wheel (applyMouseDispatchResult).
+          if (result?.render ?? !["move", "release"].includes(args.event.type)) overlay.renderImmediate();
+        } catch (err) {
+          overlay.reject?.(err instanceof Error ? err : new Error(String(err)));
+        }
+        return;
+      }
+      case "ui.view.evicted": {
+        // pig additive (D107): the host dropped these image bytes.
+        try {
+          const args = typeof notify.args === "string" ? JSON.parse(notify.args) : notify.args;
+          this.evictViewImages(args?.refs);
+        } catch {}
+        return;
+      }
       default:
         return;
     }
@@ -3196,8 +4608,8 @@ export class Runtime {
       return;
     }
     if (!config) throw new Error("Provider config is required when registering by name");
-    // Pi validates the incoming registration on its own, before it touches the stored configuration, then merges its defined values over the previous effective root (model-runtime.ts:753-766).
-    piProviderComposer().validateExtensionProvider(name, piBuiltinProvider(name), this.registryState.providers?.[name]?.modelsConfig, config);
+    // A registration made while the extension loads is queued, as Pi's loader queues it (loader.ts:217-218); the model runtime that applies the queue validates it and reports the rejection as a diagnostic, and the extension stays loaded. After the load Pi's registerProvider validates the incoming registration on its own, before it touches the stored configuration, then merges its defined values over the previous effective root (model-runtime.ts:753-766).
+    if (this.loadState === "active") piProviderComposer().validateExtensionProvider(name, piBuiltinProvider(name), this.registryState.providers?.[name]?.modelsConfig, config);
     // A loading member merges over its own queued root, else over the cell's active root, as Pi's flush merges over the effective registration.
     const merged = { ...(this.loadState === "active" ? this.registeredProviderConfig(name) ?? this.foreignProviderConfigForMerge(name) : this.registeredProviderConfigs.get(name) ?? this.providerConfigObjects.get(name)?.config) };
     for (const [key, value] of Object.entries(config)) {
@@ -3234,7 +4646,7 @@ export class Runtime {
       };
     }
     this.providers.set(name, config);
-    if (this.providersSent) this.fireAndForget("registerProvider", { ...this.providerDeclaration(name, config), configRef: this.providerConfigRef(merged) });
+    if (this.providersSent) this.holdRegistryWrite(name, this.fireAndForget("registerProvider", { ...this.providerDeclaration(name, config), configRef: this.providerConfigRef(merged) }));
   }
 
   // The declaration of a provider config, as the register frame and a registration after the factory carry it: the config without its callbacks, and the operations that run in this process.
@@ -3269,9 +4681,13 @@ export class Runtime {
       this.transferProviderOwnership(provider.id, undefined);
       this.nativeProviderObjects.set(provider.id, { owner: this, provider });
     }
-    for(const [key,model] of this.models) if(model.provider===provider.id)this.models.delete(key);
-    for(const model of declaration.models) this.models.set(modelRegistryKey(provider.id,model.id),normalizeModel(model));
-    if(this.providersSent) this.fireAndForget("registerProvider",{name:provider.id,config:{},native:declaration});
+    if (this.providersSent) {
+      this.holdRegistryWrite(provider.id, this.fireAndForget("registerProvider", { name: provider.id, config: {}, native: declaration }));
+      return;
+    }
+    const models = this.allModels();
+    for(const [key,model] of models) if(model.provider===provider.id)models.delete(key);
+    for(const model of declaration.models) models.set(modelRegistryKey(provider.id,model.id),normalizeModel(model));
   }
 
   unregisterProvider(name) {
@@ -3283,25 +4699,7 @@ export class Runtime {
     this.registeredProviderConfigs.delete(name);
     this.nativeProviders.delete(name);
     if (this.loadState === "active") this.transferProviderOwnership(name, undefined);
-    if (this.providersSent) {
-      // Pi's unregisterProvider removes the registration synchronously (model-runtime.ts:791-797); the Host's registry update arrives later, so every member of this process drops its stale entry now.
-      for (const runtime of liveRuntimes) runtime.dropRegistration(name);
-      this.dropRegistration(name);
-      this.fireAndForget("unregisterProvider", { name });
-    }
-  }
-
-  // Pi's unregisterProvider recomposes the provider from its built-in and models.json layers before it returns (model-runtime.ts:942-948), so the snapshot's extension layer goes with the registration.
-  dropRegistration(name) {
-    const providers = this.registryState.providers ?? {};
-    const state = providers[name];
-    let next = providers;
-    if (state?.extensionConfig !== undefined) {
-      const { extensionConfig: _dropped, ...rest } = state;
-      next = { ...providers, [name]: { ...rest, composed: rest.modelsConfig !== undefined } };
-    }
-    this.registryProviders.delete(name);
-    this.registryState = { ...this.registryState, providers: next, registered: (this.registryState.registered ?? []).filter((entry) => entry.name !== name) };
+    if (this.providersSent) this.holdRegistryWrite(name, this.fireAndForget("unregisterProvider", { name }));
   }
 
   // The Host forwards its caller's abort to a request that already settled while the extension still holds refreshSignal, until releaseRetainedSignal reports that it does not.
@@ -3360,6 +4758,13 @@ export class Runtime {
   async handleRequest(id, request, ctx) {
     try {
       switch (request.method) {
+        case "event_loop_turn": {
+          // pig additive (D19): the host's tool ran outside this event loop. One turn runs the immediates the process queued, and the notify reaches the host behind every call they sent, before the response.
+          await new Promise(resolve => setImmediate(resolve));
+          this.notify("event_loop_turned", { turn: request.args?.turn ?? 0 });
+          await this.respond(id, {});
+          return;
+        }
         case "facet": {
           await this.respond(id, await dispatchFacet(this, request, { signal: ctx[requestSignal] }));
           return;
@@ -3393,6 +4798,26 @@ export class Runtime {
           await this.respond(id, await stream.result());
           return;
         }
+        case "user_bash_exec": {
+          // types.ts BashOperations.exec: the object the user_bash reply named runs the command; onData chunks stream before the answer and the request's cancellation is the signal.
+          const operations = this.bashOperations.get(request.tool);
+          if (typeof operations?.exec !== "function") throw new Error(`unknown bash operations: ${request.tool}`);
+          const { command, cwd, timeout, env } = request.args ?? {};
+          let done = false;
+          const onData = (data) => {
+            if (done) return;
+            const bytes = typeof data === "string" ? Buffer.from(data) : Buffer.from(data);
+            this.notify("tool_update", { request_id: id, result: { data: bytes.toString("base64") } });
+          };
+          let result;
+          try {
+            result = await operations.exec(command, cwd, { onData, signal: ctx[requestSignal], ...(timeout === undefined ? {} : { timeout }), ...(env === undefined ? {} : { env }) });
+          } finally {
+            done = true;
+          }
+          await this.respond(id, { exitCode: result?.exitCode ?? null });
+          return;
+        }
         case "provider_operation": {
           // types.ts:1896-1898: the implementation of the config's image or classifier API runs here with the model, the context and the resolved request options; its result, or its error, is the answer.
           const { kind, api, model, context, options } = request.args ?? {};
@@ -3417,7 +4842,10 @@ export class Runtime {
           };
           let result;
           try {
-            result = await tool.execute?.(request.tool_call_id, params, this.toolSignal(request, ctx), onUpdate, this.addToolContext(ctx, request.tool_call_id));
+            const pending = tool.execute?.(request.tool_call_id, params, this.toolSignal(request, ctx), onUpdate, this.addToolContext(ctx, request.tool_call_id, request.tool_call_index, params));
+            // Calling an async execute runs its synchronous prefix before it returns its Promise (agent-loop.ts:619-647: Pi starts the next call of the batch only then). A prefix that took a place in the host's file mutation queue (withFileMutationQueue) sent that call before this point, so the host registers the edit and write calls behind this tool after it. A Promise that settles in the microtasks that follow needs no report: its answer ends the wait.
+            this.reportToolPrefixOver(id, pending);
+            result = await pending;
           } finally {
             done = true;
           }
@@ -3438,6 +4866,7 @@ export class Runtime {
           const payload = request.args ?? {};
           const exposures = payload.exposures ?? {};
           const namespaces = payload.namespaces ?? {};
+          const promptGuidelines = payload.promptGuidelines ?? {};
           const loadout = {
             declared: payload.declared ?? [],
             callable: payload.callable ?? [],
@@ -3445,6 +4874,8 @@ export class Runtime {
             // A tool without a definition is "direct" (agent-session.ts:1480-1482).
             getExposure: (name) => (Object.hasOwn(exposures, name) ? exposures[name] : "direct"),
             getNamespace: (name) => (Object.hasOwn(namespaces, name) ? namespaces[name] : undefined),
+            // A tool without guidelines has none (agent-session.ts getPromptGuidelines).
+            getPromptGuidelines: (name) => (Object.hasOwn(promptGuidelines, name) ? promptGuidelines[name] : []),
           };
           await this.respond(id, tool.prepareLoadout(loadout) ?? null);
           return;
@@ -3517,6 +4948,23 @@ export class Runtime {
           await this.respond(id, null);
           return;
         }
+        case "setup": {
+          // agent-session-runtime.ts:254-257: the callback seeds the replacement Session through its SessionManager and its settlement settles the replacement call.
+          const { handle } = request.args ?? {};
+          const entry = this.setupCallbacks.get(handle);
+          if (!entry) throw new Error(`unknown setup callback ${handle}`);
+          const owner = this.requestContext.getStore();
+          const parent = () => (owner?.id === id && !owner.settled ? id : this.activeRequest()?.id ?? "");
+          try {
+            await entry.callback(new SetupSessionManager(this, parent));
+          } catch (error) {
+            entry.failed = true;
+            entry.error = error;
+            throw error;
+          }
+          await this.respond(id, null);
+          return;
+        }
         case "command": {
           const cmd = this.commands.get(request.tool);
           if (!cmd) throw new Error(`unknown command: ${request.tool}`);
@@ -3524,12 +4972,14 @@ export class Runtime {
           if (owner?.id === id) owner.command = true;
           if (owner?.id === id && this.contextValues.mode === "rpc") armRequestWindow(owner, true);
           const pending = cmd.handler?.(request.args ?? "", ctx);
+          if (owner?.id === id) Promise.resolve(pending).then(() => { owner.handlerSettled = true; }, () => { owner.handlerSettled = true; });
           if (this.contextValues.mode === "rpc") await this.acknowledgeInvocation(id, pending);
           await pending;
           await this.respond(id, null);
           return;
         }
         case "event": {
+          if (request.streamError) throw request.streamError;
           const handlers = this.handlers.get(request.event) ?? [];
           const selected = handlers.find(({ id: handlerId }) => handlerId === request.handler_id);
           if (!selected) throw new Error(`unknown event handler ${request.handler_id} for ${request.event}`);
@@ -3569,7 +5019,8 @@ export class Runtime {
             try {
               result = await selected.handler(event, ctx);
             } catch (err) {
-              error = err instanceof Error ? err : new Error(String(err));
+              // upstream: agent-session.ts _beforeToolCall rethrows an Error and wraps any other thrown value.
+              error = err instanceof Error ? err : new Error(`Extension failed, blocking execution: ${String(err)}`);
             }
             const edited = JSON.stringify(input) !== before;
             await this.respond(id, { ...(edited ? { _pigToolCallInput: input } : {}), _pigToolCallResult: result }, error);
@@ -3578,9 +5029,25 @@ export class Runtime {
           if (request.event === "before_agent_start") {
             const options = event.systemPromptOptions;
             // Pi's normalized options always carry every collection; the host omits an empty one. A handler's own null stays.
-            for (const [name, empty] of [["selectedTools", () => []], ["toolSnippets", () => ({})], ["toolGuidelines", () => ({})], ["promptGuidelines", () => []], ["contextFiles", () => []], ["skills", () => []]]) {
+            for (const [name, empty] of [["selectedTools", () => []], ["hiddenTools", () => []], ["toolSnippets", () => ({})], ["toolGuidelines", () => ({})], ["promptGuidelines", () => []], ["contextFiles", () => []], ["skills", () => []]]) {
               if (options[name] === undefined) options[name] = empty();
             }
+            // runner.ts:1426-1450 renderCurrentSystemPrompt: event.systemPrompt and ctx.getSystemPrompt() render the shared options when read, so the handler's own edit shows at once. The host rendered the event's prompt for the options it sent; options that differ from those it renders again.
+            const owner = this.requestContext.getStore();
+            let rendered = { key: JSON.stringify(options), prompt: event.systemPrompt };
+            const renderCurrentSystemPrompt = () => {
+              const key = JSON.stringify(options);
+              if (key !== rendered.key) {
+                const parent = owner && !owner.settled ? owner.id : this.activeRequest()?.id ?? "";
+                rendered = { key, prompt: this.conn.callSync("renderSystemPrompt", { options }, parent)?.prompt ?? "" };
+              }
+              return rendered.prompt;
+            };
+            Object.defineProperty(event, "systemPrompt", { enumerable: true, configurable: true, get: renderCurrentSystemPrompt });
+            ctx.getSystemPrompt = () => {
+              this.extensionRuntime.assertActive();
+              return renderCurrentSystemPrompt();
+            };
             let result;
             let error;
             try {
@@ -3593,19 +5060,24 @@ export class Runtime {
           }
           const messages = event.messages;
           const snapshot = Array.isArray(messages) ? messages.slice() : undefined;
+          // A reply for a list the handler left as it was, with no edit to any message, omits the list: the host already holds it.
+          const encodedBefore = snapshot && (request.event === "context" || request.event === "context_with_system") ? contextMessagesEncoding(messages) : undefined;
           const pending = selected.handler(event, ctx);
           const shutdownOwner = this.requestContext.getStore();
-          if (shutdownOwner?.id === id && shutdownOwner.quit && this.contextValues.mode === "rpc") armRequestWindow(shutdownOwner);
+          // The host also hears in print and JSON mode when the handler's window closes: Pi's run, held still while a signal's disposal runs synchronously, goes on from that turn of its loop.
+          if (shutdownOwner?.id === id && shutdownOwner.quit && (this.contextValues.mode === "rpc" || PROMPT_END_MODES.has(this.contextValues.mode))) armRequestWindow(shutdownOwner);
           if (request.event === "agent_settled") this.armSettleTailWindow(id, ctx);
-          // Calling an async handler executes its synchronous prefix before returning its Promise. Unawaited notifications admit the next caller at that boundary.
-          if (request.event === "ui_prompt_start" || request.event === "ui_prompt_end" || request.event === "session_info_changed") {
+          // Calling an async handler executes its synchronous prefix before returning its Promise. Unawaited notifications admit the next caller at that boundary; Pi emits session_info_changed and thinking_level_select with `void runner.emit` (agent-session.ts:2629, 3946).
+          if (request.event === "ui_prompt_start" || request.event === "ui_prompt_end" || request.event === "session_info_changed" || request.event === "thinking_level_select") {
             this.conn.requestState(id, "blocked", "external_io");
+            if (shutdownOwner?.id === id) shutdownOwner.suspensionReported = true;
           }
           if (request.event === "session_shutdown" && this.contextValues.mode === "rpc") await this.acknowledgeInvocation(id, pending);
           let result = await pending;
           if ((request.event === "context" || request.event === "context_with_system") && snapshot) {
             const returned = result?.messages ?? messages;
-            result = { messages: returned, _pigContextUnchanged: returned.length === snapshot.length && returned.every((message, i) => message === snapshot[i]) };
+            const unchanged = returned.length === snapshot.length && returned.every((message, i) => message === snapshot[i]);
+            result = unchanged && encodedBefore !== undefined && contextMessagesEncoding(returned) === encodedBefore ? { _pigContextUnchanged: true } : { messages: returned, _pigContextUnchanged: unchanged };
           }
           // before_provider_headers handlers mutate event.headers in place and
           // their return value is ignored (runner.ts emitBeforeProviderHeaders);
@@ -3618,6 +5090,12 @@ export class Runtime {
             if (result === null) throw new Error('Invalid user_bash handler result: return undefined for local execution or exactly one valid { operations } or { result } object');
             const undefinedExitCode = result.result && Object.hasOwn(result.result, "exitCode") && result.result.exitCode === undefined;
             result = { ...result, _pigUserBashExitCodeUndefined: Boolean(undefinedExitCode) };
+            // pig additive (D19): functions cannot cross the socket, so the reply names the operations object and the host calls it with user_bash_exec.
+            if (typeof result === "object" && result.operations !== undefined && result.result === undefined && typeof result.operations?.exec === "function") {
+              const handle = `bash-${++this.bashOperationsSeq}`;
+              this.bashOperations.set(handle, result.operations);
+              result = { operations: { handle } };
+            }
           }
           await this.respond(id, result);
           return;
@@ -3633,9 +5111,12 @@ export class Runtime {
           const handler = this.renderers.get(request.tool);
           if (!handler) throw new Error(`unknown renderer: ${request.tool}`);
           const payload = request.args || {};
-          const component = await handler(payload.message, payload.options, this.ui.theme);
-          const lines = Array.isArray(component) ? component : component?.render?.(payload.width);
-          await this.respond(id, { lines: Array.isArray(lines) ? lines : [] });
+          const { keyText, keyHint } = piKeybindingHints();
+          const component = await handler(payload.message, { ...payload.options, keyText, keyHint }, this.ui.theme);
+          await this.respond(id, this.withSurfaceTheme(component, () => {
+            const lines = Array.isArray(component) ? component : component?.render?.(payload.width);
+            return this.rendererResult(component, Array.isArray(lines) ? lines : [], payload.width);
+          }));
           return;
         }
         case "markdown_transform": {
@@ -3657,9 +5138,12 @@ export class Runtime {
           const handler = this.entryRenderers.get(request.tool);
           if (!handler) throw new Error(`unknown entry renderer: ${request.tool}`);
           const payload = request.args || {};
-          const component = await handler(payload.entry, payload.options, this.ui.theme);
-          const lines = Array.isArray(component) ? component : component?.render?.(payload.width);
-          await this.respond(id, { lines: Array.isArray(lines) ? lines : [] });
+          const { keyText, keyHint } = piKeybindingHints();
+          const component = await handler(payload.entry, { ...payload.options, keyText, keyHint }, this.ui.theme);
+          await this.respond(id, this.withSurfaceTheme(component, () => {
+            const lines = Array.isArray(component) ? component : component?.render?.(payload.width);
+            return this.rendererResult(component, Array.isArray(lines) ? lines : [], payload.width);
+          }));
           return;
         }
         case "resolve_tool_renderers": {
@@ -3680,12 +5164,15 @@ export class Runtime {
           const phase = isResult ? "result" : "call";
           let component = card[phase];
           if (payload.rerender || component === undefined) {
+            const { keyText, keyHint } = piKeybindingHints();
             const context = {
               ...(payload.context || {}),
               args: payload.args,
               invalidate: () => this.notify("tool_render_invalidate", { card: payload.card }),
               lastComponent: component,
               state: card.state,
+              keyText,
+              keyHint,
             };
             try {
               component = isResult
@@ -3697,12 +5184,14 @@ export class Runtime {
             }
             card[phase] = component;
           }
-          const lines = component?.render?.(payload.width);
-          await this.respond(id, { lines: Array.isArray(lines) ? lines : [] });
+          await this.respond(id, this.withSurfaceTheme(component, () => {
+            const lines = component?.render?.(payload.width);
+            return this.rendererResult(component, Array.isArray(lines) ? lines : [], payload.width);
+          }));
           return;
         }
         case "autocomplete.suggest": {
-          await this.respond(id, await this.autocomplete.suggest(request.args, ctx[requestSignal]));
+          await this.respond(id, await this.autocomplete.suggest(request.args, ctx[requestSignal], id));
           return;
         }
         case "terminal_input": {
@@ -3711,7 +5200,9 @@ export class Runtime {
           // Upstream's TerminalInputHandler is synchronous and the host waits
           // on this reply, so the handlers run inline in registration order.
           // A handler's data replaces the chunk for the handlers after it; a
-          // throw degrades to no verdict rather than capturing the keystroke.
+          // throw is reported on stderr, which the host captures in the
+          // extension log, and degrades to no verdict rather than capturing
+          // the keystroke.
           const original = request.args?.data ?? "";
           let current = original;
           let consume = false;
@@ -3719,7 +5210,8 @@ export class Runtime {
             let result;
             try {
               result = handler(current);
-            } catch {
+            } catch (error) {
+              try { process.stderr.write(`pig: terminal input handler failed: ${error?.stack || String(error)}\n`); } catch {}
               continue;
             }
             if (result?.consume) {
@@ -3832,9 +5324,10 @@ export class Runtime {
   callSync(method, args = {}) {
     const facetMethod = method === "facet.host.sync" && hasFacetBridge(this);
     const providerMethod = method === "provider.object" && ["getModels", "filterModels", "update"].includes(args.method);
-    const providerCallback = method === "provider.callback" && args.method === "notify";
+    // notify and LoginOptions.getDeviceId are synchronous in Pi (auth/types.ts:160, 208).
+    const providerCallback = method === "provider.callback" && (args.method === "notify" || args.method === "getDeviceId");
     const themeMethod = ["ui.getTheme", "ui.setTheme", "ui.theme", "ui.addAutocompleteProvider", "ui.autocomplete.invoke", "ui.autocomplete.current"].includes(method);
-    if (!facetMethod && !themeMethod && !["registerTool", "registerMcpServer", "unregisterMcpServer", "registerVirtualModel", "unregisterVirtualModel", "mcpServers.check", "getMcpServers", "getCallableTools", "getAllTools", "getActiveTools", "xref.hello", "xref.op", "provider.config", "events.on", "events.off", "events.emit", "events.settle"].includes(method) && method !== "ui.custom.control" && method !== "provider.retain" && method !== "provider.release" && !providerMethod && !providerCallback) {
+    if (!facetMethod && !themeMethod && !["registerTool", "registerDeclaration", "registerMcpServer", "unregisterMcpServer", "registerVirtualModel", "unregisterVirtualModel", "mcpServers.check", "getMcpServers", "getCallableTools", "getAllTools", "getActiveTools", "getCommands", "hasPendingMessages", "getSystemPrompt", "getSystemPromptOptions", "isIdle", "tool.reachesTools", "setLabel", "setSessionName", "sendMessage", "xref.hello", "xref.op", "provider.config", "events.on", "events.off", "events.emit", "events.settle", "ui.custom.control", "ui.custom.showOverlay", "ui.custom.hideOverlay", "ui.custom.setFocus"].includes(method) && method !== "provider.retain" && method !== "provider.release" && !providerMethod && !providerCallback) {
       throw new Error(`Host method ${method} is not a synchronous bridge operation`);
     }
     if (!this.conn) throw new Error("runtime not connected");
@@ -3850,8 +5343,11 @@ export class Runtime {
     // by whatever request (if any) is ambient where the extension invokes it.
     const ambient = this.requestContext.getStore();
     const owner = parent ? this.requestRecords.get(parent) : ambient;
-    const connection = owner?.connection ?? ambient?.connection ?? this.conn;
-    if (!connection || connection.closed || connection !== this.conn) throw new Error("extension connection closed or replaced");
+    // While the factory runs the runtime holds only its early connection, opened by its first host call; Pi's factory can already await pi.exec().
+    if (!owner && !this.connection()) this.ensureConnectionSync();
+    const current = this.connection();
+    const connection = owner?.connection ?? ambient?.connection ?? current;
+    if (!connection || connection.closed || connection !== current) throw new Error("extension connection closed or replaced");
     if (!detached && (owner?.cancelled || (!owner?.settled && owner?.controller.signal.aborted))) {
       throw hostCancelled("host call cancelled with its parent request");
     }
@@ -3869,6 +5365,25 @@ export class Runtime {
     }
   }
 
+  // A dialog whose options carry a signal (rpc-mode.ts createDialogPromise, which a pre-aborted signal never reaches because the dialogs return the default first): an abort
+  // settles the dialog with the default at once, and the host dismisses it. The signal does not cross the process boundary, so the call names the dialog by id.
+  async dialogCall(method, args) {
+    const { signal, ...opts } = args.opts ?? {};
+    if (!signal) return this.call(method, args);
+    const dialogId = `d${this.nextDialogId++}`;
+    const outcome = this.call(method, { ...args, opts, dialogId });
+    let onAbort;
+    const aborted = new Promise(resolve => {
+      onAbort = () => {
+        this.conn?.call("ui.cancelDialog", { dialogId }, "").catch(() => {});
+        resolve(undefined);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try { return await Promise.race([outcome, aborted]); }
+    finally { signal.removeEventListener("abort", onAbort); }
+  }
+
   // A withSession callback (types.ts:410-430) cannot cross the process boundary: the call names it by handle, and the host runs it with a with_session request before the call settles. A callback that throws rejects the call with its own error, as Pi's awaited callback does.
   async callReplacement(method, args, withSession) {
     if (typeof withSession !== "function") return this.call(method, args);
@@ -3884,17 +5399,30 @@ export class Runtime {
     }
   }
 
+  // callNewSession is newSession with Pi's setup option (types.ts:411): the callback cannot cross the process boundary, so the call names it by handle and the host runs it with a setup request after the replacement Session is bound and before withSession. A callback that throws rejects the call with its own error.
+  async callNewSession(args, setup, withSession) {
+    if (typeof setup !== "function") return this.callReplacement("newSession", args, withSession);
+    const handle = `${this.name}:setup:${++this.nextSetupHandle}`;
+    const entry = { callback: setup, failed: false, error: undefined };
+    this.setupCallbacks.set(handle, entry);
+    try {
+      return await this.callReplacement("newSession", { ...args, setup: handle }, withSession);
+    } catch (error) {
+      throw entry.failed ? entry.error : error;
+    } finally {
+      this.setupCallbacks.delete(handle);
+    }
+  }
+
   // createReplacedSessionContext is Pi's createReplacedSessionContext (agent-session.ts:4325-4333) for the with_session request requestId: a command context of the replacement Session, read from the ready payload the host sent for it, with awaited sendMessage and sendUserMessage. Its host calls belong to the request, so the host applies them to the replacement Session.
   createReplacedSessionContext(ready, requestId) {
     const runtime = Object.create(this);
     runtime.extensionRuntime = { assertActive() {} };
-    runtime.ready = { ...this.ready, cwd: ready.cwd || this.ready.cwd, mode: ready.mode || this.ready.mode, model: ready.model };
+    runtime.ready = { ...this.ready, cwd: ready.cwd || this.ready.cwd, mode: ready.mode || this.ready.mode };
     const snapshot = ready.state ?? {};
     const session = snapshot.session ?? {};
     runtime.state = {
       ...this.state,
-      activeTools: [...(snapshot.activeTools ?? [])],
-      allTools: [...(snapshot.allTools ?? [])],
       commands: [...(snapshot.commands ?? [])],
       thinkingLevel: typeof snapshot.thinkingLevel === "string" ? snapshot.thinkingLevel : this.state.thinkingLevel,
       scopedModels: Array.isArray(snapshot.scopedModels) ? snapshot.scopedModels : [],
@@ -3944,6 +5472,49 @@ export class Runtime {
   // addTerminalInputHandler subscribes to raw terminal input, telling the host
   // to start forwarding only on the first handler and to stop on the last, so
   // an extension that never subscribes costs the input loop nothing.
+  // applyThemePalette installs the host's palette and tells the onThemeChange subscribers when it differs from the one before (Pi calls a widget component's invalidate() on a theme change).
+  applyThemePalette(palette) {
+    const signature = JSON.stringify(palette);
+    const changed = this.themeSignature !== undefined && this.themeSignature !== signature;
+    this.ui.theme.setPalette(palette);
+    this.themeSignature = signature;
+    if (changed) this.fireChangeHandlers(this.themeChangeHandlers, this.ui.theme);
+  }
+
+  // fireChangeHandlers calls the handlers subscribed now, in order; a throw or a rejection of one does not stop the others.
+  fireChangeHandlers(handlers, value) {
+    for (const handler of [...handlers]) {
+      try {
+        const result = handler(value);
+        if (result && typeof result.then === "function") result.then(undefined, () => {});
+      } catch {}
+    }
+  }
+
+  addChangeHandler(handlers, handler) {
+    handlers.push(handler);
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      const i = handlers.indexOf(handler);
+      if (i >= 0) handlers.splice(i, 1);
+    };
+  }
+
+  // runLoadedHandlers runs the pi.onLoaded handlers in order, each to completion. Requests wait for them (startRequest), the loop does not, so a handler's host calls are answered.
+  async runLoadedHandlers() {
+    const handlers = this.loadedHandlers;
+    this.loadedHandlers = [];
+    for (const handler of handlers) {
+      try {
+        await handler(this.ctx);
+      } catch (error) {
+        process.stderr.write(`extension: ${this.name}: onLoaded handler failed: ${error?.stack ?? error}\n`);
+      }
+    }
+  }
+
   addWidthChangeHandler(handler) {
     this.widthChangeHandlers.push(handler);
     let done = false;
@@ -3977,7 +5548,8 @@ export class Runtime {
   // Content is a block array, never a bare string. Exposed on the api object
   // so every SDK offers the same reading of the same payload.
   static messageRole(data) {
-    return data?.message?.role ?? "";
+    const role = data?.message?.role;
+    return typeof role === "string" ? role : "";
   }
 
   static messageText(data) {
@@ -4004,10 +5576,36 @@ export class Runtime {
     await Promise.resolve();
     const owner = this.requestContext.getStore();
     while (owner?.pendingHostCalls.size) await Promise.all([...owner.pendingHostCalls]);
-    if (!settled) this.conn.requestState(id, "blocked", "external_io");
+    if (!settled && !awaitsWaitForIdle(this.conn, id)) this.conn.requestState(id, "blocked", "external_io");
   }
 
-  fireAndForget(method, args = {}) {
+  // writeSync is a synchronous host write whose events may start nested in the wait (Connection.nestedEvent).
+  writeSync(method, args) {
+    const conn = this.conn;
+    if (conn) conn.nestedWrites = (conn.nestedWrites ?? 0) + 1;
+    try { return this.callSync(method, args); }
+    finally { if (conn) conn.nestedWrites--; }
+  }
+
+  // adoptHostLeafEntry reads the entry a synchronous host write just appended and adds it to this process's log view, as appendCustomEntry adds its own. A leaf that does not match, for example because a run appended after the write, is left to the log synchronization.
+  adoptHostLeafEntry(match) {
+    const sessionManager = this.contextValues.sessionManager;
+    if (!(sessionManager instanceof RuntimeSessionManager) || !this.conn) return undefined;
+    let entry;
+    try {
+      entry = this.conn.callSync("sessionRead", { method: "getLeafEntry" }, this.activeRequest()?.id ?? "");
+    } catch (err) {
+      // The write already succeeded and the adoption is only a cache of it: a host that answers no leaf (reads not bound) leaves the entry to the log synchronization, while a cancellation is still the caller's.
+      if (isHostCancellation(err)) throw err;
+      return undefined;
+    }
+    if (!entry || typeof entry !== "object" || !match(entry) || sessionManager.getEntry(entry.id)) return undefined;
+    this.pendingEntries.push(entry);
+    return entry;
+  }
+
+  // onRejected runs when the host answers the call with an error, for a caller that showed the call's effect ahead of the answer.
+  fireAndForget(method, args = {}, onRejected = undefined) {
     if (!this.conn) return;
     // The caller does not await, but the dispatcher owns the operation through
     // its parent request. The response cannot report completed while this call
@@ -4017,9 +5615,14 @@ export class Runtime {
     const parentRequestId = owner?.id || "";
     // These synchronous RPC effects must reach the host before invocation acknowledgment.
     const synchronousRPC = this.contextValues.mode === "rpc";
-    if (parentRequestId && !synchronousRPC) this.conn.requestState(parentRequestId, "blocked", "host_call");
+    const conn = this.conn;
+    // A closed connection throws on write; the call itself then rejects as a host cancellation would.
+    if (parentRequestId && !synchronousRPC && !conn.closed) conn.requestState(parentRequestId, "blocked", "host_call");
     let operation;
-    operation = this.conn.call(method, args, parentRequestId).catch((err) => {
+    operation = conn.call(method, args, parentRequestId).catch((err) => {
+      if (onRejected !== undefined && isHostRejection(err)) onRejected();
+      // A host cancellation (the connection closed or the parent request was cancelled) and a call made after the close are not failures: Pi's calls are in-process and never fail at shutdown or with their caller, so they have nothing to report.
+      if (isHostCancellation(err) || conn.closed) return;
       const reason = err && err.message ? err.message : String(err);
       try {
         process.stderr.write(`pig: host call ${method} failed: ${reason}\n`);
@@ -4028,10 +5631,42 @@ export class Runtime {
         // rejection in a path the caller never awaits.
       }
     }).finally(() => {
-      if (parentRequestId) this.conn.requestState(parentRequestId, "progress");
+      if (parentRequestId && !conn.closed) conn.requestState(parentRequestId, "progress");
       owner?.pendingHostCalls.delete(operation);
     });
     owner?.pendingHostCalls.add(operation);
+    return operation;
+  }
+
+  // reportToolPrefixOver tells the host that the tool_call request id awaits something, once the microtasks that follow the call to execute ran and left its Promise pending.
+  reportToolPrefixOver(id, pending) {
+    let settled = false;
+    Promise.resolve(pending).then(() => { settled = true; }, () => { settled = true; });
+    queueMicrotask(() => {
+      if (settled || this.conn.closed) return;
+      // Pi registers the edit and write calls behind this tool in the file mutation queue before the tool's next call: the host says when it has, and the tool's next fileMutation.enter waits for it.
+      const request = this.requestRecords.get(id);
+      if (request) request.windowSettled = new Promise((resolve) => { request.settleWindow = resolve; });
+      this.conn.requestState(id, "blocked", "external_io");
+    });
+  }
+
+  // reportHandlerYield tells the host, at the first microtask checkpoint after the send that carried token, that the code that sent a triggering message awaited or returned. The checkpoint comes once the code's synchronous run ends, as the loop's next turn does in Pi, where the run the message started can proceed (Host.syncRuns); the host sets its hold before it answers the send, and this process sends the report only after that answer.
+  reportHandlerYield(token) {
+    const conn = this.conn;
+    if (!conn) return;
+    queueMicrotask(() => { if (!conn.closed) conn.notify("handler_yielded", { token }); });
+  }
+
+  // reportCommandYield follows a send from an RPC command's handler. The host holds the run the send starts while the handler runs, as Pi's run starts only once the handler that sent it awaits or returns (agent-session.ts:2129, 2293 sendCustomMessage); a handler still unsettled at the next event-loop turn has awaited, so the command reports its suspension then.
+  reportCommandYield() {
+    const owner = this.activeRequest();
+    const conn = this.conn;
+    if (!owner?.command || this.contextValues.mode !== "rpc" || !conn) return;
+    setImmediate(() => {
+      if (owner.handlerSettled || owner.settled || conn.closed || awaitsWaitForIdle(conn, owner.id)) return;
+      conn.requestState(owner.id, "blocked", "external_io");
+    });
   }
 
   notify(method, args = {}) {
@@ -4053,22 +5688,21 @@ export function invalidFactory(entry) {
 
 // loadFailure is Pi's load error for a factory or import that threw:
 // "Failed to load extension: <message>" (loader.ts loadExtension), with the
-// thrown error's stack for diagnostics.
-export function loadFailure(err) {
-  if (err?.pigLoaderError) return { error: err.message, stack: err.stack || "" };
+// thrown error's stack for diagnostics. phase is "factory" once the factory
+// was called and "import" before, so the host retries on another runtime only
+// a load that ran no extension code past module evaluation.
+export function loadFailure(err, phase) {
+  if (err?.pigLoaderError) return { error: err.message, stack: err.stack || "", phase };
   const message = err instanceof Error ? err.message : String(err);
-  return { error: `Failed to load extension: ${message}`, stack: err instanceof Error ? err.stack || "" : "" };
+  return { error: `Failed to load extension: ${message}`, stack: err instanceof Error ? err.stack || "" : "", phase };
 }
 
 // reportLoadFailure connects to the host, sends a load_failed notify in place
-// of the register handshake, and closes. In a packed cell it always settles:
-// destroy() tears the connection down after the frame is written whether or
-// not the host has accepted the connection yet (an end() would wait for the
-// host to close its side, and the host may still be working through earlier
-// members). An isolated extension's process exits once this settles, so it
-// waits for the host to read the frame and close the connection; otherwise
-// the host could see the exit before the connection.
-export function reportLoadFailure(sockPath, failure, { waitForHost = false } = {}) {
+// of the register handshake, and closes. It always settles: destroy() tears
+// the connection down after the frame is written whether or not the host has
+// accepted the connection yet (an end() would wait for the host to close its
+// side, and the host may still be working through earlier members).
+export function reportLoadFailure(sockPath, failure) {
   return new Promise((resolve) => {
     if (!sockPath) {
       resolve();
@@ -4078,27 +5712,9 @@ export function reportLoadFailure(sockPath, failure, { waitForHost = false } = {
     const header = Buffer.alloc(4);
     header.writeUInt32BE(data.length, 0);
     const socket = net.createConnection(sockPath, () => {
-      if (waitForHost) socket.end(Buffer.concat([header, data]));
-      else socket.write(Buffer.concat([header, data]), () => socket.destroy());
+      socket.write(Buffer.concat([header, data]), () => socket.destroy());
     });
     socket.on("error", () => resolve());
     socket.on("close", () => resolve());
   });
-}
-
-// 0.3.0: replaced by Pi runner wiring
-export async function loadExtension(entry) {
-  const runtime = new Runtime(entry);
-  try {
-    const install = await importExtension(entry);
-    if (typeof install !== "function") throw invalidFactory(entry);
-    await install(runtime.api);
-  } catch (err) {
-    runtime.discardLoad();
-    if (runtime.earlyConn) await runtime.reportLoadFailureOnConnection(loadFailure(err));
-    else await reportLoadFailure(process.env.PIG_EXT_SOCKET, loadFailure(err), { waitForHost: true });
-    process.exit(1);
-  }
-  runtime.commitLoad();
-  await runtime.run();
 }

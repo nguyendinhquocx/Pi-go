@@ -1,18 +1,17 @@
 package coding
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 
 	"github.com/MichaelKinsy/PiG/ai"
-	"github.com/MichaelKinsy/PiG/internal/coding/pigidentity"
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
 )
 
@@ -40,18 +39,18 @@ import (
 // Library consumers can use this to construct models without
 // hand-rolling provider switching:
 //
-//	svcs, _ := coding.NewServices(...)
+//	svcs, _ := coding.CreateAgentSessionServices(...)
 //	defer svcs.Close()
 //	model, _ := coding.BuildModel("github-copilot/gpt-4o-mini", svcs)
 //	rt, _ := coding.NewRuntime(coding.RuntimeOptions{Services: svcs})
 //	sess, _ := rt.New(coding.SessionStartOptions{Model: model})
-func BuildModel(spec string, svcs *Services) (*ai.Model, error) {
+func BuildModel(spec string, svcs *AgentSessionServices) (*ai.Model, error) {
 	return buildModel(spec, svcs, "")
 }
 
 // buildModel builds spec's model; a non-empty apiKey replaces the resolved
 // credential, as upstream providers use options.apiKey when one is given.
-func buildModel(spec string, svcs *Services, apiKey string) (*ai.Model, error) {
+func buildModel(spec string, svcs *AgentSessionServices, apiKey string) (*ai.Model, error) {
 	if svcs == nil {
 		return nil, fmt.Errorf("coding: BuildModel: Services is required")
 	}
@@ -86,11 +85,11 @@ func buildModel(spec string, svcs *Services, apiKey string) (*ai.Model, error) {
 // the provider's default-model fallback) and shares this construction with
 // BuildModel, so both paths branch on the API kind and carry the catalog base
 // URL and credentials the same way.
-func BuildModelFromEntry(providerID, modelID string, entry icodingagent.ModelEntry, svcs *Services) (*ai.Model, error) {
+func BuildModelFromEntry(providerID, modelID string, entry icodingagent.ModelEntry, svcs *AgentSessionServices) (*ai.Model, error) {
 	return buildModelFromEntry(providerID, modelID, entry, svcs, "")
 }
 
-func buildModelFromEntry(providerID, modelID string, entry icodingagent.ModelEntry, svcs *Services, apiKey string) (*ai.Model, error) {
+func buildModelFromEntry(providerID, modelID string, entry icodingagent.ModelEntry, svcs *AgentSessionServices, apiKey string) (*ai.Model, error) {
 	if svcs == nil {
 		return nil, fmt.Errorf("coding: BuildModelFromEntry: Services is required")
 	}
@@ -104,18 +103,8 @@ func buildModelFromEntry(providerID, modelID string, entry icodingagent.ModelEnt
 	if err != nil {
 		return nil, err
 	}
-	provider = newProviderAttributionProvider(provider, providerID, entry.BaseURL, func() bool {
-		return svcs.settings != nil && svcs.settings.IsInstallTelemetryEnabled()
-	}, entry.Headers)
+	provider = newRequestOptionsProvider(provider, providerID, entry.Headers)
 
-	if providerID == "test-faux" {
-		entry.Input = []string{"text", "image"}
-		entry.ContextWindow = ai.TestFauxContextWindow
-		entry.MaxTokens = ai.TestFauxMaxTokens
-		entry.DisplayName = "Test Faux"
-		entry.API = "test-faux"
-		entry.BaseURL = "http://localhost:0"
-	}
 	return modelFromEntry(entry, provider), nil
 }
 
@@ -128,37 +117,42 @@ func modelFromEntry(entry icodingagent.ModelEntry, provider ai.Provider) *ai.Mod
 	if entry.Input != nil {
 		input = append([]string{}, entry.Input...)
 	}
-	return &ai.Model{
-		ID:          entry.ModelID,
-		DisplayName: displayName,
-		Provider:    provider,
-		Capabilities: ai.ModelCapabilities{
-			MaxThinking:         thinkingMaxLevelForEntry(entry),
-			SupportsImages:      slices.Contains(entry.Input, "image"),
-			SupportsToolUse:     true,
-			ContextWindow:       entry.ContextWindow,
-			MaxOutputTokens:     entry.MaxTokens,
-			InputCostPer1M:      entry.InputCost,
-			OutputCostPer1M:     entry.OutputCost,
-			CacheReadCostPer1M:  entry.CacheReadCost,
-			CacheWriteCostPer1M: entry.CacheWriteCost,
-			CostTiers:           append([]ai.CostTier(nil), entry.CostTiers...),
-		},
-		Input:                         input,
-		InputLimits:                   entry.InputLimits.Clone(),
-		ThinkingLevelMap:              cloneThinkingLevelMap(entry.ThinkingLevelMap),
-		SamplingParams:                maps.Clone(entry.SamplingParams),
-		SamplingParamsByThinkingLevel: cloneSamplingParamsByThinkingLevel(entry.SamplingParamsByThinkingLevel),
-		PromptCache:                   maps.Clone(entry.PromptCache),
-		ProviderMeta: ai.ProviderMetadata{
-			ProviderID: entry.ProviderID,
-			API:        ai.API(entry.API),
-			BaseURL:    entry.BaseURL,
-			Headers:    cloneStringMap(entry.ModelHeaders),
-			Compat:     cloneCompat(entry.Compat),
-			Reasoning:  entry.Reasoning,
-		},
+	// A built-in model starts from its catalog entry, so it keeps the entry's member order when it is encoded.
+	model := &ai.Model{}
+	if entry.CatalogRecord != "" {
+		model = (&ai.GeneratedModel{Record: entry.CatalogRecord}).ToModel()
 	}
+	model.Type = entry.Type
+	model.ID = entry.ModelID
+	model.DisplayName = displayName
+	model.Provider = provider
+	model.Capabilities = ai.ModelCapabilities{
+		MaxThinking:         thinkingMaxLevelForEntry(entry),
+		SupportsImages:      slices.Contains(entry.Input, "image"),
+		SupportsToolUse:     true,
+		ContextWindow:       entry.ContextWindow,
+		MaxOutputTokens:     entry.MaxTokens,
+		InputCostPer1M:      entry.InputCost,
+		OutputCostPer1M:     entry.OutputCost,
+		CacheReadCostPer1M:  entry.CacheReadCost,
+		CacheWriteCostPer1M: entry.CacheWriteCost,
+		CostTiers:           slices.Clone(entry.CostTiers),
+	}
+	model.Input = input
+	model.InputLimits = entry.InputLimits.Clone()
+	model.ThinkingLevelMap = cloneThinkingLevelMap(entry.ThinkingLevelMap)
+	model.SamplingParams = maps.Clone(entry.SamplingParams)
+	model.SamplingParamsByThinkingLevel = cloneSamplingParamsByThinkingLevel(entry.SamplingParamsByThinkingLevel)
+	model.PromptCache = maps.Clone(entry.PromptCache)
+	model.ProviderMeta = ai.ProviderMetadata{
+		ProviderID: entry.ProviderID,
+		API:        ai.API(entry.API),
+		BaseURL:    entry.BaseURL,
+		Headers:    cloneStringMap(entry.ModelHeaders),
+		Compat:     cloneCompat(entry.Compat),
+		Reasoning:  entry.Reasoning,
+	}
+	return model
 }
 
 func thinkingMaxLevelForEntry(entry icodingagent.ModelEntry) ai.ThinkingLevel {
@@ -166,25 +160,38 @@ func thinkingMaxLevelForEntry(entry icodingagent.ModelEntry) ai.ThinkingLevel {
 		return ""
 	}
 	model := &ai.Model{
-		Capabilities:     ai.ModelCapabilities{MaxThinking: ai.ThinkingHigh},
+		Capabilities:     ai.ModelCapabilities{MaxThinking: ai.ThinkingLevelHigh},
 		ThinkingLevelMap: entry.ThinkingLevelMap,
 	}
 	levels := ai.GetSupportedThinkingLevels(model)
-	return levels[len(levels)-1]
+	return ai.ThinkingLevel(levels[len(levels)-1])
 }
 
+// lookupGeneratedModel matches only providerID's own catalog, so a model of a provider that is not registered yet
+// never takes another provider's API and base URL.
 func lookupGeneratedModel(providerID, modelID string) (*ai.GeneratedModel, bool) {
-	if generated, ok := ai.LookupModel(providerID + "/" + modelID); ok {
-		return generated, true
-	}
-	return ai.LookupModel(modelID)
+	return ai.LookupModelExact(providerID + "/" + modelID)
 }
 
 // buildProviderForEntry builds the provider for entry. A non-empty explicitKey
 // is upstream's options.apiKey: it owns the request ahead of runtime, stored,
 // configured, and environment credentials. The Anthropic leaf retains the selected model's reasoning metadata and limits instead of resolving it again from the built-in catalog.
 // apiLeaf selects the pi-ai API implementation for apiKind itself. Pi's compat stream() and streamSimple() dispatch on model.api through the api registry and never consult the provider an extension registered under the model's provider id (packages/ai/src/compat.ts:278-293, stream at 252), so an API leaf must not re-enter that provider's streamSimple callback.
-func buildProviderForEntry(providerID, modelID string, apiKind ai.API, entry icodingagent.ModelEntry, svcs *Services, explicitKey string, resolvedAuth, apiLeaf bool) (ai.Provider, error) {
+// A built-in provider whose upstream constructor wraps its API streams (cloudflareStreams for the Cloudflare providers) has the wrapper
+// applied, as when its models run through the registered provider. An API leaf is the API implementation alone, which sends the model's
+// endpoint as given (openai-completions.ts:795), so it is not wrapped.
+func buildProviderForEntry(providerID, modelID string, apiKind ai.API, entry icodingagent.ModelEntry, svcs *AgentSessionServices, explicitKey string, resolvedAuth, apiLeaf bool) (ai.Provider, error) {
+	provider, err := buildLeafProviderForEntry(providerID, modelID, apiKind, entry, svcs, explicitKey, resolvedAuth, apiLeaf)
+	if err != nil {
+		return nil, err
+	}
+	if apiLeaf {
+		return provider, nil
+	}
+	return ai.WrapBuiltinProvider(providerID, provider), nil
+}
+
+func buildLeafProviderForEntry(providerID, modelID string, apiKind ai.API, entry icodingagent.ModelEntry, svcs *AgentSessionServices, explicitKey string, resolvedAuth, apiLeaf bool) (ai.Provider, error) {
 	apiKey := entry.APIKey
 	if explicitKey != "" {
 		apiKey = explicitKey
@@ -196,10 +203,12 @@ func buildProviderForEntry(providerID, modelID string, apiKind ai.API, entry ico
 		if os.Getenv("PIG_TEST_FAUX") != "1" {
 			return nil, fmt.Errorf("coding: BuildModel: test-faux is disabled")
 		}
-		return svcs.testFauxProvider(), nil
+		return svcs.testFauxProvider()
 	}
 
-	if providerID == "github-copilot" && !resolvedAuth {
+	// Pi uses a built-in provider own stream only for an api that provider catalog lists (compat.ts:236-239 getBuiltinProviderForModel); any other api, no api at all included, goes to the
+	// API registry, which refuses a name nothing is registered for (compat.ts:244-247). A provider with a stream of its own (the Copilot provider sends every api name it is given as chat completions) is built only for such an api.
+	if !resolvedAuth && ai.ProviderHasOwnStreamFor(providerID, apiKind) {
 		// Re-open auth from disk so this provider has its own handle
 		// (the Services-owned handle is shared and may be in-use).
 		auth, err := ai.NewAuthStorage(filepath.Join(svcs.AgentDir(), "auth.json"))
@@ -290,6 +299,7 @@ func buildProviderForEntry(providerID, modelID string, apiKind ai.API, entry ico
 			APIKey:        apiKey,
 			Model:         modelID,
 			ProviderID:    providerID,
+			ExtraHeaders:  extraHeaders,
 		}), nil
 	case ai.APIAzureOpenAIResponses:
 		return ai.NewAzureOpenAIResponsesProvider(ai.AzureOpenAIResponsesConfig{
@@ -303,6 +313,7 @@ func buildProviderForEntry(providerID, modelID string, apiKind ai.API, entry ico
 			SamplingParams:                maps.Clone(entry.SamplingParams),
 			SamplingParamsByThinkingLevel: cloneSamplingParamsByThinkingLevel(entry.SamplingParamsByThinkingLevel),
 			Env:                           ai.ProviderEnv(maps.Clone(entry.Env)),
+			IsReasoning:                   entry.Reasoning,
 		}), nil
 	case ai.APIAnthropicMessages:
 		config := ai.AnthropicConfig{
@@ -329,7 +340,8 @@ func buildProviderForEntry(providerID, modelID string, apiKind ai.API, entry ico
 			ThinkingLevelMap: cloneThinkingLevelMap(entry.ThinkingLevelMap),
 		}), nil
 	case ai.APIGoogleVertex:
-		return ai.NewGoogleVertexProvider(ai.GoogleVertexConfig{
+		// pig additive (D92): the google-vertex, bedrock-converse-stream and mistral-conversations constructors report a stripped API (strip.apis).
+		return ai.NewGoogleVertexAPIProvider(ai.GoogleVertexConfig{
 			ModelMetadata:    modelFromEntry(entry, nil),
 			BaseURL:          baseURL,
 			APIKey:           apiKey,
@@ -337,7 +349,7 @@ func buildProviderForEntry(providerID, modelID string, apiKind ai.API, entry ico
 			ProviderID:       providerID,
 			Headers:          extraHeaders,
 			ThinkingLevelMap: cloneThinkingLevelMap(entry.ThinkingLevelMap),
-		}), nil
+		})
 	case ai.APIBedrockConverseStream:
 		// Amazon Bedrock uses AWS native auth (SigV4 via the default
 		// credentials chain, or AWS_BEARER_TOKEN_BEDROCK). No API key
@@ -345,9 +357,9 @@ func buildProviderForEntry(providerID, modelID string, apiKind ai.API, entry ico
 		// AWS SDK resolves credentials at request time. The selected model
 		// carries the configured provider identity (bedrock-converse-stream.ts:130
 		// reports model.provider), the base URL and the limits.
-		return ai.NewBedrockProviderWithModel(*modelFromEntry(entry, nil)), nil
+		return ai.NewOptionalAPIProvider(ai.APIBedrockConverseStream, *modelFromEntry(entry, nil))
 	case ai.APIMistralConversations:
-		return ai.NewMistralProvider(ai.MistralConfig{
+		return ai.NewMistralAPIProvider(ai.MistralConfig{
 			ModelMetadata: modelFromEntry(entry, nil),
 			BaseURL:       baseURL,
 			APIKey:        apiKey,
@@ -355,7 +367,7 @@ func buildProviderForEntry(providerID, modelID string, apiKind ai.API, entry ico
 			ProviderID:    providerID,
 			ExtraHeaders:  extraHeaders,
 			Reasoning:     entry.Reasoning,
-		}), nil
+		})
 	case ai.APIPiMessages:
 		config := ai.PiMessagesConfig{
 			ModelMetadata: modelFromEntry(entry, nil),
@@ -373,20 +385,11 @@ func buildProviderForEntry(providerID, modelID string, apiKind ai.API, entry ico
 		}
 		return ai.NewPiMessagesProvider(config), nil
 	default:
-		return ai.NewOpenAIProvider(ai.OpenAIConfig{
-			ModelMetadata:                 modelFromEntry(entry, nil),
-			BaseURL:                       baseURL,
-			APIKey:                        apiKey,
-			GetAPIKey:                     resolveAPIKey,
-			Model:                         modelID,
-			ProviderID:                    providerID,
-			ExtraHeaders:                  extraHeaders,
-			SamplingParams:                maps.Clone(entry.SamplingParams),
-			SamplingParamsByThinkingLevel: cloneSamplingParamsByThinkingLevel(entry.SamplingParamsByThinkingLevel),
-			Env:                           ai.ProviderEnv(maps.Clone(entry.Env)),
-			Compat:                        cloneCompat(entry.Compat),
-			Insecure:                      entry.Insecure,
-		}), nil
+		// An api no case above implements is looked up in the API registry when the request starts, and a name nothing is registered for is refused there.
+		// upstream: provider-composer.ts:603-604 (composeModelProvider's streamWith: getApiProvider(model.api), then the throw)
+		provider := &apiRegistryProvider{id: providerID, api: apiKind, apiKey: resolveAPIKey}
+		provider.model = modelFromEntry(entry, provider)
+		return provider, nil
 	}
 }
 
@@ -405,7 +408,7 @@ func acceptsRequestAPIKey(apiKind ai.API) bool {
 // key (--api-key) first, then a stored auth.json credential, then fallback,
 // the configured or environment key. Mirrors upstream resolveProviderAuth
 // over RuntimeCredentials.
-func requestAPIKey(svcs *Services, providerID, fallback string) func(context.Context) (string, error) {
+func requestAPIKey(svcs *AgentSessionServices, providerID, fallback string) func(context.Context) (string, error) {
 	stored := storedAPIKey(filepath.Join(svcs.AgentDir(), "auth.json"), providerID, fallback)
 	registry := svcs.Registry().ModelRegistry
 	return func(ctx context.Context) (string, error) {
@@ -524,98 +527,34 @@ func (registry *ModelRegistry) Complete(ctx context.Context, model *ai.Model, re
 	return registry.runtime.Complete(ctx, model, request, options)
 }
 
-const (
-	openRouterHost        = "openrouter.ai"
-	nvidiaNIMHost         = "integrate.api.nvidia.com"
-	cloudflareAPIHost     = "api.cloudflare.com"
-	cloudflareGatewayHost = "gateway.ai.cloudflare.com"
-	openCodeHost          = "opencode.ai"
-)
-
-// mergeProviderAttributionHeaders mirrors upstream mergeProviderAttributionHeaders
-// (provider-attribution.ts): getSessionHeaders' OpenCode pair is unconditional,
-// getDefaultAttributionHeaders' OpenRouter/NVIDIA/Cloudflare headers are gated
-// on telemetryEnabled.
-// pig divergence (D26): every value below substitutes pig branding for
-// upstream's pi-branded literal (host/gate matching is unchanged).
-func mergeProviderAttributionHeaders(providerID, baseURL string, telemetryEnabled bool, sessionID string, headerSources ...ai.ProviderHeaders) ai.ProviderHeaders {
-	headers := make(ai.ProviderHeaders)
-	set := func(name, value string) { headers[name] = new(value) }
-	if sessionID != "" && (providerID == "opencode" || providerID == "opencode-go" || matchesProviderHost(baseURL, openCodeHost)) {
-		set("x-opencode-session", sessionID)
-		set("x-opencode-client", pigidentity.OpenCodeClient)
-	}
-
-	if telemetryEnabled {
-		switch {
-		// Upstream isOpenRouterModel matches the base URL by substring, not host.
-		case providerID == "openrouter" || strings.Contains(baseURL, openRouterHost):
-			set("HTTP-Referer", pigidentity.OpenRouterReferer)
-			set("X-OpenRouter-Title", pigidentity.OpenRouterTitle)
-			set("X-OpenRouter-Categories", pigidentity.OpenRouterCategories)
-		case providerID == "nvidia" || matchesProviderHost(baseURL, nvidiaNIMHost):
-			set("X-BILLING-INVOKE-ORIGIN", pigidentity.NvidiaBillingOrigin)
-		case providerID == "cloudflare-workers-ai" || providerID == "cloudflare-ai-gateway" || matchesProviderHost(baseURL, cloudflareAPIHost) || matchesProviderHost(baseURL, cloudflareGatewayHost):
-			set("User-Agent", pigidentity.CloudflareUserAgent)
-		}
-	}
-
-	for _, source := range headerSources {
-		for name, value := range source {
-			for existing := range headers {
-				if strings.EqualFold(existing, name) {
-					delete(headers, existing)
-				}
-			}
-			headers[name] = value
-		}
-	}
-	if len(headers) == 0 {
-		return nil
-	}
-	return headers
-}
-
-func matchesProviderHost(baseURL, expectedHost string) bool {
-	parsed, err := url.Parse(baseURL)
-	// WHATWG URL.hostname normalizes DNS host case before comparison.
-	return err == nil && strings.ToLower(parsed.Hostname()) == expectedHost
-}
-
-type providerAttributionProvider struct {
+// requestOptionsProvider wraps a built provider with the request preparation ModelRuntime applies to a registry-built provider.
+type requestOptionsProvider struct {
 	ai.Provider
-	providerID       string
-	baseURL          string
-	telemetryEnabled func() bool
-	configured       map[string]string
+	providerID string
+	configured map[string]string
 }
 
-func newProviderAttributionProvider(provider ai.Provider, providerID, baseURL string, telemetryEnabled func() bool, configured map[string]string) ai.Provider {
-	return &providerAttributionProvider{
-		Provider:         provider,
-		providerID:       providerID,
-		baseURL:          baseURL,
-		telemetryEnabled: telemetryEnabled,
-		configured:       maps.Clone(configured),
-	}
+func newRequestOptionsProvider(provider ai.Provider, providerID string, configured map[string]string) ai.Provider {
+	return &requestOptionsProvider{Provider: provider, providerID: providerID, configured: maps.Clone(configured)}
 }
 
-// pig divergence (D74): a direct pi-ai call that the extension bridge streams through BuildModel also receives these attribution headers; Pi's pi-ai sends only its User-Agent there (packages/ai/src/api/openai-completions.ts:760).
-func (provider *providerAttributionProvider) Stream(ctx context.Context, transcript ai.TranscriptContext, options ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
-	telemetryEnabled := false
-	if provider.telemetryEnabled != nil {
-		telemetryEnabled = provider.telemetryEnabled()
+// SimpleStreamOptions prepares the request options of a simple stream the way ModelRuntime.StreamSimple does for a registry-built provider (start): an omitted reasoning level sends the API's native thinking off, and the output budget stays within the room the context window leaves (simple-options.ts buildBaseOptions). A provider of extension-registered stream callbacks or a native provider prepares its own options.
+func (provider *requestOptionsProvider) SimpleStreamOptions(model *ai.Model, transcript ai.TranscriptContext, options ai.StreamOptions) ai.StreamOptions {
+	switch provider.Provider.(type) {
+	case *registeredStreamProvider, *nativeModelProvider:
+		return options
 	}
-	options.Headers = mergeProviderAttributionHeaders(
-		provider.providerID,
-		provider.baseURL,
-		telemetryEnabled,
-		options.SessionID,
-		ai.ProviderHeadersFromStrings(provider.configured),
-		options.Headers,
-	)
-	// Upstream transformHeaders merges the attribution headers and then runs
-	// the request's header transform (before_provider_headers) on the result.
+	ai.ApplyOmittedReasoning(model, &options)
+	options.MaxTokens = ai.ClampMaxTokensToContext(model, transcript, cmp.Or(options.MaxTokens, model.Capabilities.MaxOutputTokens))
+	return options
+}
+
+// Stream merges the configured headers under the request's and runs the request's header transform (before_provider_headers) on the result, as ModelRuntime applyAuth does for a registry-built provider. The built-in OpenCode providers add the session header below both, as providers/opencode.ts withOpenCodeSessionHeader does; a direct pi-ai call that the extension bridge streams through BuildModel carries no attribution, as under Pi.
+func (provider *requestOptionsProvider) Stream(ctx context.Context, transcript ai.TranscriptContext, options ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
+	configured := ai.ProviderHeadersFromStrings(provider.configured)
+	configured = ai.MergeProviderHeaders(ai.GetOpenCodeSessionHeaders(ai.ClientIdentityTarget{Provider: provider.providerID}, options.SessionID), configured)
+	options.Headers = ai.MergeProviderHeaders(configured, options.Headers)
+	// The request's header transform (before_provider_headers) runs on the merged headers.
 	if options.TransformHeaders != nil {
 		if options.Headers == nil {
 			options.Headers = ai.ProviderHeaders{}
@@ -628,4 +567,9 @@ func (provider *providerAttributionProvider) Stream(ctx context.Context, transcr
 		options.TransformHeaders = nil
 	}
 	return provider.Provider.Stream(ctx, transcript, options)
+}
+
+// withOpenCodeSessionHeaders adds OpenCode's per-conversation routing header, including for custom providers pointing at OpenCode, below the auth and request headers and before the request's header transform sees them (model-runtime.ts applyAuth getOpenCodeSessionHeaders).
+func withOpenCodeSessionHeaders(providerID, baseURL, sessionID string, headers ai.ProviderHeaders) ai.ProviderHeaders {
+	return ai.MergeProviderHeaders(ai.GetOpenCodeSessionHeaders(ai.ClientIdentityTarget{Provider: providerID, BaseURL: baseURL}, sessionID), headers)
 }

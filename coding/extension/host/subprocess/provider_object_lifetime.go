@@ -25,37 +25,76 @@ func (h *Host) releaseProviderCallbacks(providers []*nativeProviderProxy) {
 
 // transferProviderOwnershipLocked makes me, delivering on conn, the only extension whose teardown removes provider id. Pi keeps one effective registration per provider (model-runtime.ts:744-766), so a later registrant's acceptance supersedes the earlier owner's cleanup claim.
 // A bridged OAuth login moves with the claim: Pi's merged root keeps the earlier oauth until the latest registrant replaces or unregisters the root (model-runtime.ts:753-797).
-// The returned function tells superseded owners in other processes that their local root is no longer the provider's; call it after releasing h.mu and before the registration completes.
-func (h *Host) transferProviderOwnershipLocked(me *managedExt, conn *Conn, id string) func() {
-	var superseded []*Conn
+// The returned function tells superseded owners in other processes that their local root is no longer the provider's; call it after releasing h.mu and before the registration completes. retired are the Provider object owners retireNativeProviderLocked already removed, which it tells too.
+func (h *Host) transferProviderOwnershipLocked(me *managedExt, conn *Conn, id string, retired ...*Conn) func() {
+	notify, _ := h.claimProviderOwnershipLocked(me, conn, id, retired...)
+	return notify
+}
+
+// providerOwner is what an extension held of one provider before another extension claimed it.
+type providerOwner struct {
+	ext           *managedExt
+	hadProvider   bool
+	hadOAuthLogin bool
+}
+
+// claimProviderOwnershipLocked is transferProviderOwnershipLocked that also returns undo, which gives the claim back: the previous owners hold the provider again and me holds what it held before. It does nothing once another extension claimed the provider after this claim (me no longer holds it), because that claim already took it from me and stands. Call undo with h.mu held.
+func (h *Host) claimProviderOwnershipLocked(me *managedExt, conn *Conn, id string, retired ...*Conn) (notify func(), undo func()) {
+	superseded := slices.Clone(retired)
 	inheritedOAuth := false
+	var previous []providerOwner
 	for _, other := range h.exts {
 		if other == me {
 			continue
 		}
-		if otherConn := other.connection(); slices.Contains(other.providerNames, id) && otherConn != nil && otherConn != conn {
+		hadProvider, hadOAuth := slices.Contains(other.providerNames, id), slices.Contains(other.oauthProviderNames, id)
+		if hadProvider || hadOAuth {
+			previous = append(previous, providerOwner{ext: other, hadProvider: hadProvider, hadOAuthLogin: hadOAuth})
+		}
+		if otherConn := other.connection(); hadProvider && otherConn != nil && otherConn != conn && !slices.Contains(superseded, otherConn) {
 			superseded = append(superseded, otherConn)
 		}
-		inheritedOAuth = inheritedOAuth || slices.Contains(other.oauthProviderNames, id)
+		inheritedOAuth = inheritedOAuth || hadOAuth
 		other.providerNames = slices.DeleteFunc(other.providerNames, func(name string) bool { return name == id })
 		other.oauthProviderNames = slices.DeleteFunc(other.oauthProviderNames, func(name string) bool { return name == id })
 	}
-	if !slices.Contains(me.providerNames, id) {
+	ownedBefore, oauthBefore := slices.Contains(me.providerNames, id), slices.Contains(me.oauthProviderNames, id)
+	if !ownedBefore {
 		me.providerNames = append(me.providerNames, id)
 	}
-	if inheritedOAuth && !slices.Contains(me.oauthProviderNames, id) {
+	if inheritedOAuth && !oauthBefore {
 		me.oauthProviderNames = append(me.oauthProviderNames, id)
 	}
-	return func() {
+	notify = func() {
 		args, _ := json.Marshal(map[string]string{"name": id})
 		for _, target := range superseded {
 			_ = target.Send(&Envelope{Type: MsgNotify, Notify: &NotifyPayload{Method: notifyProviderSuperseded, Args: args}})
 		}
 	}
+	undo = func() {
+		if !slices.Contains(me.providerNames, id) {
+			return
+		}
+		if !ownedBefore {
+			me.providerNames = slices.DeleteFunc(me.providerNames, func(name string) bool { return name == id })
+		}
+		if !oauthBefore {
+			me.oauthProviderNames = slices.DeleteFunc(me.oauthProviderNames, func(name string) bool { return name == id })
+		}
+		for _, owner := range previous {
+			if owner.hadProvider && !slices.Contains(owner.ext.providerNames, id) {
+				owner.ext.providerNames = append(owner.ext.providerNames, id)
+			}
+			if owner.hadOAuthLogin && !slices.Contains(owner.ext.oauthProviderNames, id) {
+				owner.ext.oauthProviderNames = append(owner.ext.oauthProviderNames, id)
+			}
+		}
+	}
+	return notify, undo
 }
 
-func (h *Host) retireNativeProviderLocked(id string) []*nativeProviderProxy {
-	var released []*nativeProviderProxy
+// retireNativeProviderLocked removes provider id's Provider object, whoever registered it, with its owner's claim to id. It returns the objects to release and the connection of each owner in another process than conn, me's connection, whose local registration the caller's registration or unregistration supersedes (Pi keeps one effective registration per provider, model-runtime.ts:884-888); pass them to transferProviderOwnershipLocked.
+func (h *Host) retireNativeProviderLocked(me *managedExt, conn *Conn, id string) (released []*nativeProviderProxy, superseded []*Conn) {
 	for _, providers := range h.nativeProviders {
 		provider := providers[id]
 		if provider == nil {
@@ -63,6 +102,9 @@ func (h *Host) retireNativeProviderLocked(id string) []*nativeProviderProxy {
 		}
 		delete(providers, id)
 		provider.registered = false
+		if ownerConn := provider.owner.connection(); provider.owner != me && ownerConn != nil && ownerConn != conn && slices.Contains(provider.owner.providerNames, id) {
+			superseded = append(superseded, ownerConn)
+		}
 		provider.owner.providerNames = slices.DeleteFunc(provider.owner.providerNames, func(name string) bool { return name == id })
 		provider.owner.oauthProviderNames = slices.DeleteFunc(provider.owner.oauthProviderNames, func(name string) bool { return name == id })
 		if provider.declaration.OAuth != nil {
@@ -70,7 +112,7 @@ func (h *Host) retireNativeProviderLocked(id string) []*nativeProviderProxy {
 		}
 		released = append(released, h.collectProviderObjectLocked(provider)...)
 	}
-	return released
+	return released, superseded
 }
 func (h *Host) handleProviderReference(conn *Conn, call *CallPayload) (*CallResultPayload, error) {
 	var args struct {

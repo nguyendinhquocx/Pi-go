@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -61,6 +63,14 @@ type goPackage struct {
 	jsonTags map[string][]string // struct type → JSON names (embedded structs flattened later)
 	embeds   map[string][]string // struct type → embedded struct type names
 	literals map[string]bool     // every string literal and JSON tag name
+	aliases  []goAlias           // type X = pkg.Y declarations whose target lives in another package
+}
+
+// goAlias is a type alias of a type declared in another package of this module; its wire fields are the target's.
+type goAlias struct {
+	name       string // the alias, as declared in this package
+	importPath string
+	target     string
 }
 
 func parseGoPackage(dir string) (*goPackage, error) {
@@ -75,6 +85,7 @@ func parseGoPackage(dir string) (*goPackage, error) {
 		if err != nil {
 			return nil, err
 		}
+		imports := importNames(file)
 		for _, decl := range file.Decls {
 			switch d := decl.(type) {
 			case *ast.FuncDecl:
@@ -98,6 +109,10 @@ func parseGoPackage(dir string) (*goPackage, error) {
 							pkg.symbols[name] = true
 						}
 						switch t := s.Type.(type) {
+						case *ast.SelectorExpr:
+							if pkgIdent, ok := t.X.(*ast.Ident); ok && s.Assign.IsValid() && imports[pkgIdent.Name] != "" {
+								pkg.aliases = append(pkg.aliases, goAlias{name: name, importPath: imports[pkgIdent.Name], target: t.Sel.Name})
+							}
 						case *ast.StructType:
 							for _, field := range t.Fields.List {
 								tag := jsonTag(field)
@@ -162,6 +177,44 @@ func parseGoPackage(dir string) (*goPackage, error) {
 		})
 	}
 	return pkg, nil
+}
+
+// importNames maps a file's import names to their paths; an unnamed import is named by its last path element.
+func importNames(file *ast.File) map[string]string {
+	out := map[string]string{}
+	for _, imp := range file.Imports {
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			continue
+		}
+		name := path[strings.LastIndex(path, "/")+1:]
+		if imp.Name != nil {
+			name = imp.Name.Name
+		}
+		out[name] = path
+	}
+	return out
+}
+
+// resolveAliases gives every alias of a type declared in another package of this module that type's JSON fields: a type alias is the
+// same type, so a field decoded through the alias is a field of the target (coding/extension re-exports markdowntransform.MarkdownTransformContext).
+func (p *goPackage) resolveAliases(root, modulePath string) error {
+	for _, a := range p.aliases {
+		rel, ok := strings.CutPrefix(a.importPath, modulePath+"/")
+		if !ok {
+			continue
+		}
+		target, err := parseGoPackage(filepath.Join(root, rel))
+		if err != nil {
+			return fmt.Errorf("%s: %w", rel, err)
+		}
+		p.jsonTags[a.name] = append(p.jsonTags[a.name], target.jsonTags[a.target]...)
+		p.embeds[a.name] = append(p.embeds[a.name], target.embeds[a.target]...)
+		for _, tag := range target.jsonTags[a.target] {
+			p.literals[tag] = true
+		}
+	}
+	return nil
 }
 
 // jsonFields returns a struct's JSON field names, with embedded structs'
@@ -287,6 +340,15 @@ func scanCode(src string, lang string) string {
 			i = j
 			lastSig = '/'
 			continue
+		case lang == "rust" && c == 'r' && (i == 0 || !isIdentByte(b[i-1])) && rawStringEnd(b, i) > 0:
+			// A raw string has no escapes: r"\?\" ends at its second quote.
+			end := rawStringEnd(b, i)
+			for k := i; k < end; k++ {
+				blank(k)
+			}
+			i = end - 1
+			lastSig = '"'
+			continue
 		case c == '"' || (c == '\'' && lang == "js") || (c == '`' && lang == "js"):
 			quote := c
 			j := i + 1
@@ -388,16 +450,22 @@ type blockScope struct {
 // ── Rust ────────────────────────────────────────────────────────────────────
 
 var (
-	rsImplRE   = regexp.MustCompile(`^\s*impl(?:\s*<[^{]*?>)?\s+(?:[A-Za-z_:<>, ]+?\s+for\s+)?([A-Za-z_][A-Za-z0-9_]*)`)
-	rsItemRE   = regexp.MustCompile(`^\s*pub(?:\([a-z]+\))?\s+(?:async\s+)?(fn|struct|enum|trait|mod|type|const|static)\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	rsTraitFn  = regexp.MustCompile(`^\s*(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	rsFieldRE  = regexp.MustCompile(`^\s*pub\s+([a-z_][A-Za-z0-9_]*)\s*:`)
-	rsVariant  = regexp.MustCompile(`^\s*([A-Z][A-Za-z0-9_]*)\s*[,({]?`)
-	rsReexport = regexp.MustCompile(`pub use [^;]*;`)
+	rsImplRE = regexp.MustCompile(`^\s*impl(?:\s*<[^{]*?>)?\s+(?:[A-Za-z_:<>, ]+?\s+for\s+)?([A-Za-z_][A-Za-z0-9_]*)`)
+	rsItemRE = regexp.MustCompile(`^\s*pub(?:\([a-z]+\))?\s+(?:async\s+)?(fn|struct|enum|trait|mod|type|const|static)\s+([A-Za-z_][A-Za-z0-9_]*)`)
+	// rsPublicItemRE is rsItemRE without restricted visibility: pub(crate) and pub(super) items are not API.
+	rsPublicItemRE = regexp.MustCompile(`^\s*pub\s+(?:async\s+)?(fn|struct|enum|trait|mod|type|const|static)\s+([A-Za-z_][A-Za-z0-9_]*)`)
+	rsTraitFn      = regexp.MustCompile(`^\s*(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)`)
+	rsFieldRE      = regexp.MustCompile(`^\s*pub\s+([a-z_][A-Za-z0-9_]*)\s*:`)
+	rsVariant      = regexp.MustCompile(`^\s*([A-Z][A-Za-z0-9_]*)\s*[,({]?`)
+	rsReexport     = regexp.MustCompile(`pub use [^;]*;`)
 )
 
-func parseRust(dir string) (symbolSet, error) {
-	files, err := sourceFiles(dir, ".rs", nil)
+func parseRust(dir string) (symbolSet, error) { return parseRustItems(dir, rsItemRE, nil) }
+
+// parseRustItems reads a directory's Rust declarations with the given item
+// pattern; only (when not nil) limits it to those files.
+func parseRustItems(dir string, itemRE *regexp.Regexp, only func(path string) bool) (symbolSet, error) {
+	files, err := sourceFiles(dir, ".rs", func(name string) bool { return only != nil && !only(name) })
 	if err != nil {
 		return nil, err
 	}
@@ -422,7 +490,7 @@ func parseRust(dir string) (symbolSet, error) {
 			if direct {
 				switch top.kind {
 				case "impl", "trait":
-					if sm := rsItemRE.FindStringSubmatch(line); sm != nil && sm[1] == "fn" {
+					if sm := itemRE.FindStringSubmatch(line); sm != nil && sm[1] == "fn" {
 						syms[top.name+"::"+sm[2]] = true
 					} else if sm := rsTraitFn.FindStringSubmatch(line); sm != nil && top.kind == "trait" {
 						syms[top.name+"::"+sm[1]] = true
@@ -436,7 +504,7 @@ func parseRust(dir string) (symbolSet, error) {
 						syms[top.name+"::"+sm[1]] = true
 					}
 				default:
-					if sm := rsItemRE.FindStringSubmatch(line); sm != nil {
+					if sm := itemRE.FindStringSubmatch(line); sm != nil {
 						name := sm[2]
 						if top.kind == "mod" {
 							name = top.name + "::" + name
@@ -448,7 +516,7 @@ func parseRust(dir string) (symbolSet, error) {
 			// Decide what the next '{' on this line opens.
 			if sm := rsImplRE.FindStringSubmatch(line); sm != nil && direct {
 				pending = blockScope{name: sm[1], kind: "impl"}
-			} else if sm := rsItemRE.FindStringSubmatch(line); sm != nil && direct {
+			} else if sm := itemRE.FindStringSubmatch(line); sm != nil && direct {
 				switch sm[1] {
 				case "struct", "enum", "trait", "mod":
 					pending = blockScope{name: sm[2], kind: sm[1]}
@@ -486,7 +554,8 @@ var (
 	pyAssignRE = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]*)?=`)
 	pyMemberRE = regexp.MustCompile(`^    (?:(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*)\s*:)`)
 	pySelfRE   = regexp.MustCompile(`^\s+self\.([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]*)?=`)
-	pySigEndRE = regexp.MustCompile(`\)\s*(?:->[^:]*)?:\s*(?:#.*)?$`)
+	// A signature ends at its colon, or at a one-line elided body (`: ...`).
+	pySigEndRE = regexp.MustCompile(`\)\s*(?:->[^:]*)?:\s*(?:\.\.\.\s*)?(?:#.*)?$`)
 	pyParamRE  = regexp.MustCompile(`^\*{0,2}([A-Za-z_][A-Za-z0-9_]*)`)
 )
 
@@ -525,6 +594,11 @@ func parsePython(dir string) (symbolSet, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parsePythonFiles(files)
+}
+
+// parsePythonFiles reads the classes, members and parameters of files.
+func parsePythonFiles(files []string) (symbolSet, error) {
 	syms := symbolSet{}
 	for _, f := range files {
 		raw, err := os.ReadFile(f)
@@ -605,4 +679,119 @@ func parseNodeReads(files []string) (symbolSet, error) {
 		}
 	}
 	return syms, nil
+}
+
+func isIdentByte(c byte) bool {
+	return c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+// rawStringEnd returns the index just past the Rust raw string literal that
+// starts at b[i] (`r"..."`, `r#"..."#`, any number of hashes), or 0 when b[i]
+// does not start one.
+func rawStringEnd(b []byte, i int) int {
+	j := i + 1
+	hashes := 0
+	for j < len(b) && b[j] == '#' {
+		hashes++
+		j++
+	}
+	if j >= len(b) || b[j] != '"' {
+		return 0
+	}
+	closing := append([]byte{'"'}, bytes.Repeat([]byte{'#'}, hashes)...)
+	if k := bytes.Index(b[j+1:], closing); k >= 0 {
+		return j + 1 + k + len(closing)
+	}
+	return len(b)
+}
+
+// ── Lisp ─────────────────────────────────────────────────────────────────────
+
+// lispExportRE reads one exported symbol of the pig package: #:name inside the defpackage's (:export ...) clause.
+var lispExportRE = regexp.MustCompile(`#:([a-z0-9*+][a-z0-9*+-]*)`)
+
+// lispConstructorRE finds a defstruct's keyword constructor: its lambda list starts at the end of the match.
+var lispConstructorRE = regexp.MustCompile(`\(:constructor\s+([a-z0-9][a-z0-9*+-]*)\s+\(`)
+
+// lispDefunRE finds a function definition: its lambda list starts at the end of the match.
+var lispDefunRE = regexp.MustCompile(`(?m)^\(def(?:un|macro)\s+([a-z0-9][a-z0-9*+-]*)\s+\(`)
+
+// parseLisp returns the symbols the pig package exports, each as pig:<name>: the SDK's whole public surface. The package
+// file is src/package.lisp; for an exported function the parameters of its lambda list (keyword, optional and required)
+// are also symbols, pig:<name>(<parameter>), the form the surface map names a parameter of a member.
+func parseLisp(packageFile string) (symbolSet, error) {
+	data, err := os.ReadFile(packageFile)
+	if err != nil {
+		return nil, err
+	}
+	text := string(data)
+	start := strings.Index(text, "(:export")
+	if start < 0 {
+		return nil, fmt.Errorf("%s has no (:export clause", packageFile)
+	}
+	set := symbolSet{}
+	for _, m := range lispExportRE.FindAllStringSubmatch(text[start:], -1) {
+		set["pig:"+m[1]] = true
+	}
+	files, err := filepath.Glob(filepath.Join(filepath.Dir(packageFile), "*.lisp"))
+	if err != nil {
+		return nil, err
+	}
+	for _, file := range files {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			return nil, err
+		}
+		source := string(src)
+		for _, re := range []*regexp.Regexp{lispDefunRE, lispConstructorRE} {
+			for _, loc := range re.FindAllStringSubmatchIndex(source, -1) {
+				name := source[loc[2]:loc[3]]
+				if !set["pig:"+name] {
+					continue
+				}
+				for _, param := range lispLambdaParams(source[loc[1]-1:]) {
+					set["pig:"+name+"("+param+")"] = true
+				}
+			}
+		}
+	}
+	return set, nil
+}
+
+// lispLambdaParams returns the parameter names of the lambda list that opens at the start of text.
+func lispLambdaParams(text string) []string {
+	var params []string
+	depth, i := 0, 0
+	for ; i < len(text); i++ {
+		c := text[i]
+		switch {
+		case c == '(':
+			depth++
+			if depth == 2 {
+				// (name default): the name is the first symbol of the element
+				j := i + 1
+				for j < len(text) && !strings.ContainsRune(" \t\n()", rune(text[j])) {
+					j++
+				}
+				if name := text[i+1 : j]; name != "" && !strings.HasPrefix(name, "&") {
+					params = append(params, strings.ToLower(name))
+				}
+			}
+		case c == ')':
+			depth--
+			if depth == 0 {
+				return params
+			}
+		case depth == 1 && !strings.ContainsRune(" \t\n", rune(c)):
+			j := i
+			for j < len(text) && !strings.ContainsRune(" \t\n()", rune(text[j])) {
+				j++
+			}
+			if name := text[i:j]; !strings.HasPrefix(name, "&") {
+				params = append(params, strings.ToLower(name))
+			}
+			i = j - 1
+		}
+	}
+	return params
 }

@@ -1,5 +1,7 @@
 package tools
 
+// pi: packages/coding-agent/src/core/tools/bash.ts
+
 import (
 	"context"
 	"encoding/json"
@@ -68,6 +70,7 @@ func assertFullBashOutput(t *testing.T, path string) {
 	}
 }
 
+// Pi: packages/coding-agent/src/core/tools/powershell.ts:35 (BashOperations.exec).
 func TestToolsBashPort(t *testing.T) {
 	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:486
 	t.Run("should execute simple commands", func(t *testing.T) {
@@ -220,7 +223,7 @@ func TestToolsBashPort(t *testing.T) {
 			t.Fatal(result.Text())
 		}
 		fmt.Printf("BASH_DELEGATE %s\n", result.Text())
-		_, err := NewLocalBashOperations(settings, "").Exec(t.Context(), "echo test", t.TempDir(), BashOperationsExecOptions{})
+		_, err := CreateLocalBashOperations(&LocalBashOptions{ShellPath: settings.path}).Exec(t.Context(), "echo test", t.TempDir(), BashOperationsExecOptions{})
 		if err == nil || err.Error() != "Custom shell path not found: /custom/bash" {
 			t.Fatalf("local resolution = %v", err)
 		}
@@ -287,6 +290,15 @@ func TestToolsBashPort(t *testing.T) {
 	})
 	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:724
 	t.Run("should not count a trailing newline as an extra truncated bash output line", func(t *testing.T) {
+		// The notice ends with the random temp path of the full-output log; Pi asserts the whole output lacks "4001", which fails whenever that
+		// path happens to contain it. Put 4001 in the directory on purpose so the check below must exclude the path to pass.
+		spoofed := filepath.Join(t.TempDir(), "dir-4001")
+		if err := os.MkdirAll(spoofed, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
+			t.Setenv(key, spoofed)
+		}
 		tool := &BashTool{CWD: t.TempDir(), Operations: portBashOperations(func(_ context.Context, _, _ string, opts BashOperationsExecOptions) (BashOperationsResult, error) {
 			for i := 1; i <= 4000; i++ {
 				opts.OnData(fmt.Appendf(nil, "line-%04d\n", i))
@@ -302,7 +314,22 @@ func TestToolsBashPort(t *testing.T) {
 		if details.Truncation.TotalLines != 4000 || details.Truncation.OutputLines != 2000 {
 			t.Fatal(details.Truncation)
 		}
-		requireTextParts(t, result, []string{"line-2001", "line-4000", "[Showing lines 2001-4000 of 4000. Full output: "}, []string{"4001"})
+		if !strings.HasPrefix(details.FullOutputPath, spoofed) {
+			t.Fatalf("full output path %q is not under %q", details.FullOutputPath, spoofed)
+		}
+		// Only the path is excluded; every other character of the output is still checked.
+		text := strings.ReplaceAll(result.Text(), details.FullOutputPath, "<full-output-path>")
+		if result.IsError {
+			t.Fatalf("tool failed: %s", result.Text())
+		}
+		for _, want := range []string{"line-2001", "line-4000", "[Showing lines 2001-4000 of 4000. Full output: <full-output-path>]"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("output %q lacks %q", text, want)
+			}
+		}
+		if strings.Contains(text, "4001") {
+			t.Errorf("output %q contains %q", text, "4001")
+		}
 	})
 	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:746
 	t.Run("should decode UTF-8 characters split across output chunks", func(t *testing.T) {
@@ -321,14 +348,14 @@ func TestToolsBashPort(t *testing.T) {
 	t.Run("should expose local bash operations for extension reuse", func(t *testing.T) {
 		t.Setenv("TEST_LOCAL_BASH_OPS", "from-local-ops")
 		var output strings.Builder
-		result, err := NewLocalBashOperations(nil, "").Exec(t.Context(), "echo $TEST_LOCAL_BASH_OPS", t.TempDir(), BashOperationsExecOptions{OnData: func(data []byte) { output.Write(data) }, Env: os.Environ()})
+		result, err := CreateLocalBashOperations(nil).Exec(t.Context(), "echo $TEST_LOCAL_BASH_OPS", t.TempDir(), BashOperationsExecOptions{OnData: func(data []byte) { output.Write(data) }, Env: os.Environ()})
 		if err != nil || result.ExitCode == nil || *result.ExitCode != 0 || strings.TrimSpace(output.String()) != "from-local-ops" {
 			t.Fatalf("result %+v, %v, output %q", result, err, output.String())
 		}
 	})
 	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:775
 	t.Run("should preserve executeBash sanitization when using local bash operations", func(t *testing.T) {
-		result, err := ExecuteBashWithOperations(t.Context(), `printf '\033[31mred\033[0m\r\n'`, t.TempDir(), NewLocalBashOperations(nil, ""), BashExecOptions{})
+		result, err := ExecuteBashWithOperations(t.Context(), `printf '\033[31mred\033[0m\r\n'`, t.TempDir(), CreateLocalBashOperations(nil), BashExecOptions{})
 		if err != nil || result.ExitCode == nil || *result.ExitCode != 0 || result.Output != "red\n" {
 			t.Fatalf("result %+v, %v", result, err)
 		}
@@ -347,7 +374,7 @@ func TestToolsBashPort(t *testing.T) {
 	})
 	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:809
 	t.Run("executeBash should persist full output when truncation happens by line count only", func(t *testing.T) {
-		result, err := ExecuteBashWithOperations(t.Context(), "seq 3000", t.TempDir(), NewLocalBashOperations(nil, ""), BashExecOptions{})
+		result, err := ExecuteBashWithOperations(t.Context(), "seq 3000", t.TempDir(), CreateLocalBashOperations(nil), BashExecOptions{})
 		if err != nil || !result.Truncated {
 			t.Fatalf("result %+v, %v", result, err)
 		}

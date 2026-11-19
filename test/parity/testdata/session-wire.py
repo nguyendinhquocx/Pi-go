@@ -168,12 +168,24 @@ def signal_probe(binary, root, mode):
         server.server_close()
 
 
-def command_ready_fixture(root, env):
+def command_ready_fixture(root, env, busy=False):
+    """The extension's /wire-ready command writes the readiness marker.
+
+    With busy, it first starts a status ticker, so the session is still working when the probe acts; session_shutdown
+    stops it, because a tick after a graceful shutdown touches a disposed context and Pi would exit 1. An idle Pi
+    that loses its terminal has nothing left in its event loop: Node ends the stdin handle at EOF, drops the
+    unreferenced SIGHUP listener and exits 0 without touching the terminal. Pi exits 129 only when something
+    writes after the hangup (interactive-mode.ts emergencyTerminalExit on the write's EIO), so without a
+    ticker the outcome depends on whether a throttled render happens to be pending at that moment."""
     ready = root / "ready"
     env["WIRE_READY"] = str(ready)
+    if busy:
+        env["WIRE_BUSY"] = "1"
     extension = root / "ready.mjs"
     extension.write_text('import {writeFileSync} from "node:fs"; export default function(pi) {'
-                         'pi.registerCommand("wire-ready", {handler: async () => {'
+                         'let ticker; pi.on("session_shutdown", () => clearInterval(ticker));'
+                         'pi.registerCommand("wire-ready", {handler: async (_args, ctx) => {'
+                         'if (process.env.WIRE_BUSY) { let tick = 0; ticker = setInterval(() => ctx.ui.setStatus("wire", String(++tick)), 5); }'
                          'writeFileSync(process.env.WIRE_READY,"ready");}});}')
     return ready, extension
 
@@ -188,14 +200,29 @@ def wait_command_ready(master, proc, ready):
     return output
 
 
-def terminal_probe(binary, root, action):
+def terminal_probe(binary, root, case):
+    """A terminal that goes away (disconnect, disconnect-repo) or a live SIGHUP (live-hup) under an interactive session.
+
+    disconnect and live-hup keep the session working with a ticker (command_ready_fixture). disconnect-repo leaves it
+    idle in a git repository with the PTY as the session's controlling terminal, as a login terminal is: Pi's footer
+    watches .git/HEAD, so its event loop stays alive, the kernel's SIGHUP at the hangup runs its graceful shutdown,
+    and the shutdown's terminal writes meet EIO (interactive-mode.ts shutdown fromSignal, then emergencyTerminalExit):
+    129 without any pending render. Without a controlling terminal no SIGHUP arrives, and an idle Pi in a repository
+    stays alive until some write fails. In a plain directory an idle Pi has nothing left in its loop, so it can exit
+    0 before the handler runs (D186; D102 states the live-terminal half of this)."""
+    action = "live-hup" if case == "live-hup" else "disconnect"
     cwd, env, args = setup(root, "http://127.0.0.1:1/v1")
-    ready, extension = command_ready_fixture(root, env)
+    spawn = {}
+    if case == "disconnect-repo":
+        subprocess.run(["git", "init", "-q"], cwd=cwd, env=env, check=True)
+    ready, extension = command_ready_fixture(root, env, busy=case != "disconnect-repo")
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 35, 100, 0, 0))
+    if case == "disconnect-repo":
+        spawn["preexec_fn"] = lambda: fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
     try:
         with child([*binary, *args, "-e", str(extension), "/wire-ready"], cwd=cwd, env=env,
-                   stdin=slave, stdout=slave, stderr=slave) as proc:
+                   stdin=slave, stdout=slave, stderr=slave, **spawn) as proc:
             wait_command_ready(master, proc, ready)
             if action == "disconnect":
                 os.close(master)
@@ -211,7 +238,7 @@ def terminal_probe(binary, root, action):
                 else:
                     time.sleep(0.02)
             status = proc.wait()
-            emit({"case": action, "returncode": status})
+            emit({"case": case, "returncode": status})
             assert status == (129 if action == "disconnect" else 0), status
     finally:
         if master is not None:
@@ -259,10 +286,102 @@ def modal_shutdown_probe(binary, root):
             os.close(slave)
 
 
+
+SHUTDOWN_HANDLERS = {
+    "throwing": 'export default function (pi) { pi.on("session_shutdown", () => { throw new Error("shutdown boom"); }); }\n',
+    "slow": 'export default function (pi) { pi.on("session_shutdown", () => new Promise((resolve) => setTimeout(resolve, 1500))); }\n',
+}
+
+
+def tool_signal_probe(binary, root, sig, shutdown=None, mode="json"):
+    """SIGTERM/SIGHUP while a bash tool runs: what stdout, stderr, the session file and the provider saw afterwards.
+
+    With shutdown, an extension's session_shutdown handler throws at once or waits 1.5 s on a timer. Pi runs the
+    signal's disposal on its one event loop (print-mode.ts:50-63): a handler that throws ends it within microtasks,
+    before the killed tool's exit is seen, so the run stops at the tool; a handler that waits on a timer lets the loop
+    turn, so the killed tool settles, the run makes its second request (answered with text) and text mode prints that
+    answer before the process exits."""
+    tool_call = {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "wire-model", "choices": [{"index": 0,
+        "delta": {"role": "assistant", "content": None, "tool_calls": [{"index": 0, "id": "call_wire", "type": "function",
+        "function": {"name": "bash", "arguments": json.dumps({"command": ": > tool-started; sleep 37.25"})}}]}, "finish_reason": None}]}
+    if shutdown is None:
+        tool_call["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] = json.dumps({"command": "sleep 37.25"})
+    finish = {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "wire-model", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+    text_reply = {"id": "c2", "object": "chat.completion.chunk", "created": 1, "model": "wire-model", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "done"}, "finish_reason": None}]}
+    text_stop = {"id": "c2", "object": "chat.completion.chunk", "created": 1, "model": "wire-model", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+    requests = []
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            requests.append(self.path)
+            chunks = (tool_call, finish)
+            if shutdown is not None and len(requests) > 1:
+                chunks = (text_reply, text_stop)
+            body = "".join("data: %s\n\n" % json.dumps(chunk) for chunk in chunks) + "data: [DONE]\n\n"
+            data = body.encode()
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        def log_message(self, *_):
+            pass
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        cwd, env, args = setup(root, f"http://127.0.0.1:{server.server_port}/v1")
+        sessions = root / "sessions"
+        extension_args = []
+        if shutdown is not None:
+            extension = root / (shutdown + "-shutdown.ts")
+            extension.write_text(SHUTDOWN_HANDLERS[shutdown])
+            extension_args = ["-e", str(extension)]
+        started = Path(cwd) / "tool-started"
+        with open(root / "stdout", "wb") as stdout, open(root / "stderr", "wb") as stderr, child(
+                [*binary, *args, *extension_args, "--session-dir", str(sessions), "--mode", mode, "run it"], cwd=cwd, env=env,
+                stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr) as proc:
+            deadline = time.monotonic() + 15
+            if shutdown is None:
+                while b'"type":"tool_execution_update"' not in (root / "stdout").read_bytes():
+                    assert time.monotonic() < deadline, "the bash tool did not start"
+                    time.sleep(0.02)
+            else:
+                while not started.exists():
+                    assert time.monotonic() < deadline, "the bash tool did not start"
+                    time.sleep(0.02)
+                # The shell has run its first command; let it reach sleep, the child the signal's kill ends.
+                time.sleep(0.2)
+            proc.send_signal(sig)
+            status = proc.wait(timeout=10)
+        stdout_text = (root / "stdout").read_text()
+        records = []
+        for path in sorted(sessions.glob("*.jsonl")):
+            for line in path.read_text().splitlines():
+                entry = json.loads(line)
+                message = entry.get("message") or {}
+                records.append([entry["type"], message.get("role"), message.get("stopReason")])
+        result = {"returncode": status, "session": records, "requests": len(requests),
+                  "stderr": (root / "stderr").read_text().replace(str(root), "<root>")}
+        if mode == "json":
+            result["events"] = [json.loads(line)["type"] for line in stdout_text.splitlines() if line.strip()]
+        else:
+            result["stdout"] = stdout_text
+        if shutdown is None:
+            result["case"] = "json-tool-" + signal.Signals(sig).name
+        else:
+            result["case"] = f"{mode}-tool-{shutdown}-shutdown"
+        emit(result)
+    finally:
+        server.shutdown()
+        worker.join()
+        server.server_close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bin", default=os.environ.get("PIG_PARITY_PIG_BIN"))
-    parser.add_argument("--case", choices=["session", "print", "json", "disconnect", "live-hup", "modal-shutdown"], required=True, action="append")
+    parser.add_argument("--case", choices=["session", "print", "json", "json-tool-term", "json-tool-hup", "json-tool-throwing-shutdown", "json-tool-slow-shutdown", "text-tool-throwing-shutdown", "text-tool-slow-shutdown", "disconnect", "disconnect-repo", "live-hup", "modal-shutdown"], required=True, action="append")
     options = parser.parse_args()
     if not options.bin:
         parser.error("--bin or PIG_PARITY_PIG_BIN is required")
@@ -279,8 +398,15 @@ def main():
                 session_probe(binary, root)
             elif case in ("print", "json"):
                 signal_probe(binary, root, case)
+            elif case == "json-tool-term":
+                tool_signal_probe(binary, root, signal.SIGTERM)
+            elif case == "json-tool-hup":
+                tool_signal_probe(binary, root, signal.SIGHUP)
             elif case == "modal-shutdown":
                 modal_shutdown_probe(binary, root)
+            elif case.endswith("-shutdown"):
+                mode, _, shutdown, _ = case.split("-")
+                tool_signal_probe(binary, root, signal.SIGTERM, shutdown=shutdown, mode=mode)
             else:
                 terminal_probe(binary, root, case)
 

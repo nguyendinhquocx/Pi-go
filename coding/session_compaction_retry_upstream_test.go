@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
 // SPDX-FileCopyrightText: Copyright (c) 2025 Mario Zechner
 // SPDX-License-Identifier: MIT
 
@@ -42,6 +41,7 @@ func retryCompactionSession(t *testing.T, enabled bool, maxRetries, delay int, s
 	return s, p
 }
 
+// Pi: packages/coding-agent/src/core/agent-session.ts:1382 (Session.abortCompaction).
 func TestCompactionRetriesTransientStreamDropUpstream(t *testing.T) {
 	for _, tc := range []struct {
 		name                       string
@@ -62,7 +62,8 @@ func TestCompactionRetriesTransientStreamDropUpstream(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, p := retryCompactionSession(t, tc.enabled, tc.max, 0, tc.script)
-			result, err := s.CompactResult(t.Context(), "")
+			_ = s.Events()
+			result, err := s.Compact(t.Context(), "")
 			if tc.failure != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.failure) {
 					t.Fatalf("error=%v", err)
@@ -98,6 +99,7 @@ func TestCompactionRetriesTransientStreamDropUpstream(t *testing.T) {
 	// .upstream/v0.87.1/packages/coding-agent/test/suite/regressions/6647-compaction-retries-transient-stream-drop.test.ts:169
 	t.Run("aborts an in-flight retry backoff via abortCompaction", func(t *testing.T) {
 		s, p := retryCompactionSession(t, true, 5, 30000, []string{"terminated", "terminated", "terminated"})
+		_ = s.Events()
 		started := make(chan struct{}, 1)
 		s.Subscribe(func(event agent.AgentEvent) {
 			if _, ok := event.(agent.SummarizationRetryScheduledEvent); ok {
@@ -105,7 +107,7 @@ func TestCompactionRetriesTransientStreamDropUpstream(t *testing.T) {
 			}
 		})
 		done := make(chan error, 1)
-		go func() { done <- s.Compact(t.Context(), "") }()
+		go func() { _, err := s.Compact(t.Context(), ""); done <- err }()
 		select {
 		case <-started:
 		case err := <-done:

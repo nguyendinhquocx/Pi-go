@@ -27,13 +27,36 @@ func registryProbeView() codingagent.ExtensionSessionView {
 	return codingagent.ExtensionSessionView{Session: s, CWD: "/conformance/registry", SessionDir: "relative/sessions"}
 }
 
+func registryProbeModel(id, provider string) map[string]any {
+	return map[string]any{"id": id, "modelId": id, "provider": provider, "name": strings.ToUpper(id), "displayName": strings.ToUpper(id), "api": "openai-completions"}
+}
+
+// registryProbeState is a registry whose answers differ by provider, so a getAvailable that returns getAll, a provider whose
+// configured flag defaults to true, or an availableModelIds list that is ignored all give an answer other than Pi's:
+//   - registry-probe: configured and using OAuth, availableModelIds ["a"], models a and b: only a is available;
+//   - registry-open: configured, no availableModelIds, not OAuth, model c: available;
+//   - registry-off: configured false, model d: never available;
+//   - registry-none: configured, using OAuth, availableModelIds [], model e: configured but nothing available.
+//
+// Pi's getAvailable is the models of the providers that have configured auth, narrowed to a provider's availableModelIds
+// (model-runtime.ts getAvailableSnapshot, model-registry.ts:68-70); hasConfiguredAuth and isUsingOAuth read the model's provider
+// (model-registry.ts:85-87, 206-208).
 func registryProbeState() map[string]any {
 	return map[string]any{
-		"models":    []any{map[string]any{"id": "model", "modelId": "model", "provider": "registry-probe", "name": "Model", "displayName": "Model", "api": "openai-completions"}},
-		"providers": map[string]any{"registry-probe": map[string]any{"name": "Registry Probe", "configured": true, "usingOAuth": true, "authStatus": map[string]any{"configured": true, "source": "stored"}}},
-		"error":     "probe-error",
+		"models": []any{
+			registryProbeModel("a", "registry-probe"), registryProbeModel("b", "registry-probe"),
+			registryProbeModel("c", "registry-open"), registryProbeModel("d", "registry-off"), registryProbeModel("e", "registry-none"),
+		},
+		"providers": map[string]any{
+			"registry-probe": map[string]any{"name": "Registry Probe", "configured": true, "usingOAuth": true, "availableModelIds": []any{"a"}, "authStatus": map[string]any{"configured": true, "source": "stored"}},
+			"registry-open":  map[string]any{"name": "Registry Open", "configured": true, "usingOAuth": false, "authStatus": map[string]any{"configured": true, "source": "env"}},
+			"registry-off":   map[string]any{"name": "Registry Off", "configured": false, "usingOAuth": false, "authStatus": map[string]any{"configured": false}},
+			"registry-none":  map[string]any{"name": "Registry None", "configured": true, "usingOAuth": true, "availableModelIds": []any{}, "authStatus": map[string]any{"configured": true, "source": "stored"}},
+		},
+		"error": "probe-error",
 	}
 }
+
 func registryProbeAuth() map[string]any {
 	return map[string]any{"auth": map[string]any{"apiKey": "probe-key"}, "source": "stored credential"}
 }
@@ -46,8 +69,8 @@ func registryProbeRefresh() map[string]any {
 func registryProbeReference() (map[string]any, error) {
 	view := registryProbeView()
 	out := map[string]any{}
-	for key, method := range map[string]string{"cwd": "getCwd", "dir": "getSessionDir", "id": "getSessionId", "name": "getSessionName", "leaf": "getLeafId", "entry": "getEntry", "missing": "getEntry", "label": "getLabel", "entries": "getEntries", "branch": "getBranch", "tree": "getTree", "contextEntries": "buildContextEntries", "projection": "buildSessionProjection"} {
-		args := json.RawMessage(`{"id":"one","fromId":"one"}`)
+	for key, method := range map[string]string{"cwd": "getCwd", "dir": "getSessionDir", "id": "getSessionId", "name": "getSessionName", "leaf": "getLeafId", "entry": "getEntry", "missing": "getEntry", "label": "getLabel", "entries": "getEntries", "branch": "getBranch", "tree": "getTree", "contextEntries": "buildContextEntries", "projection": "buildSessionProjection", "persisted": "isPersisted", "usesDefaultDir": "usesDefaultSessionDir", "children": "getChildren", "sessionContext": "buildSessionContext"} {
+		args := json.RawMessage(`{"id":"one","fromId":"one","parentId":"one"}`)
 		if key == "missing" {
 			args = json.RawMessage(`{"id":"missing"}`)
 		}
@@ -59,7 +82,10 @@ func registryProbeReference() (map[string]any, error) {
 	}
 	state := registryProbeState()
 	out["models"] = state["models"]
-	out["available"] = state["models"]
+	// Not derived from the state's filter: Pi's answer is the models of a provider with configured auth, narrowed to its availableModelIds,
+	// so a (registry-probe lists only a) and c (registry-open lists no restriction); b is outside the list, d has no auth, e lists none.
+	models := state["models"].([]any)
+	out["available"] = []any{models[0], models[2]}
 	out["status"] = map[string]any{"configured": true, "source": "stored"}
 	out["display"] = "Registry Probe"
 	out["error"] = "probe-error"
@@ -99,13 +125,13 @@ func TestRegistrySessionFacadesAcrossSDKs(t *testing.T) {
 			if h.bridge != nil {
 				view := registryProbeView()
 				path := filepath.Join(t.TempDir(), "session.jsonl")
-				header, err := json.Marshal(view.Session.Header())
+				header, err := json.Marshal(view.Session.GetHeader())
 				if err != nil {
 					t.Fatal(err)
 				}
 				data := header
 				data = append(data, '\n')
-				for _, entry := range view.Session.Entries() {
+				for _, entry := range view.Session.GetEntries() {
 					data = append(data, entry.Raw()...)
 					data = append(data, '\n')
 				}
@@ -122,7 +148,7 @@ func TestRegistrySessionFacadesAcrossSDKs(t *testing.T) {
 				b.SetHostAction("getSessionFile", func() string { return path })
 				b.SetHostAction("getLeafID", func() string { return "two" })
 				b.SetHostAction("getEntriesPage", func(cursor, _ int) ([]json.RawMessage, int, bool, string) {
-					entries := view.Session.Entries()
+					entries := view.Session.GetEntries()
 					if cursor < 0 || cursor > len(entries) {
 						cursor = 0
 					}
@@ -135,6 +161,7 @@ func TestRegistrySessionFacadesAcrossSDKs(t *testing.T) {
 				b.ForgetProviderRegistration("conformance-oauth")
 				b.ForgetProviderRegistration("conformance-oauth-object")
 				b.ForgetProviderRegistration("conformance-oauth-large")
+				b.ForgetProviderRegistration("conformance-oauth-callbacks")
 				b.SetHostAction("getModelRegistryState", registryProbeState)
 				b.SetHostAction("getProviderAuth", func(_ context.Context, provider string) (map[string]any, error) {
 					if provider == "missing" {

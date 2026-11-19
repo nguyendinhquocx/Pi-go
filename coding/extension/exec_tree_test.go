@@ -11,12 +11,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/internal/childwait"
 	"github.com/MichaelKinsy/PiG/internal/testbudget"
 )
 
@@ -38,8 +39,8 @@ import (
 // exit sees a dead descendant and fails.
 const holderLifetime = 15 * time.Second
 
-// lateWriterTicks is the number of ticks the late writer emits after the leader
-// exits: 15 x 20 ms is three times the idle grace.
+// lateWriterTicks is the number of POST ticks the late writer emits after the
+// leader exits.
 const lateWriterTicks = 15
 
 // treeHelpers are the child modes of TestExecHelperProcess that this file
@@ -67,8 +68,8 @@ var treeHelpers = map[string]func(args []string){
 	},
 	// bg-late PIDFILE ADDR: start a descendant that writes after this process
 	// exits, as in earendil-works/pi#5303, and print HEAD and exit only once the
-	// descendant reports that it has written its first tick, so that it is
-	// already ticking when the exit happens, however long the system takes to
+	// descendant reports that it has written PRE, so that the descendant is
+	// already running when the exit happens, however long the system takes to
 	// start it.
 	"bg-late": func(args []string) {
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -86,17 +87,24 @@ var treeHelpers = map[string]func(args []string){
 			panic(err)
 		}
 		_, _ = os.Stdout.WriteString("HEAD\n")
+		if _, err := leader.Write([]byte{'\n'}); err != nil {
+			panic(err)
+		}
+		// Exit only once the descendant has read that byte: a socket that the
+		// exit closes abortively would discard it unread.
+		if _, err := io.ReadFull(leader, make([]byte, 1)); err != nil {
+			panic(err)
+		}
 		// The descendant reads the end of leader as this process's exit: the
 		// process ends with it and the operating system closes leader.
 		defer runtime.KeepAlive(leader)
 	},
-	// late-writer ADDR LEADER: connect to the leader, write the first PRE
-	// tick, report it to the leader with one byte, and then write a PRE tick
-	// every 20 ms, so the output never idles for the grace however late the
-	// scheduler delivers the leader's exit. Once the leader's connection ends,
-	// which is its exit, write EOF and then 15 POST ticks, one chunk shorter
-	// than the grace apart and longer than the grace in total, then hold the
-	// pipes.
+	// late-writer ADDR LEADER: connect to the leader, write PRE, report it to
+	// the leader with one byte, wait for the leader's byte that says HEAD is
+	// written, and acknowledge it with one byte. Once the leader's connection
+	// ends, which is its exit, write one of lateTicks for each byte that the
+	// test sends over ADDR, which it does after ExecCommand has read the tick
+	// before, then hold the pipes.
 	"late-writer": func(args []string) {
 		conn := dial(args[0])
 		leader := dial(args[1])
@@ -104,22 +112,18 @@ var treeHelpers = map[string]func(args []string){
 		if _, err := leader.Write([]byte{'\n'}); err != nil {
 			panic(err)
 		}
-		var exited atomic.Bool
-		go func() {
-			_, _ = io.Copy(io.Discard, leader)
-			exited.Store(true)
-		}()
-		for {
-			time.Sleep(20 * time.Millisecond)
-			if exited.Load() {
-				break
-			}
-			_, _ = os.Stdout.WriteString("PRE\n")
+		if _, err := io.ReadFull(leader, make([]byte, 1)); err != nil {
+			panic(err)
 		}
-		_, _ = os.Stdout.WriteString("EOF\n")
-		for i := 1; i <= lateWriterTicks; i++ {
-			_, _ = os.Stdout.WriteString("POST" + strconv.Itoa(i) + "\n")
-			time.Sleep(20 * time.Millisecond)
+		if _, err := leader.Write([]byte{'\n'}); err != nil {
+			panic(err)
+		}
+		_, _ = io.Copy(io.Discard, leader)
+		for _, tick := range lateTicks() {
+			if _, err := io.ReadFull(conn, make([]byte, 1)); err != nil {
+				panic(err)
+			}
+			_, _ = os.Stdout.WriteString(tick)
 		}
 		echoUntilClosed(conn)
 	},
@@ -304,79 +308,190 @@ func TestExecCommandTermHandlerRuns(t *testing.T) {
 	assertAlive(t, conn)
 }
 
-// Pi sends SIGTERM once. Node sets proc.killed when the signal is delivered, so
-// the SIGKILL that its timer sends `if (!proc.killed)` never follows: a child
-// that ignores SIGTERM keeps the call waiting. Windows has no signals.
-func TestExecCommandDoesNotEscalateAfterSIGTERM(t *testing.T) {
+// core/exec.ts killProcess sends SIGTERM and, forceKillDelay later, SIGKILL if the child has not exited (c466a359: it checks exitCode and signalCode, because
+// proc.killed only says that a signal was sent). A child that ignores SIGTERM therefore keeps the call waiting for five seconds and is then ended. Windows has
+// no signals: the kill ends the child at once.
+func TestExecCommandForceKillsAChildThatIgnoresSIGTERMAfterFiveSeconds(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Node's kill ends a Windows child without a handler")
 	}
+	for _, how := range []string{"context", "signal", "timeout"} {
+		t.Run(how, func(t *testing.T) {
+			f := newTreeFixture(t)
+			command, args := helper(t, "stubborn", f.listener.Addr().String())
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			opts := &extension.ExecOptions{}
+			if how == "signal" {
+				signal, abort := context.WithCancel(t.Context())
+				defer abort()
+				opts.Signal = signal
+				cancel = abort
+			}
+			if how == "timeout" {
+				opts.Timeout = 100
+			}
+			done := make(chan execOutcome, 1)
+			go func() {
+				result, err := extension.ExecCommand(ctx, t.TempDir(), command, args, opts)
+				done <- execOutcome{result, err}
+			}()
+			conn := f.accept(t)
+			var killedAt time.Time
+			if how == "timeout" {
+				killedAt = time.Now().Add(100 * time.Millisecond)
+			} else {
+				killedAt = time.Now()
+				cancel()
+			}
+			// The child reports the delivery of SIGTERM, then keeps running until SIGKILL ends it.
+			reader := bufio.NewReader(conn)
+			if line, err := reader.ReadString('\n'); err != nil || line != "term\n" {
+				t.Fatalf("the child did not report SIGTERM: %q, %v", line, err)
+			}
+			select {
+			case outcome := <-done:
+				t.Fatalf("ExecCommand returned while the child ignores SIGTERM and the force kill is not due: %+v", outcome)
+			case <-time.After(500 * time.Millisecond):
+			}
+			outcome := <-done
+			// A lower bound only: a loaded host can make the call take longer, never shorter.
+			if elapsed := time.Since(killedAt); elapsed < extension.ExecForceKillDelay-100*time.Millisecond {
+				t.Fatalf("ExecCommand returned %v after the kill, before the %v force-kill delay", elapsed, extension.ExecForceKillDelay)
+			}
+			if outcome.err != nil {
+				t.Fatal(outcome.err)
+			}
+			if want := (extension.ExecResult{Killed: true}); outcome.result != want {
+				t.Fatalf("result = %+v, want %+v", outcome.result, want)
+			}
+		})
+	}
+}
+
+// lateTicks are the ticks the late writer writes after the leader exits: EOF,
+// then lateWriterTicks POST ticks.
+func lateTicks() []string {
+	ticks := []string{"EOF\n"}
+	for i := 1; i <= lateWriterTicks; i++ {
+		ticks = append(ticks, "POST"+strconv.Itoa(i)+"\n")
+	}
+	return ticks
+}
+
+// lateDrain is the clock and the tap of one ExecCommand call whose descendant
+// writes after the leader exits. The call measures the post-exit grace with
+// expired, which only the test fires, and reports each chunk of stdout that
+// its readers have consumed, so the test lets the descendant write the next
+// tick only once the readers have the one before. It also reports that the
+// call has begun to drain the pipes, which is after the leader exited.
+type lateDrain struct {
+	expired   chan time.Time
+	draining  chan struct{}
+	progress  chan struct{}
+	drainOnce sync.Once
+
+	mu   sync.Mutex
+	seen strings.Builder
+}
+
+func newLateDrain() *lateDrain {
+	return &lateDrain{expired: make(chan time.Time, 1), draining: make(chan struct{}), progress: make(chan struct{}, 1)}
+}
+
+func (d *lateDrain) hooks() *childwait.Hooks {
+	return &childwait.Hooks{
+		GraceTimer: func() childwait.IdleTimer {
+			d.drainOnce.Do(func() { close(d.draining) })
+			return childwait.IdleTimer{Expired: d.expired, Rearm: func() {}, Stop: func() {}}
+		},
+		AfterData: func(index int, chunk []byte) {
+			if index != 0 {
+				return
+			}
+			d.mu.Lock()
+			d.seen.Write(chunk)
+			d.mu.Unlock()
+			select {
+			case d.progress <- struct{}{}:
+			default:
+			}
+		},
+	}
+}
+
+func (d *lateDrain) stdoutSoFar() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.seen.String()
+}
+
+// earendil-works/pi#5303: output that a descendant writes after the child
+// exits, while it holds the pipe, reaches the caller. Pi's own regression test
+// (test/suite/regressions/5303-bash-output-truncation.test.ts) drives the
+// grace with virtual time "so host load cannot reorder a real subprocess's
+// writes and the grace timer". This test does the same: the real leader,
+// descendant and pipes stay, the test decides when the grace elapses, and it
+// does so only after the readers have consumed the last tick, which the
+// descendant writes only after the readers consumed the tick before. How a
+// grace that every chunk re-arms ends is tested without processes in
+// internal/childwait (TestWaitIdleRearmsOnEveryChunk).
+func TestExecCommandKeepsOutputWrittenAfterTheLeaderExits(t *testing.T) {
 	f := newTreeFixture(t)
-	command, args := helper(t, "stubborn", f.listener.Addr().String())
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
+	command, args := f.args(t, "bg-late")
+	drain := newLateDrain()
+	ctx := extension.WithExecDrainHooks(testbudget.Context(t), drain.hooks())
 	done := make(chan execOutcome, 1)
 	go func() {
 		result, err := extension.ExecCommand(ctx, t.TempDir(), command, args, nil)
 		done <- execOutcome{result, err}
 	}()
 	conn := f.accept(t)
-	cancel()
-	// The child reports the delivery of SIGTERM; a SIGKILL ends it instead.
-	reader := bufio.NewReader(conn)
-	if line, err := reader.ReadString('\n'); err != nil || line != "term\n" {
-		t.Fatalf("the child did not report SIGTERM: %q, %v", line, err)
-	}
+	// The descendant writes only once ExecCommand drains the pipes, which is
+	// after the leader exited. It holds the pipes until the test closes its
+	// connection and the grace has not elapsed, so nothing ends the call before
+	// the test fires the grace.
 	select {
-	case outcome := <-done:
-		t.Fatalf("ExecCommand returned while the child ignores SIGTERM: %+v", outcome)
-	default:
+	case <-drain.draining:
+	case early := <-done:
+		t.Fatalf("ExecCommand returned (%q, %v) without draining the pipes after the leader exited", early.result.Stdout, early.err)
+	case <-ctx.Done():
+		t.Fatal("the leader did not exit")
 	}
-	if _, err := conn.Write([]byte("exit\n")); err != nil {
-		t.Fatal(err)
+	var want strings.Builder
+	want.WriteString("PRE\nHEAD\n")
+	for _, tick := range lateTicks() {
+		if _, err := conn.Write([]byte{'\n'}); err != nil {
+			t.Fatal(err)
+		}
+		for !strings.HasSuffix(drain.stdoutSoFar(), tick) {
+			select {
+			case <-drain.progress:
+			case early := <-done:
+				t.Fatalf("ExecCommand returned (%q, %v) while a descendant still held the output pipes and the grace had not elapsed; it had read %q and had to read %q next", early.result.Stdout, early.err, drain.stdoutSoFar(), tick)
+			case <-ctx.Done():
+				t.Fatalf("the descendant's output after the leader exited did not arrive: read %q, want %q next", drain.stdoutSoFar(), tick)
+			}
+		}
+		want.WriteString(tick)
 	}
-	outcome := <-done
+	drain.expired <- time.Now()
+	var outcome execOutcome
+	select {
+	case outcome = <-done:
+	case <-ctx.Done():
+		t.Fatal("ExecCommand did not return after the grace elapsed")
+	}
 	if outcome.err != nil {
 		t.Fatal(outcome.err)
 	}
-	if want := (extension.ExecResult{Code: 7, Killed: true}); outcome.result != want {
-		t.Fatalf("result = %+v, want %+v", outcome.result, want)
+	if outcome.result.Stderr != "" || outcome.result.Code != 0 || outcome.result.Killed {
+		t.Fatalf("result = %+v", outcome.result)
 	}
-}
-
-// earendil-works/pi#5303: output that a descendant writes after the child exits,
-// each chunk arriving within the grace of the last, is not truncated.
-func TestExecCommandKeepsOutputWrittenAfterTheLeaderExits(t *testing.T) {
-	f := newTreeFixture(t)
-	command, args := f.args(t, "bg-late")
-	result, err := extension.ExecCommand(t.Context(), t.TempDir(), command, args, nil)
-	if err != nil {
-		t.Fatal(err)
+	// PRE is written before the leader prints HEAD and HEAD before the leader
+	// exits, so the pipe holds PRE, HEAD and then the ticks, in that order.
+	if outcome.result.Stdout != want.String() {
+		t.Fatalf("output = %q, want %q", outcome.result.Stdout, want.String())
 	}
-	if result.Stderr != "" || result.Code != 0 || result.Killed {
-		t.Fatalf("result = %+v", result)
-	}
-	// The leader prints HEAD only after the descendant's first PRE tick, and the
-	// descendant keeps ticking, with no order against the leader: a tick can land
-	// between the first PRE and HEAD (a slow Windows runner delays the leader's
-	// read) as well as after HEAD. Both write to the one pipe, so each reads in
-	// the order it was written. EOF is written only
-	// after the leader exited: it and every POST tick after it, which span more
-	// than the grace, must have arrived.
-	head, tail, found := strings.Cut(result.Stdout, "EOF\n")
-	if !found {
-		t.Fatalf("output written after the leader exited was lost: %q", result.Stdout)
-	}
-	before, after, found := strings.Cut(head, "HEAD\n")
-	if !found || before == "" || strings.ReplaceAll(before, "PRE\n", "") != "" || strings.ReplaceAll(after, "PRE\n", "") != "" {
-		t.Fatalf("output before the leader exited = %q, want PRE ticks around exactly one HEAD, starting with PRE", head)
-	}
-	var want strings.Builder
-	for i := 1; i <= lateWriterTicks; i++ {
-		want.WriteString("POST" + strconv.Itoa(i) + "\n")
-	}
-	if tail != want.String() {
-		t.Fatalf("output after the leader exited = %q, want %q", tail, want.String())
-	}
-	assertAlive(t, f.accept(t))
+	assertAlive(t, conn)
 }

@@ -64,7 +64,7 @@ func TestBuildModelStoredCredentialOwnsProvider(t *testing.T) {
 		},
 		{
 			name:     "stored subscription login outranks OPENAI_API_KEY",
-			provider: "openai-codex", model: "gpt-5.5",
+			provider: "openai-codex", model: "gpt-5.6-sol",
 			env:        map[string]string{"OPENAI_API_KEY": "env-key"},
 			stored:     &ai.Credential{Type: ai.CredentialOAuth, Refresh: "refresh", Access: codexTestAccessToken, Expires: time.Now().Add(time.Hour).UnixMilli()},
 			wantHeader: "Bearer " + codexTestAccessToken,
@@ -98,14 +98,14 @@ func TestBuildModelStoredCredentialOwnsProvider(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			services, err := NewServices(ServicesOptions{CWD: t.TempDir(), AgentDir: agentDir})
+			services, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: t.TempDir(), AgentDir: agentDir})
 			if err != nil {
 				t.Fatal(err)
 			}
 			if tc.runtimeKey != "" {
 				services.Registry().SetRuntimeAPIKey(tc.provider, tc.runtimeKey)
 			}
-			if !services.Registry().HasConfiguredAuth(tc.provider) {
+			if !services.Registry().ModelRegistry.HasConfiguredAuth(tc.provider) {
 				t.Fatalf("%s has no configured auth", tc.provider)
 			}
 			model := services.ModelRuntime().GetModel(tc.provider, tc.model)

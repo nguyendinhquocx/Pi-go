@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"fmt"
 	"strconv"
 
 	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
@@ -13,6 +12,7 @@ const cellSizeQuery = "\x1b[16t"
 
 var cellSizeResponsePattern = lazyregexp.New(`^\x1b\[6;(\d+);(\d+)t$`)
 
+// Ports packages/tui/src/tui.ts (queryCellSize, cell-size response handling).
 // QueryCellSize writes the cell-size query when the terminal supports images,
 // since only image rendering uses the cell size. Mirrors upstream tui.ts
 // queryCellSize, which start() sends after the terminal starts.
@@ -20,7 +20,7 @@ func (t *tuiBase) QueryCellSize() {
 	if GetCapabilities().Images == "" {
 		return
 	}
-	_, _ = fmt.Fprint(t.out, cellSizeQuery)
+	WriteToTerminal(t.out, cellSizeQuery)
 }
 
 // ConsumeCellSizeResponse reports whether data is a complete cell-size
@@ -34,8 +34,8 @@ func (t *tuiBase) ConsumeCellSizeResponse(data string) bool {
 	if match == nil {
 		return false
 	}
-	heightPx, heightErr := strconv.Atoi(match[1])
-	widthPx, widthErr := strconv.Atoi(match[2])
+	heightPx, heightErr := strconv.Atoi(match[1]) //portlint:allow numbers digits-only match; a size past int range (no terminal reports one) is consumed without setting it, where Pi's parseInt would store it
+	widthPx, widthErr := strconv.Atoi(match[2])   //portlint:allow numbers same digits-only match and int-range note as the height
 	if heightErr != nil || widthErr != nil || heightPx <= 0 || widthPx <= 0 {
 		return true
 	}

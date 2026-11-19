@@ -3,30 +3,64 @@
 package harness
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
-	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
+	chordctx "github.com/MichaelKinsy/PiG/chord/context"
 	"github.com/MichaelKinsy/PiG/chord/delta"
+	"github.com/MichaelKinsy/PiG/chord/output"
 	"github.com/MichaelKinsy/PiG/durable"
 	"github.com/MichaelKinsy/PiG/durable/env"
+	"github.com/MichaelKinsy/PiG/durable/session"
+	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
-// ToolTaskInput is the input of the built-in tool task: the tool-calling answer and the call to run.
+// ToolTaskKind is the `kind` of a ToolTaskInput and a ToolTaskResult (tool.ts): "model" for a call the model issued,
+// "nested" for one a running tool made through executeTool().
+type ToolTaskKind string
+
+const (
+	// ToolTaskModel is a call the model issued.
+	ToolTaskModel ToolTaskKind = "model"
+	// ToolTaskNested is a call a running tool made through executeTool().
+	ToolTaskNested ToolTaskKind = "nested"
+)
+
+// ToolTaskInput is the input of the built-in tool task (tool.ts ToolTaskInput): a model-issued call, read from its
+// assistant entry (Kind "model": Assistant, CallId), or a nested call a running tool made through executeTool(), whose
+// call the input carries because no entry holds it (Kind "nested": Parent, ParentCallId, Key, Call, Progress).
 type ToolTaskInput struct {
-	Assistant durable.EntryId `json:"assistant"`
-	CallId    string          `json:"callId"`
+	Kind         ToolTaskKind    `json:"kind"`
+	Assistant    durable.EntryId `json:"assistant,omitempty"`
+	CallId       string          `json:"callId,omitempty"`
+	Parent       durable.TaskId  `json:"parent,omitempty"`
+	ParentCallId string          `json:"parentCallId,omitempty"`
+	Key          string          `json:"key,omitempty"`
+	Call         *ai.ToolCall    `json:"call,omitempty"`
+	// Progress false commits no running output, details, or diagnostics to the slot; the result still gets them.
+	Progress *bool `json:"progress,omitempty"`
+	// Unoffered is a call to a tool its request did not offer: it settles tool_unavailable without resolving the name (Kind "model").
+	Unoffered bool `json:"unoffered,omitempty"`
 }
 
-// ToolTaskResult is the result of the built-in tool task: its result entry and the controls the result requested.
+// ToolTaskResult is the result of the built-in tool task (tool.ts ToolTaskResult): a model-issued call's result is its
+// transcript entry and the controls it requested (Kind "model"); a nested call's result is in its caller's
+// NestedResultDoc, so the receipt is only {kind: "nested"}. A version 1 task that was already holding its outcome as
+// `completing` when the Harness upgraded finishes with a version 1 result, `{entryId, control?}` without kind: a result
+// without a kind is a model-issued call's.
 type ToolTaskResult struct {
-	EntryId durable.EntryId      `json:"entryId"`
+	Kind    ToolTaskKind         `json:"kind"`
+	EntryId durable.EntryId      `json:"entryId,omitempty"`
 	Control *durable.ToolControl `json:"control,omitempty"`
 }
 
@@ -35,7 +69,7 @@ type ToolTaskResult struct {
 func HarnessError(code, message string) durable.ToolExecutionResult {
 	isError := true
 	return durable.ToolExecutionResult{
-		Content:     []ai.ToolResultMessageContent{},
+		Output:      []ai.ToolResultMessageContent{},
 		IsError:     &isError,
 		Diagnostics: []durable.ToolDiagnostic{{Severity: durable.SeverityError, Code: code, Message: message}},
 	}
@@ -44,9 +78,9 @@ func HarnessError(code, message string) durable.ToolExecutionResult {
 // AppendToolResult appends a pi.tool-result entry (tool.ts:438-460). The content ends with the rendered diagnostics,
 // so the stored message is exactly what the model sees; data keeps the structured list. A result's usage is added to
 // pi.usage in the same commit.
-func AppendToolResult(tx durable.Tx, conversationId durable.ConversationId, call ai.ToolCall, result durable.ToolExecutionResult, timestamp float64) (*durable.TypedEntry[durable.ToolResultEntryData], error) {
+func AppendToolResult(tx durable.Tx, conversationId durable.ConversationId, call ai.ToolCall, result durable.ToolExecutionResult, timestamp float64, durationMs *int64) (*durable.TypedEntry[durable.ToolResultEntryData], error) {
 	diagnostics := append([]durable.ToolDiagnostic{}, result.Diagnostics...)
-	content := append([]ai.ToolResultMessageContent{}, result.Content...)
+	content := append([]ai.ToolResultMessageContent{}, result.Output...)
 	if len(diagnostics) > 0 {
 		content = append(content, ai.TextContent{Text: renderDiagnostics(diagnostics)})
 	}
@@ -55,6 +89,7 @@ func AppendToolResult(tx durable.Tx, conversationId durable.ConversationId, call
 		ToolName:   call.Name,
 		Content:    content,
 		IsError:    result.IsError != nil && *result.IsError,
+		DurationMs: durationMs,
 		Timestamp:  int64(timestamp),
 	}
 	if result.HasDetails {
@@ -84,29 +119,75 @@ func renderDiagnostics(diagnostics []durable.ToolDiagnostic) string {
 // ToolTaskCheckpoint is the tool task's checkpoint: call, or execute with the durable intent, the final arguments and
 // the replay policy recorded before execution (tool.ts:35-38).
 type ToolTaskCheckpoint struct {
-	Phase     string             `json:"phase"`
-	Arguments durable.JsonObject `json:"arguments"`
+	Phase     ToolTaskPhase      `json:"phase"`
+	Arguments map[string]any     `json:"arguments"`
 	Replay    durable.ToolReplay `json:"replay"`
+	// argumentsJSON is Arguments in the call's member order, which the stored intent keeps (tool.ts:163); nil: sorted.
+	argumentsJSON json.RawMessage
 }
 
+// ToolTaskPhase names a phase of the tool task (tool.ts:36-38).
+type ToolTaskPhase string
+
 const (
-	toolPhaseCall    = "call"
-	toolPhaseExecute = "execute"
+	toolPhaseCall    ToolTaskPhase = "call"
+	toolPhaseExecute ToolTaskPhase = "execute"
 )
 
 // MarshalJSON writes {"phase":"call"} or the execute intent with its arguments and replay.
 func (checkpoint ToolTaskCheckpoint) MarshalJSON() ([]byte, error) {
 	if checkpoint.Phase != toolPhaseExecute {
 		return json.Marshal(struct {
-			Phase string `json:"phase"`
+			Phase ToolTaskPhase `json:"phase"`
 		}{checkpoint.Phase})
 	}
-	type execute ToolTaskCheckpoint
-	arguments := checkpoint.Arguments
-	if arguments == nil {
-		arguments = durable.JsonObject{}
+	arguments, err := checkpoint.argumentsText()
+	if err != nil {
+		return nil, err
 	}
-	return json.Marshal(execute{Phase: checkpoint.Phase, Arguments: arguments, Replay: checkpoint.Replay})
+	return json.Marshal(struct {
+		Phase     ToolTaskPhase      `json:"phase"`
+		Arguments json.RawMessage    `json:"arguments"`
+		Replay    durable.ToolReplay `json:"replay"`
+	}{checkpoint.Phase, arguments, checkpoint.Replay})
+}
+
+// UnmarshalJSON reads the checkpoint and keeps the arguments' text, so the rerun of a safe tool shows them in the member order
+// the intent stored, as the parsed object keeps it upstream (tool.ts:202-217).
+func (checkpoint *ToolTaskCheckpoint) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Phase     ToolTaskPhase      `json:"phase"`
+		Arguments json.RawMessage    `json:"arguments"`
+		Replay    durable.ToolReplay `json:"replay"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	decoded := ToolTaskCheckpoint{Phase: wire.Phase, Replay: wire.Replay}
+	if len(wire.Arguments) > 0 && string(wire.Arguments) != "null" {
+		// The object's decode goes through a struct member, so the map is the struct's field, not an interface tree.
+		var object struct {
+			Arguments map[string]any `json:"arguments"`
+		}
+		if err := json.Unmarshal(data, &object); err != nil {
+			return err
+		}
+		decoded.Arguments = object.Arguments
+		decoded.argumentsJSON = wire.Arguments
+	}
+	*checkpoint = decoded
+	return nil
+}
+
+// argumentsText is the arguments as stored: in the call's member order when it is known, else sorted; an absent object is {}.
+func (checkpoint ToolTaskCheckpoint) argumentsText() (json.RawMessage, error) {
+	if checkpoint.argumentsJSON != nil {
+		return checkpoint.argumentsJSON, nil
+	}
+	if checkpoint.Arguments == nil {
+		return json.RawMessage("{}"), nil
+	}
+	return json.Marshal(checkpoint.Arguments)
 }
 
 type toolRuntime = durable.TaskRuntime[ToolTaskInput, ToolTaskCheckpoint, ToolTaskResult, *ToolHooks]
@@ -122,11 +203,23 @@ var ToolTask durable.Task[ToolTaskInput, ToolTaskCheckpoint, ToolTaskResult, *To
 func init() {
 	ToolTask = durable.DefineTask(durable.TaskDefinition[ToolTaskInput, ToolTaskCheckpoint, ToolTaskResult, *ToolHooks]{
 		Name:    "pi.tool",
-		Version: 1,
+		Version: 3,
 		Initial: func(ToolTaskInput) ToolTaskCheckpoint { return ToolTaskCheckpoint{Phase: toolPhaseCall} },
+		// Version 1 had only model-issued calls, without `kind`; version 3 added `unoffered`, absent in version 2 inputs.
+		Migrate: func(input durable.JsonValue, checkpoint durable.JsonValue, fromVersion int) (ToolTaskInput, ToolTaskCheckpoint, error) {
+			typedInput, err := durable.FromJsonValue[ToolTaskInput](input)
+			if err != nil {
+				return ToolTaskInput{}, ToolTaskCheckpoint{}, err
+			}
+			if fromVersion == 1 {
+				typedInput.Kind = ToolTaskModel
+			}
+			typedCheckpoint, err := durable.FromJsonValue[ToolTaskCheckpoint](checkpoint)
+			return typedInput, typedCheckpoint, err
+		},
 		Phases: map[string]durable.PhaseHandler[ToolTaskInput, ToolTaskCheckpoint, ToolTaskResult, *ToolHooks]{
-			toolPhaseCall:    toolCallPhase,
-			toolPhaseExecute: toolExecutePhase,
+			string(toolPhaseCall):    toolCallPhase,
+			string(toolPhaseExecute): toolExecutePhase,
 		},
 		Abort: toolAbort,
 	})
@@ -137,27 +230,33 @@ func toolCallPhase(ctx context.Context, task toolRecord, runtime toolRuntime) er
 	if err != nil {
 		return err
 	}
-	tool, err := findTool(ctx, runtime, call.Name)
-	if err != nil {
-		return err
+	if CutOffTooOften(task.Restarts, runtime) {
+		return toolEndCutOff(ctx, runtime, task, call)
+	}
+	var tool *durable.ToolRegistration
+	if !isUnoffered(task.Input) {
+		tool, err = findTool(ctx, runtime, task.Input, call.Name)
+		if err != nil {
+			return err
+		}
 	}
 	if tool == nil {
 		unavailable := HarnessError("tool_unavailable", fmt.Sprintf("Tool %s is not available", call.Name))
-		return settleTool(ctx, runtime, call, toolCompleted, func(*ToolSlot) durable.ToolExecutionResult { return unavailable })
+		return rejectTool(ctx, runtime, task.Input, call, nil, unavailable)
 	}
 	args, invalidReason := prepareArguments(tool, call.Arguments)
 	if invalidReason == "" {
 		args, invalidReason = validateArguments(tool, call, args)
 	}
 	if invalidReason != "" {
-		return settleTool(ctx, runtime, call, toolCompleted, func(*ToolSlot) durable.ToolExecutionResult { return invalidArguments(invalidReason) })
+		return rejectTool(ctx, runtime, task.Input, call, tool, invalidArguments(invalidReason))
 	}
 	var block *string
 	if err := runtime.Hooks().Each("beforeTool", func(hooks *ToolHooks) error {
 		if block != nil || hooks == nil || hooks.BeforeTool == nil {
 			return nil
 		}
-		decided := call
+		decided := hookCall(task.Input, call)
 		decided.Arguments = args
 		var decision *BeforeToolResult
 		// A panicking hook blocks the call, as a throwing hook does upstream (tool.ts:69-71); it must not fail open.
@@ -185,16 +284,29 @@ func toolCallPhase(ctx context.Context, task toolRecord, runtime toolRuntime) er
 	}
 	if block != nil {
 		blocked := HarnessError("blocked", "Tool call blocked: "+*block)
-		return settleTool(ctx, runtime, call, toolCompleted, func(*ToolSlot) durable.ToolExecutionResult { return blocked })
+		return rejectTool(ctx, runtime, task.Input, call, tool, blocked)
 	}
 	final, invalidReason := validateArguments(tool, call, args)
 	if invalidReason != "" {
-		return settleTool(ctx, runtime, call, toolCompleted, func(*ToolSlot) durable.ToolExecutionResult { return invalidArguments(invalidReason) })
+		return rejectTool(ctx, runtime, task.Input, call, tool, invalidArguments(invalidReason))
+	}
+	// final keeps the member order of the call's arguments, as the clone validateToolArguments returns does (tool.ts:155).
+	ordered := call
+	ordered.Arguments = final
+	finalJSON, err := ordered.ArgumentsJSON()
+	if err != nil {
+		return err
 	}
 	replay := tool.Replay
 	if replay == "" {
 		replay = durable.ReplayUnsafe
 	}
+	shown, err := delta.DecodeJson(finalJSON)
+	if err != nil {
+		return err
+	}
+	// The slot's status and arguments are presentation, stored like progress (ProgressCommit); the intent is durable before
+	// the tool runs. Parallel calls of one round then share no immediate write to pi.live.
 	if err := runtime.Commit(ctx, func(tx durable.Tx, _ toolRecord) (*toolNext, error) {
 		live, err := docDraft(tx, LiveDoc, runtime.ConversationId())
 		if err != nil {
@@ -204,13 +316,25 @@ func toolCallPhase(ctx context.Context, task toolRecord, runtime toolRuntime) er
 			if err := slot.Set("status", string(ToolSlotRunning)); err != nil {
 				return nil, err
 			}
+			// A nested slot shows the arguments the call runs with, which repair, hooks, and coercion may have changed.
+			// Assigned whole: an equal value records no change, and a rerun corrects what an earlier attempt showed.
+			if isNestedSlot(slot) {
+				if err := slot.Set("arguments", shown); err != nil {
+					return nil, err
+				}
+			}
 		}
-		intent := ToolTaskCheckpoint{Phase: toolPhaseExecute, Arguments: final, Replay: replay}
+		return nil, nil
+	}, ProgressCommit); err != nil {
+		return err
+	}
+	if err := runtime.Commit(ctx, func(durable.Tx, toolRecord) (*toolNext, error) {
+		intent := ToolTaskCheckpoint{Phase: toolPhaseExecute, Arguments: final, Replay: replay, argumentsJSON: finalJSON}
 		return &toolNext{Status: durable.TaskRunning, Checkpoint: &intent}, nil
 	}); err != nil {
 		return err
 	}
-	return runTool(ctx, runtime, call, tool, final)
+	return runTool(ctx, runtime, task.Input, call, tool, final)
 }
 
 // toolExecutePhase is recovery after intent: rerun only when the stored and the current policy both say safe.
@@ -220,12 +344,25 @@ func toolExecutePhase(ctx context.Context, task toolRecord, runtime toolRuntime)
 	if err != nil {
 		return err
 	}
-	tool, err := findTool(ctx, runtime, call.Name)
+	// Also before an interruption result: its afterTool hooks may be what cut the task off.
+	if CutOffTooOften(task.Restarts, runtime) {
+		return toolEndCutOff(ctx, runtime, task, call)
+	}
+	tool, err := findTool(ctx, runtime, task.Input, call.Name)
 	if err != nil {
 		return err
 	}
 	if checkpoint.Replay == durable.ReplaySafe && tool != nil && tool.Replay == durable.ReplaySafe {
-		// The rerun reports from scratch; clear what the interrupted attempt published.
+		// The rerun reports from scratch: clear what the interrupted attempt published, and show the slot running with the
+		// arguments it runs with again, as the deferred commit that showed them may have been lost with the crash.
+		encoded, err := checkpoint.argumentsText()
+		if err != nil {
+			return err
+		}
+		shown, err := delta.DecodeJson(encoded)
+		if err != nil {
+			return err
+		}
 		if err := runtime.Commit(ctx, func(tx durable.Tx, _ toolRecord) (*toolNext, error) {
 			live, err := docDraft(tx, LiveDoc, runtime.ConversationId())
 			if err != nil {
@@ -233,19 +370,40 @@ func toolExecutePhase(ctx context.Context, task toolRecord, runtime toolRuntime)
 			}
 			if slot := FindToolSlot(live, runtime.TaskId()); slot != nil {
 				ClearProgress(slot)
+				if err := slot.Set("status", string(ToolSlotRunning)); err != nil {
+					return nil, err
+				}
+				if isNestedSlot(slot) {
+					if err := slot.Set("arguments", shown); err != nil {
+						return nil, err
+					}
+				}
 			}
 			return nil, nil
 		}); err != nil {
 			return err
 		}
-		return runTool(ctx, runtime, call, tool, checkpoint.Arguments)
+		return runTool(ctx, runtime, task.Input, call, tool, checkpoint.Arguments)
 	}
 	message := fmt.Sprintf("Tool %s was interrupted and may have partially run", call.Name)
 	// failed records cancellation intent, so the call's owned conversations, left unsupervised, are aborted.
 	ending := toolEnding{status: durable.OutcomeFailed, message: message}
-	return settleTool(ctx, runtime, call, ending, func(slot *ToolSlot) durable.ToolExecutionResult {
-		return fromSlot(slot, "interrupted", message)
-	})
+	// Not cut off too often (checked above), so the hooks run.
+	return settleFromSlot(ctx, runtime, task.Input, call, &settleHooks{tool: tool}, ending, "interrupted", message)
+}
+
+// toolEndCutOff ends a call cut off settings.restartLimit times in a row (spec section 5.4) with an error result, built
+// from the slot like an interrupted call's, instead of running it again. failed, like an interruption, so its owned work
+// is aborted.
+func toolEndCutOff(ctx context.Context, runtime toolRuntime, task toolRecord, call ai.ToolCall) error {
+	message := fmt.Sprintf("Tool %s was interrupted %s; it is not run again", call.Name, CutOffCount(task.Restarts))
+	ending := toolEnding{status: durable.OutcomeFailed, message: message, reason: durable.ReasonRestartLimit}
+	// Past the limit the hooks may be what keeps cutting the task off (Salvageable).
+	var hooks *settleHooks
+	if Salvageable(task.Restarts, runtime) {
+		hooks = &settleHooks{tool: toolForLimits(ctx, runtime, task.Input, call.Name)}
+	}
+	return settleFromSlot(ctx, runtime, task.Input, call, hooks, ending, "restart_limit", message)
 }
 
 func toolAbort(ctx context.Context, task toolRecord, runtime toolRuntime) error {
@@ -256,10 +414,25 @@ func toolAbort(ctx context.Context, task toolRecord, runtime toolRuntime) error 
 	if err := awaitEarlierAborts(ctx, runtime); err != nil {
 		return err
 	}
-	message := fmt.Sprintf("Tool %s was aborted", call.Name)
-	return settleTool(ctx, runtime, call, toolEnding{status: durable.OutcomeAborted}, func(slot *ToolSlot) durable.ToolExecutionResult {
-		return fromSlot(slot, "aborted", message)
-	})
+	// Abandoned after a restart (TaskOptions.AbandonOnRestart): say whether the call may have run (tool.ts abort). An
+	// unoffered call could not run in any case, and its result says so.
+	code, message := "aborted", fmt.Sprintf("Tool %s was aborted", call.Name)
+	if isUnoffered(task.Input) {
+		code, message = "tool_unavailable", fmt.Sprintf("Tool %s is not available", call.Name)
+	} else if task.AbortReason == durable.AbortedByRestart {
+		if task.State.Checkpoint != nil && task.State.Checkpoint.Phase == toolPhaseExecute {
+			code, message = "interrupted", fmt.Sprintf("Tool %s was interrupted by a restart and may have partially run", call.Name)
+		} else {
+			code, message = "abandoned", fmt.Sprintf("Tool %s was not started: its caller ended with a restart", call.Name)
+		}
+	}
+	// The scheduler runs an abort handler only while its restarts are below the limit, and faults the task without a
+	// result when the last attempt is cut off. That attempt skips the hooks, which may be what cuts it off.
+	var hooks *settleHooks
+	if float64(task.Restarts) < runtime.Settings().RestartLimit-1 {
+		hooks = &settleHooks{tool: toolForLimits(ctx, runtime, task.Input, call.Name)}
+	}
+	return settleFromSlot(ctx, runtime, task.Input, call, hooks, toolEnding{status: durable.OutcomeAborted}, code, message)
 }
 
 // awaitEarlierAborts waits for the abort-marked, still live earlier calls of this call's round to settle. Pi appends the
@@ -310,30 +483,38 @@ func awaitEarlierAborts(ctx context.Context, runtime toolRuntime) error {
 	return nil
 }
 
-// readCall returns the tool call callId of the assistant entry (tool.ts:123-135).
+// readCall returns the call: from the input for a nested call, else the tool call callId of the assistant entry (tool.ts readCall).
 func readCall(ctx context.Context, runtime toolRuntime, input ToolTaskInput) (ai.ToolCall, error) {
-	entry, err := runtime.Entry(ctx, input.Assistant)
+	if input.Kind == ToolTaskNested {
+		// A nested call carries its call, because no entry holds it.
+		if span := chordctx.Telemetry(ctx); span != telemetry.NoopTelemetryContext {
+			span.SetAttributes(telemetry.SpanAttributes{telemetry.Attr("tool.name", input.Call.Name), telemetry.Attr("tool.call_id", input.Call.ID)})
+		}
+		return *input.Call, nil
+	}
+	call, found, err := durable.TaskAssistantToolCall(ctx, runtime, input.Assistant, input.CallId)
 	if err != nil {
 		return ai.ToolCall{}, err
 	}
-	if durable.AssistantEntry.Is(entry) && len(entry.Model) > 0 {
-		if message, ok := entry.Model[0].(ai.AssistantMessage); ok {
-			for _, block := range message.Content {
-				if call, ok := block.(ai.ToolCall); ok && call.ID == input.CallId {
-					return call, nil
-				}
-			}
+	if found {
+		if span := chordctx.Telemetry(ctx); span != telemetry.NoopTelemetryContext {
+			span.SetAttributes(telemetry.SpanAttributes{telemetry.Attr("tool.name", call.Name), telemetry.Attr("tool.call_id", call.ID)})
 		}
+		return call, nil
 	}
 	return ai.ToolCall{}, fmt.Errorf("Entry %d has no tool call %s", input.Assistant, input.CallId)
 }
 
-func findTool(ctx context.Context, runtime toolRuntime, name string) (*durable.ToolRegistration, error) {
+func findTool(ctx context.Context, runtime toolRuntime, input ToolTaskInput, name string) (*durable.ToolRegistration, error) {
 	agent, err := runtime.Agent(ctx)
 	if err != nil {
 		return nil, err
 	}
-	for _, tool := range agent.Tools {
+	candidates := agent.Callable
+	if input.Kind == ToolTaskModel {
+		candidates = agent.Tools
+	}
+	for _, tool := range candidates {
 		if tool.Name == name {
 			return tool, nil
 		}
@@ -343,7 +524,7 @@ func findTool(ctx context.Context, runtime toolRuntime, name string) (*durable.T
 
 // prepareArguments returns the call's arguments as repaired by the tool; a failing repair makes them invalid, and
 // the reason is returned.
-func prepareArguments(tool *durable.ToolRegistration, args durable.JsonObject) (durable.JsonObject, string) {
+func prepareArguments(tool *durable.ToolRegistration, args map[string]any) (map[string]any, string) {
 	if tool.PrepareArguments == nil {
 		return args, ""
 	}
@@ -366,16 +547,21 @@ func prepareArguments(tool *durable.ToolRegistration, args durable.JsonObject) (
 	if err != nil {
 		return nil, err.Error()
 	}
-	object, _ := copied.(map[string]any)
+	// Tool arguments are pi-ai values, which Go keeps as ai.JsonObject maps.
+	var object map[string]any
+	if encoded, isObject := copied.(*delta.JsonObject); isObject {
+		text, _ := json.Marshal(encoded)
+		_ = json.Unmarshal(text, &object)
+	}
 	return object, ""
 }
 
 // validateArguments returns the arguments validated and coerced against the implementation's schema, or why they
 // are invalid.
-func validateArguments(tool *durable.ToolRegistration, call ai.ToolCall, args durable.JsonObject) (durable.JsonObject, string) {
+func validateArguments(tool *durable.ToolRegistration, call ai.ToolCall, args map[string]any) (map[string]any, string) {
 	checked := call
 	checked.Arguments = args
-	validated, err := agent.ValidateToolArguments(tool.ToolSchema, checked)
+	validated, err := ai.ValidateToolArguments(tool.ToolSchema, checked)
 	if err != nil {
 		return nil, err.Error()
 	}
@@ -403,8 +589,8 @@ func callTool(run func() error) (err error) {
 // toolReported is what a running tool reported through its api: output, the last details, and diagnostics.
 type toolReported struct {
 	mu          sync.Mutex
-	output      *OutputBuffer
-	limits      OutputLimits
+	output      *output.OutputBuffer
+	limits      output.OutputLimits
 	diagnostics []durable.ToolDiagnostic
 	details     durable.JsonValue
 	hasDetails  bool
@@ -418,14 +604,17 @@ type toolReported struct {
 type toolEnding struct {
 	status  durable.TaskOutcomeStatus
 	message string
+	// reason is the detail.reason of a failed outcome, when the failure has a fixed one.
+	reason string
 }
 
 var toolCompleted = toolEnding{status: durable.OutcomeCompleted}
 
-// runTool executes with the resolved implementation, then settles its result (tool.ts:157-262).
-func runTool(ctx context.Context, runtime toolRuntime, call ai.ToolCall, tool *durable.ToolRegistration, args durable.JsonObject) error {
-	limits := OutputLimits{MaxBytes: durable.DEFAULT_MAX_BYTES, MaxLines: durable.DEFAULT_MAX_LINES, Retain: string(durable.RetainHead)}
-	if tool.OutputLimits != nil {
+// ToolOutputLimits is the bound a tool's retained output keeps: the tool's own limits over the defaults (tool.ts
+// outputLimits); all defaults when the tool did not resolve (nil).
+func ToolOutputLimits(tool *durable.ToolRegistration) output.OutputLimits {
+	limits := output.OutputLimits{MaxBytes: durable.DEFAULT_MAX_BYTES, MaxLines: durable.DEFAULT_MAX_LINES, Retain: string(durable.RetainHead)}
+	if tool != nil && tool.OutputLimits != nil {
 		if tool.OutputLimits.MaxBytes != nil {
 			limits.MaxBytes = *tool.OutputLimits.MaxBytes
 		}
@@ -436,20 +625,29 @@ func runTool(ctx context.Context, runtime toolRuntime, call ai.ToolCall, tool *d
 			limits.Retain = string(tool.OutputLimits.Retain)
 		}
 	}
-	reported := &toolReported{output: NewOutputBuffer(limits), limits: limits}
-	progress := publishProgress(ctx, runtime, reported)
-	api := &toolApi{runtime: runtime, call: call, reported: reported, progress: progress}
+	return limits
+}
+
+// runTool executes with the resolved implementation, then settles its result (tool.ts:157-262).
+func runTool(ctx context.Context, runtime toolRuntime, input ToolTaskInput, call ai.ToolCall, tool *durable.ToolRegistration, args map[string]any) error {
+	limits := ToolOutputLimits(tool)
+	reported := &toolReported{output: output.NewOutputBuffer(limits), limits: limits}
+	progress := publishProgress(ctx, runtime, reported, input.Kind != ToolTaskNested || input.Progress == nil || *input.Progress)
+	api := &toolApi{runtime: runtime, call: call, tool: tool, reported: reported, progress: progress, nested: NewNestedCalls(call.ID, tool.Replay == durable.ReplaySafe)}
 	if limits.Retain == string(durable.RetainTail) {
 		api.window = &env.ShellOutputWindow{
 			MaxBytes:       limits.MaxBytes,
 			MaxLines:       limits.MaxLines,
 			MinIntervalMs:  runtime.Settings().Progress.OutputIntervalMs,
-			BytesPerSecond: progressBytesPerSecond,
+			BytesPerSecond: output.ProgressBytesPerSecond,
 		}
 	}
 
 	var result durable.ToolExecutionResult
 	ending := toolCompleted
+	// Execution time of this attempt; a rerun after recovery measures only itself. The environment build and the hooks are
+	// not part of it, and a failed Execute still has a duration.
+	var durationMs *int64
 	err := callTool(func() error {
 		// Built for this call, so a rerun after recovery gets the conversation's environment at that time.
 		environment, err := runtime.Env(ctx)
@@ -457,15 +655,18 @@ func runTool(ctx context.Context, runtime toolRuntime, call ai.ToolCall, tool *d
 			return err
 		}
 		api.env = environment
+		startedAt := time.Now()
+		defer func() {
+			durationMs = new(int64(math.Round(float64(time.Since(startedAt)) / float64(time.Millisecond))))
+		}()
 		result, err = tool.Execute(ctx, args, api)
 		return err
 	})
 	if err != nil {
 		if runtime.Signal().Err() != nil {
 			api.ended.Store(true)
-			for _, waiter := range progress.Stop() {
-				waiter.Reject(err)
-			}
+			api.nested.End()
+			output.SettleInOrder(progress.Stop(), err)
 			return err
 		}
 		isError := true
@@ -475,25 +676,32 @@ func runTool(ctx context.Context, runtime toolRuntime, call ai.ToolCall, tool *d
 		ending = toolEnding{status: durable.OutcomeFailed, message: fmt.Sprintf("Tool %s threw", call.Name)}
 	}
 	api.ended.Store(true)
+	// No admission starts after ended; let those underway commit, so settlement aborts and lists their calls.
+	api.nested.End()
 	reported.mu.Lock()
 	reported.output.End()
 	reported.mu.Unlock()
 	// Details still waiting for a progress commit settle with the terminal commit, the final flush.
 	pending := progress.Stop()
-	settled, err := finalResult(ctx, runtime, call, result, reported)
+	// The caller of the details() the last progress commit settled may still be running; it runs before what follows.
+	if trailing := progress.TrailingWaiter(); trailing != nil {
+		output.AwaitCaller(trailing)
+	}
+	settled, err := finalResult(ctx, runtime, input, tool, call, result, reported)
+	commitCtx := ctx
+	if len(pending) > 0 {
+		// Upstream resolves each of them after the terminal commit (tool.ts:420-428) and runs their continuations before the
+		// scheduler pass the commit's publication queued, so they run before the owner's next step (harness-tools.test.ts:1019).
+		// The commit keeps the Session line position behind it until they ran, and the pass and the owner's steps queue behind that.
+		var hold *lineHold
+		commitCtx, hold = withLineHold(ctx)
+		defer hold.release()
+	}
 	if err == nil {
-		err = settleTool(ctx, runtime, call, ending, func(*ToolSlot) durable.ToolExecutionResult { return settled })
+		err = settleTool(commitCtx, runtime, input, call, ending, settled, durationMs)
 	}
-	if err != nil {
-		for _, waiter := range pending {
-			waiter.Reject(err)
-		}
-		return err
-	}
-	for _, waiter := range pending {
-		waiter.Resolve()
-	}
-	return nil
+	output.SettleAndAwait(pending, err)
+	return err
 }
 
 // toolApi is the ToolExecutionApi of one call (tool.ts:177-238).
@@ -502,9 +710,11 @@ type toolApi struct {
 	call     ai.ToolCall
 	env      env.ExecutionEnv
 	reported *toolReported
-	progress *Progress
+	progress *output.Progress
 	window   *env.ShellOutputWindow
 	ended    atomic.Bool
+	tool     *durable.ToolRegistration
+	nested   *NestedCalls
 }
 
 var _ durable.ToolExecutionApi = (*toolApi)(nil)
@@ -524,22 +734,35 @@ func (api *toolApi) CallId() string { return api.call.ID }
 
 func (api *toolApi) Registry() durable.RegistrySnapshot { return api.runtime.Registry() }
 
+func (api *toolApi) Models() durable.Models { return api.runtime.Models() }
+
 func (api *toolApi) Agent(ctx context.Context) (durable.Agent, error) { return api.runtime.Agent(ctx) }
 
 func (api *toolApi) Env() env.ExecutionEnv { return api.env }
 
-// Output appends a string or byte chunk to the retained output.
-func (api *toolApi) Output(chunk any) {
-	api.output(chunk, nil)
-}
+func (api *toolApi) Now() float64 { return api.runtime.Now() }
 
-// OutputSkipping appends a chunk that follows output an environment omitted; tail retention only.
-func (api *toolApi) OutputSkipping(chunk any, skipped env.ShellOutputSkip) {
-	api.output(chunk, &skipped)
+// Output appends a string or byte chunk to the retained output. A chunk that follows output an environment omitted
+// carries skipped; tail retention only.
+func (api *toolApi) Output(chunk any, skipped ...env.ShellOutputSkip) {
+	if len(skipped) == 0 {
+		api.output(chunk, nil)
+		return
+	}
+	api.output(chunk, &skipped[0])
 }
 
 // OutputWindow is the tail window offered to the environment; nil for head retention.
 func (api *toolApi) OutputWindow() *env.ShellOutputWindow { return api.window }
+
+// RetainedOutput is the output retained so far and whether earlier output was dropped.
+func (api *toolApi) RetainedOutput() (string, bool) {
+	api.assertLive()
+	api.reported.mu.Lock()
+	defer api.reported.mu.Unlock()
+	retained := api.reported.output.Snapshot()
+	return retained.Text, retained.DroppedBytes > 0
+}
 
 func (api *toolApi) output(chunk any, skipped *env.ShellOutputSkip) {
 	api.assertLive()
@@ -551,13 +774,13 @@ func (api *toolApi) output(chunk any, skipped *env.ShellOutputSkip) {
 		if skipped == nil {
 			accepted = api.reported.output.PushString(typed)
 		} else {
-			accepted, err = api.reported.output.PushStringSkipping(typed, *skipped)
+			accepted, err = api.reported.output.PushStringSkipping(typed, output.OutputSkip(*skipped))
 		}
 	case []byte:
 		if skipped == nil {
 			accepted = api.reported.output.PushBytes(typed)
 		} else {
-			accepted, err = api.reported.output.PushBytesSkipping(typed, *skipped)
+			accepted, err = api.reported.output.PushBytesSkipping(typed, output.OutputSkip(*skipped))
 		}
 	default:
 		api.reported.mu.Unlock()
@@ -591,21 +814,24 @@ func (api *toolApi) Details(ctx context.Context, value durable.JsonValue) error 
 	if err != nil {
 		return err
 	}
+	// The value and its waiter are queued in one step, as upstream's details() does (tool.ts:322-327), so a call that saw the
+	// value has its waiter in the final flush.
 	api.reported.mu.Lock()
 	api.reported.details = copied
 	api.reported.hasDetails = true
 	api.reported.detailsVersion++
+	waiter := api.progress.MarkAndWait()
 	api.reported.mu.Unlock()
-	return api.progress.MarkAndWait().Wait(ctx)
+	return waiter.Wait(ctx)
 }
 
-func (api *toolApi) Commit(ctx context.Context, change func(tx durable.Tx) (any, error)) (any, error) {
+func (api *toolApi) Commit(ctx context.Context, change func(tx durable.Tx) (any, error), options ...durable.CommitOptions) (any, error) {
 	var result any
 	err := api.runtime.Commit(ctx, func(tx durable.Tx, _ toolRecord) (*toolNext, error) {
 		var err error
 		result, err = change(tx)
 		return nil, err
-	})
+	}, options...)
 	return result, err
 }
 
@@ -620,6 +846,11 @@ func (api *toolApi) MemoCandidate(ctx context.Context, name string, candidate du
 // CreateTaskErased creates a task in its own commit; the conversation is the tool task's own default.
 func (api *toolApi) CreateTaskErased(ctx context.Context, task durable.AnyTask, input durable.JsonValue, options durable.TaskOptions) (durable.TaskId, error) {
 	options.ConversationId = nil
+	// A caller that can rerun reattaches to its child tasks after a restart; any other caller never resumes, so they are
+	// abandoned (TaskOptions.AbandonOnRestart) unless the options say otherwise (tool.ts:338).
+	if options.Ownership.Kind == durable.TaskOwnedByTask && !api.resumes() && options.AbandonOnRestart == nil {
+		options.AbandonOnRestart = new(true)
+	}
 	var id durable.TaskId
 	err := api.runtime.Commit(ctx, func(tx durable.Tx, _ toolRecord) (*toolNext, error) {
 		var err error
@@ -653,18 +884,53 @@ func (api *toolApi) WatchDocErased(ctx context.Context, token durable.AnyDocToke
 	return api.runtime.WatchDocErased(ctx, token, args...)
 }
 
+// toolProgressClock, when set, times tool progress commits instead of the Harness clock and timers; tests replace it to
+// hold the throttled commits.
+var toolProgressClock *output.ProgressClock
+
+// progressClock is the Harness clock and timers for progress pacing (tool.ts progressClock). After the invocation ends nothing more
+// commits, and the clock answers with the last time it read.
+func progressClock(runtime toolRuntime) output.ProgressClock {
+	if toolProgressClock != nil {
+		return *toolProgressClock
+	}
+	var mu sync.Mutex
+	last := 0.0
+	return output.ProgressClock{
+		Now: func() (now float64) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					// Only the ended invocation's check is Pi's caught throw; any other panic is a failure and propagates.
+					if err, ok := recovered.(error); !ok || runtime.Signal().Err() == nil || err.Error() != fmt.Sprintf("Task %d invocation has ended", runtime.TaskId()) {
+						panic(recovered)
+					}
+					mu.Lock()
+					now = last
+					mu.Unlock()
+				}
+			}()
+			now = runtime.Now()
+			mu.Lock()
+			last = now
+			mu.Unlock()
+			return now
+		},
+		SetTimer: func(callback func(), delayMs float64) func() { return runtime.SetTimer(callback, delayMs) },
+	}
+}
+
 // publishProgress returns throttled commits of what the tool reported into its pi.live.tools slot, each writing only
 // what changed since the last one (tool.ts:268-318).
-// toolProgressClock times tool progress commits; tests replace it to hold the throttled commits.
-var toolProgressClock progressClock = systemProgressClock{}
-
-func publishProgress(ctx context.Context, runtime toolRuntime, reported *toolReported) *Progress {
+func publishProgress(ctx context.Context, runtime toolRuntime, reported *toolReported, enabled bool) *output.Progress {
 	written := struct {
 		text           string
 		detailsVersion int
 		diagnostics    int
 	}{}
-	return newProgressWithClock(func() (int, error) {
+	return output.NewProgressWithClock(func() (int, error) {
+		if !enabled {
+			return 0, nil
+		}
 		// Capture everything at once: the tool keeps reporting while the commit is in flight.
 		reported.mu.Lock()
 		snapshot := reported.output.Snapshot()
@@ -717,7 +983,7 @@ func publishProgress(ctx context.Context, runtime toolRuntime, reported *toolRep
 			}
 			// Diff details leaf by leaf and append new diagnostics, so each commit writes only what changed.
 			if detailsChanged && hasDetails {
-				if err := AssignJson(slot, "details", details); err != nil {
+				if err := AssignJson(slot, "details", details, nil); err != nil {
 					return nil, err
 				}
 			}
@@ -736,34 +1002,35 @@ func publishProgress(ctx context.Context, runtime toolRuntime, reported *toolRep
 				}
 			}
 			return nil, nil
-		}); err != nil {
+		}, ProgressCommit); err != nil {
 			return 0, err
 		}
 		written.text, written.detailsVersion, written.diagnostics = snapshot.Text, detailsVersion, diagnostics
 		return bytes, nil
 	}, func(err error) {
-		// Rejections after an abort mark or close are expected; the committed state stays consistent.
-		if runtime.Signal().Err() == nil {
+		// Rejections after an abort mark or close are expected; the committed state stays consistent. A close signals the
+		// invocations only after its listeners ran, so a commit rejected in between reports the same closed Session.
+		if _, failed := errors.AsType[*durable.SessionFailed](err); runtime.Signal().Err() == nil && !failed && !errors.Is(err, session.ErrSessionClosed) {
 			runtime.Report(err)
 		}
-	}, runtime.Settings().Progress.OutputIntervalMs, toolProgressClock)
+	}, runtime.Settings().Progress.OutputIntervalMs, progressClock(runtime))
 }
 
 // finalResult is the settled result (tool.ts:325-353): the tool's result with the retained output and last details
 // as fallbacks, its diagnostics after those reported through the api, afterTool applied, and explicit text bounded,
 // with the Harness's truncation diagnostic last.
-func finalResult(ctx context.Context, runtime toolRuntime, call ai.ToolCall, result durable.ToolExecutionResult, reported *toolReported) (durable.ToolExecutionResult, error) {
+func finalResult(ctx context.Context, runtime toolRuntime, input ToolTaskInput, tool *durable.ToolRegistration, call ai.ToolCall, result durable.ToolExecutionResult, reported *toolReported) (durable.ToolExecutionResult, error) {
 	harness := []durable.ToolDiagnostic{}
 	reported.mu.Lock()
-	var retained *BoundedOutput
-	if result.Content == nil {
+	var retained *output.BoundedOutput
+	if result.Output == nil {
 		snapshot := reported.output.Snapshot()
 		retained = &snapshot
 	}
 	details, hasDetails := reported.details, reported.hasDetails
 	diagnostics := slices.Clone(reported.diagnostics)
 	reported.mu.Unlock()
-	content := result.Content
+	content := result.Output
 	if retained != nil {
 		content = []ai.ToolResultMessageContent{}
 		if retained.Text != "" {
@@ -771,7 +1038,7 @@ func finalResult(ctx context.Context, runtime toolRuntime, call ai.ToolCall, res
 		}
 	}
 	final := result
-	final.Content = content
+	final.Output = content
 	if !result.HasDetails {
 		final.Details, final.HasDetails = details, hasDetails
 	}
@@ -780,7 +1047,7 @@ func finalResult(ctx context.Context, runtime toolRuntime, call ai.ToolCall, res
 		if hooks == nil || hooks.AfterTool == nil {
 			return nil
 		}
-		replaced, err := hooks.AfterTool(ctx, call, final, runtime)
+		replaced, err := hooks.AfterTool(ctx, hookCall(input, call), final, runtime)
 		if err != nil {
 			return err
 		}
@@ -792,14 +1059,54 @@ func finalResult(ctx context.Context, runtime toolRuntime, call ai.ToolCall, res
 		return durable.ToolExecutionResult{}, err
 	}
 	// The retained output's truncation applies only while afterTool kept that content.
-	if retained != nil && retained.DroppedBytes > 0 && sameContent(final.Content, content) {
+	if retained != nil && retained.DroppedBytes > 0 && sameContent(final.Output, content) {
 		harness = append(harness, truncated(retained.DroppedLines, retained.DroppedBytes, reported.limits.Retain))
 	}
-	bounded, droppedBytes, droppedLines := boundContent(final.Content, reported.limits)
+	bounded, droppedBytes, droppedLines := boundContent(final.Output, reported.limits)
 	if droppedBytes > 0 {
 		harness = append(harness, truncated(droppedLines, droppedBytes, reported.limits.Retain))
 	}
-	final.Content = bounded
+	if broken := StructuredOutputError(tool, final); broken != "" {
+		final.StructuredOutput, final.HasStructuredOutput = nil, false
+		if input.Kind == ToolTaskNested {
+			// A nested call whose structuredOutput breaks the contract gets an error result without it.
+			isError := true
+			final.IsError = &isError
+			harness = append(harness, toolDiagnostic("invalid_structured_output", broken))
+		} else {
+			// The model never sees structured output, so its call stands; the host learns of the broken tool.
+			// Only names the extension: a failed resolution leaves the report without the name.
+			var extension string
+			if agent, err := runtime.Agent(ctx); err == nil {
+				extension = ToolExtension(agent, tool.Name)
+			}
+			runtime.Report(errors.New(broken), durable.ReportFrom{Kind: durable.ReportFromExtension, Extension: extension})
+		}
+	}
+	// Programs get the tool's own value: without a schema, its output. The model reads only Output, so model-issued calls
+	// skip both.
+	if input.Kind == ToolTaskNested && tool.StructuredOutputSchema == nil {
+		value, err := durable.ToJsonValue(outputValue(bounded))
+		if err != nil {
+			return durable.ToolExecutionResult{}, err
+		}
+		final.StructuredOutput, final.HasStructuredOutput = value, true
+	}
+	// A schema tool's error result without structured output has its text only in the output, which programs never get: it
+	// becomes an error diagnostic, as a thrown error's message does, unless one says what went wrong already.
+	if input.Kind == ToolTaskNested && tool.StructuredOutputSchema != nil && final.IsError != nil && *final.IsError && !final.HasStructuredOutput &&
+		!slices.ContainsFunc(slices.Concat(final.Diagnostics, harness), func(diagnostic durable.ToolDiagnostic) bool { return diagnostic.Severity == "error" }) {
+		var texts []string
+		for _, item := range bounded {
+			if text, ok := item.(ai.TextContent); ok {
+				texts = append(texts, text.Text)
+			}
+		}
+		if text := strings.Join(texts, "\n"); text != "" {
+			harness = append(harness, toolDiagnostic("tool_error", text))
+		}
+	}
+	final.Output = bounded
 	final.Diagnostics = append(slices.Clone(final.Diagnostics), harness...)
 	return final, nil
 }
@@ -816,51 +1123,97 @@ func sameContent(left, right []ai.ToolResultMessageContent) bool {
 }
 
 // settleTool commits the tool's terminal state (tool.ts:359-385): it appends the result entry, marks the slot done,
-// and completes or ends aborted with the entry ID. build receives the slot so interruption and abort can report the
-// durable partial output.
-func settleTool(ctx context.Context, runtime toolRuntime, call ai.ToolCall, ending toolEnding, build func(slot *ToolSlot) durable.ToolExecutionResult) error {
+// and completes or ends aborted with the entry ID. control applies only when the task completes.
+func settleTool(ctx context.Context, runtime toolRuntime, input ToolTaskInput, call ai.ToolCall, ending toolEnding, result durable.ToolExecutionResult, durationMs ...*int64) error {
+	// A crash in between leaves the call in execute: a safe rerun reattaches to the calls, an interruption ends here. Every live
+	// nested call the task owns, also those an earlier attempt made and this one never called again.
+	nestedIds, err := nestedCallIds(ctx, runtime)
+	if err != nil {
+		return err
+	}
+	// Read before the settling commit: no admission starts after the call ended, and those underway were awaited.
+	madeNested, err := madeNestedCallsMemo(ctx, runtime)
+	if err != nil {
+		return err
+	}
+	// Mark them all before waiting for any: one may run until a sibling is cancelled.
+	if err := abortAll(ctx, runtime, nestedIds); err != nil {
+		return err
+	}
 	return runtime.Commit(ctx, func(tx durable.Tx, _ toolRecord) (*toolNext, error) {
 		live, err := docDraft(tx, LiveDoc, runtime.ConversationId())
 		if err != nil {
 			return nil, err
 		}
 		slot := FindToolSlot(live, runtime.TaskId())
-		var state *ToolSlot
-		if slot != nil {
-			decoded, err := decodeDraft[ToolSlot](slot)
+		var duration *int64
+		if len(durationMs) > 0 {
+			duration = durationMs[0]
+		}
+		var settled ToolTaskResult
+		if input.Kind == ToolTaskNested {
+			nested := nestedResult(runtime.TaskId(), result, duration)
+			if nested.Usage != nil {
+				if err := RecordUsage(tx, runtime.ConversationId(), UsageTools, call.Name, *nested.Usage); err != nil {
+					return nil, err
+				}
+			}
+			if err := storeNestedResult(tx, input, call, runtime.TaskId(), nested); err != nil {
+				return nil, err
+			}
+			if slot != nil && isNestedSlot(slot) {
+				if err := FinishSlot(slot); err != nil {
+					return nil, err
+				}
+				if err := setJSON(slot, "summary", summaryOf(nested, result.Output)); err != nil {
+					return nil, err
+				}
+			}
+			settled = ToolTaskResult{Kind: ToolTaskNested}
+		} else {
+			entry, err := AppendToolResult(tx, runtime.ConversationId(), call, result, runtime.Now(), duration)
 			if err != nil {
 				return nil, err
 			}
-			state = &decoded
+			entryId := entry.Id
+			if slot != nil && !isNestedSlot(slot) {
+				if err := FinishSlot(slot); err != nil {
+					return nil, err
+				}
+				if err := slot.Set("entry", float64(entryId)); err != nil {
+					return nil, err
+				}
+			}
+			settled = ToolTaskResult{Kind: ToolTaskModel, EntryId: entryId}
+			if ending.status == durable.OutcomeCompleted {
+				settled.Control = result.Control
+			}
 		}
-		result := build(state)
-		entry, err := AppendToolResult(tx, runtime.ConversationId(), call, result, runtime.Now())
-		if err != nil {
-			return nil, err
-		}
-		entryId := entry.Id
-		if slot != nil {
-			if err := FinishSlot(slot, &entryId); err != nil {
+		// A call that made no nested calls, in any attempt, has no slots below it; skipping the scan keeps many leaves linear.
+		if madeNested {
+			if err := RemoveNestedSlots(live, runtime.TaskId()); err != nil {
 				return nil, err
 			}
 		}
-		outcome := durable.TaskOutcome[ToolTaskResult]{Status: ending.status, Result: &ToolTaskResult{EntryId: entryId}}
-		switch ending.status {
-		case durable.OutcomeFailed:
+		outcome := durable.TaskOutcome[ToolTaskResult]{Status: ending.status, Result: &settled}
+		if ending.status == durable.OutcomeFailed {
 			outcome.Error = &durable.TaskOutcomeError{Message: ending.message}
-		case durable.OutcomeCompleted:
-			outcome.Result.Control = result.Control
+			if ending.reason != "" {
+				outcome.Error.Detail = map[string]any{"reason": ending.reason}
+			}
 		}
 		return &toolNext{Status: durable.TaskTerminal, Outcome: &outcome}, nil
 	})
 }
 
-// fromSlot is an error result from the slot's durable partial output, details, and diagnostics.
-func fromSlot(slot *ToolSlot, code, message string) durable.ToolExecutionResult {
+// fromSlot is an error result from the slot's durable partial output, details, and diagnostics, ending with code; and
+// the truncation diagnostic of that output, when its bounds dropped some, which the caller adds after afterTool.
+func fromSlot(slot *ToolSlot, code, message string) (durable.ToolExecutionResult, *durable.ToolDiagnostic) {
 	diagnostics := []durable.ToolDiagnostic{}
 	content := []ai.ToolResultMessageContent{}
 	isError := true
 	result := durable.ToolExecutionResult{IsError: &isError}
+	var truncation *durable.ToolDiagnostic
 	if slot != nil {
 		diagnostics = append(diagnostics, slot.Diagnostics...)
 		if slot.DroppedBytes != nil && *slot.DroppedBytes > 0 {
@@ -868,7 +1221,8 @@ func fromSlot(slot *ToolSlot, code, message string) durable.ToolExecutionResult 
 			if slot.DroppedLines != nil {
 				droppedLines = *slot.DroppedLines
 			}
-			diagnostics = append(diagnostics, truncated(droppedLines, *slot.DroppedBytes, ""))
+			dropped := truncated(droppedLines, *slot.DroppedBytes, "")
+			truncation = &dropped
 		}
 		if slot.Output != nil && *slot.Output != "" {
 			content = append(content, ai.TextContent{Text: *slot.Output})
@@ -877,9 +1231,130 @@ func fromSlot(slot *ToolSlot, code, message string) durable.ToolExecutionResult 
 			result.Details, result.HasDetails = *slot.Details, true
 		}
 	}
-	result.Content = content
+	result.Output = content
 	result.Diagnostics = slices.Concat(diagnostics, []durable.ToolDiagnostic{toolDiagnostic(code, message)})
-	return result
+	return result, truncation
+}
+
+// settleHooks says that a result built from the slot passes afterTool, and is bounded with the limits of tool (the defaults
+// when it is nil).
+type settleHooks struct{ tool *durable.ToolRegistration }
+
+// rejectTool settles a result the Harness decided in the call phase, without running the tool: the tool did not resolve,
+// the arguments are invalid, or beforeTool blocked the call. afterTool applies as to an executed call's result.
+func rejectTool(ctx context.Context, runtime toolRuntime, input ToolTaskInput, call ai.ToolCall, tool *durable.ToolRegistration, result durable.ToolExecutionResult) error {
+	settled, err := afterHarnessResult(ctx, runtime, input, call, tool, result, nil)
+	if err != nil {
+		return err
+	}
+	return settleTool(ctx, runtime, input, call, toolCompleted, settled)
+}
+
+// settleFromSlot settles an error result built from the call's slot (fromSlot): an interruption, the restart limit, or an
+// abort. The tool is not running, so the slot read before the commit is still current when it commits. With hooks, the
+// result passes afterTool and is bounded with the limits of hooks.tool (the defaults when it is nil); without, it is
+// settled as built, when the hooks may be what cuts the task off.
+func settleFromSlot(ctx context.Context, runtime toolRuntime, input ToolTaskInput, call ai.ToolCall, hooks *settleHooks, ending toolEnding, code, message string) error {
+	live, err := durable.Snapshot[LiveState](ctx, runtime, LiveDoc, runtime.ConversationId())
+	if err != nil {
+		return err
+	}
+	var slot *ToolSlot
+	if live != nil {
+		slot = toolSlotOf(live, runtime.TaskId())
+	}
+	result, truncation := fromSlot(slot, code, message)
+	settled := result
+	if hooks != nil {
+		settled, err = afterHarnessResult(ctx, runtime, input, call, hooks.tool, result, truncation)
+		if err != nil {
+			return err
+		}
+	} else if truncation != nil {
+		settled.Diagnostics = append(slices.Clone(result.Diagnostics), *truncation)
+	}
+	return settleTool(ctx, runtime, input, call, ending, settled)
+}
+
+// toolSlotOf is the slot of tool task taskId in a pi.live value, model-issued or nested, as a model-issued slot; nil when
+// pi.live no longer lists it.
+func toolSlotOf(live *LiveState, taskId durable.TaskId) *ToolSlot {
+	for index := range live.Tools {
+		if live.Tools[index].TaskId != nil && *live.Tools[index].TaskId == taskId {
+			return &live.Tools[index]
+		}
+	}
+	// Nested slots ascend by task ID, as FindToolSlot relies on.
+	index, found := slices.BinarySearchFunc(live.NestedTools, taskId, func(slot NestedToolSlot, id durable.TaskId) int { return cmp.Compare(slot.TaskId, id) })
+	if !found {
+		return nil
+	}
+	nested := live.NestedTools[index]
+	return &ToolSlot{CallId: nested.CallId, Name: nested.Name, TaskId: &nested.TaskId, Status: nested.Status, Output: nested.Output, DroppedBytes: nested.DroppedBytes, DroppedLines: nested.DroppedLines, Details: nested.Details, Diagnostics: nested.Diagnostics}
+}
+
+// toolForLimits is the tool whose output limits bound a hooks' result: the called tool, or none when it, or the agent,
+// fails to resolve, and for an unoffered call, which never resolves its name.
+func toolForLimits(ctx context.Context, runtime toolRuntime, input ToolTaskInput, name string) *durable.ToolRegistration {
+	if isUnoffered(input) {
+		return nil
+	}
+	tool, err := findTool(ctx, runtime, input, name)
+	if err != nil {
+		return nil
+	}
+	return tool
+}
+
+// isUnoffered is a model-issued call to a tool its request did not offer (spec section 8.3).
+func isUnoffered(input ToolTaskInput) bool {
+	return input.Kind == ToolTaskModel && input.Unoffered
+}
+
+// afterHarnessResult is a result the Harness wrote itself, without executing the tool, after the afterTool chain,
+// normalized like an executed call's: the output bounded with the tool's limits (the defaults when it did not resolve), a
+// truncation diagnostic when that dropped something, and the hooks' structuredOutput dropped, since the tool never
+// produced one. A nested call that the hooks turned into a success gets the bounded output as its value, as a
+// schema-less tool's success does, unless the tool declares a schema. usage is kept and recorded; control applies only
+// when the task completes. truncation describes what the result's own output lost before (a slot's retained output); it
+// is kept only while the hooks keep that output.
+func afterHarnessResult(ctx context.Context, runtime toolRuntime, input ToolTaskInput, call ai.ToolCall, tool *durable.ToolRegistration, result durable.ToolExecutionResult, truncation *durable.ToolDiagnostic) (durable.ToolExecutionResult, error) {
+	final := result
+	if err := runtime.Hooks().Each("afterTool", func(hooks *ToolHooks) error {
+		if hooks == nil || hooks.AfterTool == nil {
+			return nil
+		}
+		replaced, err := hooks.AfterTool(ctx, hookCall(input, call), final, runtime)
+		if err != nil {
+			return err
+		}
+		if replaced != nil {
+			final = *replaced
+		}
+		return nil
+	}); err != nil {
+		return durable.ToolExecutionResult{}, err
+	}
+	harness := []durable.ToolDiagnostic{}
+	if truncation != nil && sameContent(final.Output, result.Output) {
+		harness = append(harness, *truncation)
+	}
+	limits := ToolOutputLimits(tool)
+	bounded, droppedBytes, droppedLines := boundContent(final.Output, limits)
+	if droppedBytes > 0 {
+		harness = append(harness, truncated(droppedLines, droppedBytes, limits.Retain))
+	}
+	final.StructuredOutput, final.HasStructuredOutput = nil, false
+	if input.Kind == ToolTaskNested && (final.IsError == nil || !*final.IsError) && (tool == nil || tool.StructuredOutputSchema == nil) {
+		value, err := durable.ToJsonValue(outputValue(bounded))
+		if err != nil {
+			return durable.ToolExecutionResult{}, err
+		}
+		final.StructuredOutput, final.HasStructuredOutput = value, true
+	}
+	final.Output = bounded
+	final.Diagnostics = append(slices.Clone(final.Diagnostics), harness...)
+	return final, nil
 }
 
 func toolDiagnostic(code, message string) durable.ToolDiagnostic {
@@ -905,7 +1380,7 @@ func truncated(droppedLines, droppedBytes int, retain string) durable.ToolDiagno
 // boundContent bounds the text of result content (tool.ts:470-484). When the joined text exceeds the limits, the
 // text items are replaced by one bounded item at the position of the first (head) or last (tail) text item; other
 // content is kept.
-func boundContent(content []ai.ToolResultMessageContent, limits OutputLimits) ([]ai.ToolResultMessageContent, int, int) {
+func boundContent(content []ai.ToolResultMessageContent, limits output.OutputLimits) ([]ai.ToolResultMessageContent, int, int) {
 	var joined strings.Builder
 	keep := -1
 	for index, item := range content {
@@ -918,7 +1393,7 @@ func boundContent(content []ai.ToolResultMessageContent, limits OutputLimits) ([
 			keep = index
 		}
 	}
-	bounded := BoundOutput(joined.String(), limits)
+	bounded := output.BoundOutput(joined.String(), limits)
 	if bounded.DroppedBytes == 0 {
 		return content, 0, 0
 	}

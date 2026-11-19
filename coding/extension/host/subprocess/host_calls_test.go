@@ -23,6 +23,7 @@ import (
 // raw call frames as the extension would.
 type callOrderFixture struct {
 	t      *testing.T
+	host   *Host
 	conn   *Conn
 	ext    net.Conn
 	writeM sync.Mutex
@@ -30,6 +31,8 @@ type callOrderFixture struct {
 	resultMu sync.Mutex
 	results  map[string]*CallResultPayload
 	resultCh chan struct{}
+	// requests receives the request frames the host writes, in write order.
+	requests chan Envelope
 }
 
 func newCallOrderFixture(t *testing.T, handle func(call *CallPayload) (*CallResultPayload, error)) *callOrderFixture {
@@ -50,13 +53,58 @@ func newBridgeCallOrderFixture(t *testing.T, bridge *UIBridge) *callOrderFixture
 func startCallOrderFixture(t *testing.T, h *Host) *callOrderFixture {
 	t.Helper()
 	hostSide, extSide := net.Pipe()
+	return startCallOrderFixtureOn(t, h, hostSide, extSide)
+}
+
+// newSocketCallOrderFixture is newCallOrderFixture over a loopback socket, whose buffer lets the extension's frames reach the host's read loop
+// back to back, as an extension process's do; a net.Pipe hands each frame over with a goroutine switch, so every call would apply before the
+// next frame is read.
+func newSocketCallOrderFixture(t *testing.T, handle func(call *CallPayload) (*CallResultPayload, error)) *callOrderFixture {
+	t.Helper()
+	h := NewHostWithConfigRoot(t.TempDir(), t.TempDir())
+	h.SetCallHandler(func(_ string, call *CallPayload) (*CallResultPayload, error) { return handle(call) })
+	hostSide, extSide := socketPair(t)
+	return startCallOrderFixtureOn(t, h, hostSide, extSide)
+}
+
+// socketPair returns the two ends of a loopback connection.
+func socketPair(t *testing.T) (hostSide, extSide net.Conn) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, err := listener.Accept()
+		if err != nil {
+			close(accepted)
+			return
+		}
+		accepted <- c
+	}()
+	extSide, err = net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ok bool
+	hostSide, ok = <-accepted
+	if !ok {
+		t.Fatal("the host side of the socket never connected")
+	}
+	return hostSide, extSide
+}
+
+func startCallOrderFixtureOn(t *testing.T, h *Host, hostSide, extSide net.Conn) *callOrderFixture {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	conn := NewConn("order", hostSide)
 	conn.Start(ctx)
 	me := withConn(&managedExt{config: ExtConfig{Name: "order"}, host: h}, conn)
 	me.shuttingDown.Store(true)
 	go h.handleIncoming(me, me.connection())
-	f := &callOrderFixture{t: t, ext: extSide, conn: conn, results: map[string]*CallResultPayload{}, resultCh: make(chan struct{}, 1)}
+	f := &callOrderFixture{t: t, host: h, ext: extSide, conn: conn, results: map[string]*CallResultPayload{}, resultCh: make(chan struct{}, 1), requests: make(chan Envelope, 256)}
 	go f.readFrames()
 	t.Cleanup(func() {
 		cancel()
@@ -66,7 +114,7 @@ func startCallOrderFixture(t *testing.T, h *Host) *callOrderFixture {
 	return f
 }
 
-// readFrames records the call results the host sends to the extension and drops every other frame.
+// readFrames records the call results the host sends to the extension, queues its request frames on requests, and drops every other frame.
 func (f *callOrderFixture) readFrames() {
 	for {
 		var length [4]byte
@@ -78,7 +126,17 @@ func (f *callOrderFixture) readFrames() {
 			return
 		}
 		var envelope Envelope
-		if json.Unmarshal(data, &envelope) != nil || envelope.Type != MsgCallResult || envelope.CallResult == nil {
+		if json.Unmarshal(data, &envelope) != nil {
+			continue
+		}
+		if envelope.Type == MsgRequest && envelope.Request != nil {
+			select {
+			case f.requests <- envelope:
+			default:
+			}
+			continue
+		}
+		if envelope.Type != MsgCallResult || envelope.CallResult == nil {
 			continue
 		}
 		f.resultMu.Lock()
@@ -285,12 +343,14 @@ func (u *orderedSlotUI) Notify(string, string) {
 	close(u.after)
 }
 
-func (u *orderedSlotUI) SetHeader(factory any) {
+func (u *orderedSlotUI) SetHeader(build extension.HeaderFactory) {
+	factory := frameOf(build, 2)
 	lines, _ := factory.([]string)
 	u.record("header:" + strings.Join(lines, ","))
 }
 
-func (u *orderedSlotUI) SetFooter(factory any) {
+func (u *orderedSlotUI) SetFooter(build extension.FooterFactory) {
+	factory := frameOf(build, 3)
 	lines, _ := factory.([]string)
 	u.record("footer:" + strings.Join(lines, ","))
 }
@@ -327,7 +387,7 @@ func runSlotOrder(t *testing.T, ui *orderedSlotUI, sends ...slotSend) (blocked, 
 	t.Helper()
 	bridge := NewUIBridge(func() {})
 	bridge.SetUIContext(ui)
-	bridge.SetWidgetRequestFunc(func(_ string, _ string, lines []string, _ extension.ExtensionWidgetOptions) {
+	bridge.SetWidgetRequestFunc(func(_ string, _ string, lines []string, _ *extension.ExtensionWidgetOptions) {
 		ui.record("widget:" + strings.Join(lines, ","))
 	})
 	f = newBridgeCallOrderFixture(t, bridge)
@@ -362,9 +422,10 @@ func TestReadLoopRunsSlotCallsInSendOrder(t *testing.T) {
 			return []slotSend{footerSend("c1", "", "older"), footerSend("c2", "r9", "newer")}
 		}},
 		{"widget", func(*testing.T) []slotSend {
+			// A string list, as the Go, Rust and Python SDKs send it: a width marks a frame a component rendered, which the non-interactive observer installed by runSlotOrder never receives (handleSetWidget).
 			return []slotSend{
-				{"c1", "ui.setWidget", "", map[string]any{"key": "list", "lines": []string{"older"}, "width": 20}, "widget:older"},
-				{"c2", "ui.setWidget", "r9", map[string]any{"key": "list", "lines": []string{"newer"}, "width": 40}, "widget:newer"},
+				{"c1", "ui.setWidget", "", map[string]any{"key": "list", "lines": []string{"older"}}, "widget:older"},
+				{"c2", "ui.setWidget", "r9", map[string]any{"key": "list", "lines": []string{"newer"}}, "widget:newer"},
 			}
 		}},
 		{"header then login", func(t *testing.T) []slotSend {
@@ -414,7 +475,7 @@ func TestReadLoopWidgetPushOrdersAgainstQueuedSlotCalls(t *testing.T) {
 			ui := newOrderedSlotUI()
 			bridge := newTestBridge(ui)
 			bridge.SetWidgetSyncFunc(func(widgets map[string]*PushProxy) {
-				if proxy := widgets["order:list"]; proxy != nil {
+				if proxy := widgets["list"]; proxy != nil {
 					ui.record("widget:" + strings.Join(proxy.Lines(), ","))
 				} else {
 					ui.record("widget:cleared")
@@ -492,12 +553,13 @@ type holdingHeaderUI struct {
 	holding, hold chan struct{}
 }
 
-func (u *holdingHeaderUI) SetHeader(factory any) {
+func (u *holdingHeaderUI) SetHeader(build extension.HeaderFactory) {
+	factory := frameOf(build, 2)
 	if lines, _ := factory.([]string); len(lines) == 1 && lines[0] == "older" {
 		close(u.holding)
 		<-u.hold
 	}
-	u.orderedSlotUI.SetHeader(factory)
+	u.orderedSlotUI.SetHeader(build)
 }
 
 // A later call that runs earlier calls of its slot holds the slot until they are applied. Another lane's call sent after them must not apply between them (rev-sol-ci-rc2-final-r P2 ordering; interactive-mode.ts:2454-2488).

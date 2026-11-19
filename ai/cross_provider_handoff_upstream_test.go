@@ -20,7 +20,7 @@ func TestCrossProviderHandoffUpstream(t *testing.T) {
 	}{
 		{"anthropic", "claude-sonnet-4-5", "anthropic-claude-sonnet-4-5", ""}, {"google", "gemini-3-flash-preview", "google-gemini-3-flash-preview", ""},
 		{"openai", "gpt-4o-mini", "openai-completions-gpt-4o-mini", ai.APIOpenAICompletions}, {"openai", "gpt-5-mini", "openai-responses-gpt-5-mini", ""}, {"azure", "gpt-4o-mini", "azure-gpt-4o-mini", ""},
-		{"openai-codex", "gpt-5.5", "openai-codex-gpt-5.5", ""}, {"github-copilot", "claude-sonnet-4.5", "copilot-claude-sonnet-4.5", ""}, {"github-copilot", "gpt-5.1-codex", "copilot-gpt-5.1-codex", ""},
+		{"openai-codex", "gpt-6.1-sol", "openai-codex-gpt-6.1-sol", ""}, {"github-copilot", "claude-sonnet-4.5", "copilot-claude-sonnet-4.5", ""}, {"github-copilot", "gpt-5.1-codex", "copilot-gpt-5.1-codex", ""},
 		{"github-copilot", "gemini-3-flash-preview", "copilot-gemini-3-flash-preview", ""}, {"github-copilot", "grok-code-fast-1", "copilot-grok-code-fast-1", ""},
 		{"amazon-bedrock", "global.anthropic.claude-sonnet-4-5-20250929-v1:0", "bedrock-claude-sonnet-4-5", ""}, {"xai", "grok-4.3", "xai-grok-4.3", ""}, {"cerebras", "zai-glm-4.7", "cerebras-zai-glm-4.7", ""},
 		{"cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6", "cloudflare-kimi-k2.6", ""}, {"cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6", "cloudflare-gateway-kimi-k2.6", ""},
@@ -30,12 +30,12 @@ func TestCrossProviderHandoffUpstream(t *testing.T) {
 		{"minimax", "MiniMax-M2.7", "minimax-m2.7", ""}, {"minimax-cn", "MiniMax-M2.7", "minimax-m2.7", ""},
 		{"opencode", "big-pickle", "zen-big-pickle", ""}, {"opencode", "claude-sonnet-4-5", "zen-claude-sonnet-4-5", ""}, {"opencode", "gemini-3-flash", "zen-gemini-3-flash", ""}, {"opencode", "glm-4.7-free", "zen-glm-4.7-free", ""},
 		{"opencode", "gpt-5.2-codex", "zen-gpt-5.2-codex", ""}, {"opencode", "minimax-m2.1-free", "zen-minimax-m2.1-free", ""}, {"opencode-go", "kimi-k2.5", "go-kimi-k2.5", ""}, {"opencode-go", "minimax-m2.5", "go-minimax-m2.5", ""},
-		{"xiaomi", "mimo-v2.5-pro", "xiaomi-mimo-v2.5-pro", ""}, {"xiaomi-token-plan-cn", "mimo-v2.5-pro", "xiaomi-token-plan-cn-mimo-v2.5-pro", ""}, {"xiaomi-token-plan-ams", "mimo-v2.5-pro", "xiaomi-token-plan-ams-mimo-v2.5-pro", ""}, {"xiaomi-token-plan-sgp", "mimo-v2.5-pro", "xiaomi-token-plan-sgp-mimo-v2.5-pro", ""},
+		{"xiaomi", "mimo-v2.6-pro", "xiaomi-mimo-v2.6-pro", ""}, {"xiaomi-token-plan-cn", "mimo-v2.6-pro", "xiaomi-token-plan-cn-mimo-v2.6-pro", ""}, {"xiaomi-token-plan-ams", "mimo-v2.6-pro", "xiaomi-token-plan-ams-mimo-v2.6-pro", ""}, {"xiaomi-token-plan-sgp", "mimo-v2.6-pro", "xiaomi-token-plan-sgp-mimo-v2.6-pro", ""},
 		{"qwen-token-plan", "qwen3.7-max", "qwen-token-plan-qwen3.7-max", ""}, {"qwen-token-plan-cn", "qwen3.7-max", "qwen-token-plan-cn-qwen3.7-max", ""}, {"qwen-token-plan-individual", "qwen3.8-max", "qwen-token-plan-individual-qwen3.8-max", ""},
 		{"qwen-token-plan-individual", "deepseek-v4-flash-0731", "qwen-token-plan-individual-deepseek-v4-flash-0731", ""}, {"qwen-token-plan-individual", "glm-5.2", "qwen-token-plan-individual-glm-5.2", ""},
 	}
 	tool := ai.ToolSchema{Name: "double_number", Description: "Doubles a number and returns the result", Parameters: map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "number", "description": "A number to double"}}, "required": []string{"value"}}}
-	services, err := coding.NewServices(coding.ServicesOptions{CWD: t.TempDir(), AgentDir: t.TempDir()})
+	services, err := coding.CreateAgentSessionServices(coding.CreateAgentSessionServicesOptions{CWD: t.TempDir(), AgentDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestCrossProviderHandoffUpstream(t *testing.T) {
 		case ai.APIMistralConversations:
 			id = fmt.Sprintf("call%05d", index)
 		}
-		provider.SetResponses([]ai.FauxResponseStep{ai.FauxStaticStep(ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxThinking("Double 21 to get 42"), ai.FauxToolCall("double_number", map[string]any{"value": 21}, id)}, StopReason: "toolUse"}), ai.FauxStaticStep(ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxText("42")}, StopReason: "stop"})})
+		provider.SetResponses([]ai.FauxResponseStep{ai.FauxStaticStep(ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxThinking("Double 21 to get 42"), ai.FauxToolCall("double_number", map[string]any{"value": 21}, &ai.FauxToolCallOptions{ID: id})}, StopReason: "toolUse"}), ai.FauxStaticStep(ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxText("42")}, StopReason: "stop"})})
 		user := ai.UserMessage{Content: ai.UserText("Please double the number 21 using the double_number tool.")}
 		target := &ai.Model{ID: pair.model, Provider: provider}
 		first := services.ModelRuntime().Complete(t.Context(), target, ai.Context{SystemPrompt: "You are a helpful assistant. Use the provided tool to complete the task.", Messages: []ai.Message{user}, Tools: []ai.ToolSchema{tool}}, ai.StreamOptions{})
@@ -109,11 +109,11 @@ func TestCrossProviderHandoffUpstream(t *testing.T) {
 			calls, results := handoffToolCounts(t, payload)
 			paired := len(calls) > 0 && reflect.DeepEqual(calls, results)
 			provider := ai.NewFauxProvider(ai.FauxConfig{ProviderID: pair.provider, Model: pair.model})
-			provider.SetResponses([]ai.FauxResponseStep{ai.FauxFactoryStep(func(context ai.TranscriptContext, _ ai.StreamOptions, _ *ai.FauxProviderState, _ *ai.Model) (ai.FauxResponse, error) {
+			provider.SetResponses([]ai.FauxResponseStep{ai.FauxFactoryStep(func(context ai.TranscriptContext, _ ai.StreamOptions, _ *ai.FauxProviderState, _ *ai.Model) (ai.AssistantMessage, error) {
 				if !paired || len(context.Messages()) != len(messages)+1 {
-					return ai.FauxResponse{StopReason: "error", ErrorMessage: "handoff lost history or tool pairing"}, nil
+					return ai.FauxResponse{StopReason: "error", ErrorMessage: "handoff lost history or tool pairing"}.AssistantMessage(), nil
 				}
-				return ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxText("Hello, handoff successful!")}, StopReason: "stop"}, nil
+				return ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxText("Hello, handoff successful!")}, StopReason: "stop"}.AssistantMessage(), nil
 			})})
 			response := services.ModelRuntime().Complete(t.Context(), &ai.Model{ID: pair.model, Provider: provider}, request, ai.StreamOptions{})
 			if response.StopReason == ai.StopReasonError {

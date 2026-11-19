@@ -18,7 +18,7 @@ func proxyTestModel() *ai.Model {
 		ID:          "gpt-5.4",
 		DisplayName: "GPT-5.4",
 		Capabilities: ai.ModelCapabilities{
-			MaxThinking:         ai.ThinkingHigh,
+			MaxThinking:         ai.ThinkingLevelHigh,
 			SupportsImages:      true,
 			ContextWindow:       400_000,
 			MaxOutputTokens:     128_000,
@@ -84,6 +84,15 @@ func proxyEventTypes(events []ai.AssistantMessageEvent) []ai.AssistantEventType 
 	return types
 }
 
+// Pi: packages/agent/src/proxy.ts:67 (cacheRetention)
+// Pi: packages/agent/src/proxy.ts:73 (maxRetryDelayMs)
+// Pi: packages/agent/src/proxy.ts:65 (maxTokens)
+// Pi: packages/agent/src/proxy.ts:66 (reasoning)
+// Pi: packages/agent/src/proxy.ts:68 (sessionId)
+// Pi: packages/agent/src/proxy.ts:63 (temperature)
+// Pi: packages/agent/src/proxy.ts:71 (transport)
+// streamProxy posts { model, context, options } with the bearer token to <proxyUrl>/api/stream (packages/agent/src/proxy.ts:159-171),
+// and the options are exactly the serializable stream options buildProxyRequestOptions copies (proxy.ts:104-118).
 func TestStreamProxyReconstructsPartialsAndPreservesRequestAndTerminalMetadata(t *testing.T) {
 	usage := proxyTestUsage()
 	signature := "sig-text"
@@ -253,6 +262,12 @@ func TestStreamProxyOmitsUnsetOptionsAndSendsEmptyContextArray(t *testing.T) {
 }
 
 // Upstream buildProxyRequestOptions copies present objects and zero budgets unchanged; JSON.stringify omits only undefined options.
+// Pi: packages/agent/src/proxy.ts:69 (headers)
+// Pi: packages/agent/src/proxy.ts:70 (metadata)
+// Pi: packages/agent/src/proxy.ts:64 (samplingParams)
+// Pi: packages/agent/src/proxy.ts:72 (thinkingBudgets)
+// Upstream buildProxyRequestOptions copies present objects and zero budgets unchanged (packages/agent/src/proxy.ts:104-118);
+// JSON.stringify omits only undefined options (proxy.ts:166).
 func TestProxyRequestPreservesOptionPresence(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -368,11 +383,11 @@ func TestProxyRequestPreservesOptionPresence(t *testing.T) {
 	}
 }
 
-// Upstream processProxyEvent gives each toolcall_start a new block with partialJson: "", even when its index replaces an unfinished tool.
+// Upstream processProxyEvent gives each toolcall_start a new block and a new argument stream, even when its index replaces an unfinished tool.
 func TestProxyEventConverterRestartsToolIndex(t *testing.T) {
 	for _, staleJSON := range []string{`{"stale":1}`, `{"stale":"unfinished`} {
 		t.Run(staleJSON, func(t *testing.T) {
-			converter := &proxyEventConverter{partial: newProxyPartial(proxyTestModel()), toolJSON: map[int]string{}}
+			converter := &proxyEventConverter{partial: newProxyPartial(proxyTestModel()), toolArguments: map[proxyArgumentsKey]*ai.ToolCallArgumentsStream{}}
 			for _, event := range []ProxyAssistantMessageEvent{
 				{Type: "toolcall_start", ContentIndex: 0, ID: "old", ToolName: "lookup"},
 				{Type: "toolcall_delta", ContentIndex: 0, Delta: staleJSON},
@@ -381,9 +396,6 @@ func TestProxyEventConverterRestartsToolIndex(t *testing.T) {
 				if _, err := converter.process(event); err != nil {
 					t.Fatal(err)
 				}
-			}
-			if got := converter.toolJSON[0]; got != "" {
-				t.Errorf("restarted tool JSON = %q, want empty", got)
 			}
 			if got, want := converter.partial.Content[0], (ai.ToolCall{ID: "new", Name: "lookup", Arguments: ai.JsonObject{}}); !reflect.DeepEqual(got, want) {
 				t.Errorf("restarted tool = %#v, want %#v", got, want)
@@ -437,6 +449,7 @@ func TestStreamProxyRestartsToolIndex(t *testing.T) {
 		{"old delta", events[2].(ai.ToolCallDeltaEvent).Partial, ai.ToolCall{ID: "old", Name: "lookup", Arguments: ai.JsonObject{"stale": float64(1)}}},
 		{"new start", events[3].(ai.ToolCallStartEvent).Partial, ai.ToolCall{ID: "new", Name: "lookup", Arguments: ai.JsonObject{}}},
 		{"new delta", events[4].(ai.ToolCallDeltaEvent).Partial, ai.ToolCall{ID: "new", Name: "lookup", Arguments: ai.JsonObject{"fresh": float64(2)}}},
+		// No toolcall_end arrived, so the delivered call keeps its partialJson member, as Pi's does.
 		{"result", result, ai.ToolCall{ID: "new", Name: "lookup", Arguments: ai.JsonObject{"fresh": float64(2)}}},
 	} {
 		if got, want := check.partial.Observe().Content, []ai.AssistantContentBlock{check.want}; !reflect.DeepEqual(got, want) {
@@ -541,8 +554,14 @@ func TestStreamProxyCancellationTerminatesAsAborted(t *testing.T) {
 		AuthToken: "token", ProxyURL: server.URL,
 	})
 	resultReady := make(chan *ai.AssistantMessage, 1)
+	firstEvent := make(chan struct{})
 	go func() {
 		for range stream.Events(context.Background()) {
+			select {
+			case <-firstEvent:
+			default:
+				close(firstEvent)
+			}
 		}
 		resultReady <- stream.Result()
 	}()
@@ -550,6 +569,12 @@ func TestStreamProxyCancellationTerminatesAsAborted(t *testing.T) {
 	case <-requestStarted:
 	case <-time.After(2 * time.Second):
 		t.Fatal("proxy request did not start")
+	}
+	// The abort must land after the response arrives; before it, fetch rejects with the signal reason instead.
+	select {
+	case <-firstEvent:
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy start event was not delivered")
 	}
 	cancel()
 	select {
@@ -564,5 +589,27 @@ func TestStreamProxyCancellationTerminatesAsAborted(t *testing.T) {
 	case <-requestCancelled:
 	case <-time.After(2 * time.Second):
 		t.Fatal("cancellation did not reach proxy request")
+	}
+}
+
+// upstream: packages/agent/src/proxy.ts (1.1.0, f284a246) builds the stream with createAssistantMessageEventStream(), so the
+// proxy's final message is timed like any other response: the message it rebuilt starts at the request, so it has a durationMs.
+func TestStreamProxyTimesTheResponseLikeAnyAssistantStream(t *testing.T) {
+	usage := proxyTestUsage()
+	message := "provider rejected request"
+	for name, terminal := range map[string]ProxyAssistantMessageEvent{
+		"done":  {Type: "done", Reason: ai.StopReasonStop, Usage: usage},
+		"error": {Type: "error", Reason: ai.StopReasonError, ErrorMessage: &message, Usage: usage},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writeProxyEvents(t, writer, []ProxyAssistantMessageEvent{{Type: "start"}, terminal}, true)
+			}))
+			defer server.Close()
+			_, result := collectProxyEvents(t, StreamProxy(t.Context(), proxyTestModel(), ai.NormalizeContext(ai.Context{}), ProxyStreamOptions{AuthToken: "token", ProxyURL: server.URL}))
+			if result.DurationMs == nil || *result.DurationMs < 0 {
+				t.Fatalf("%s result has no durationMs: %+v", name, result)
+			}
+		})
 	}
 }

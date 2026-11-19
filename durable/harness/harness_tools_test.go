@@ -3,10 +3,13 @@
 
 package harness
 
+// pi: packages/durable/src/harness/tool.ts
+
 import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -32,7 +35,7 @@ func tlTool(name string, execute tlExecute, edit ...func(*durable.ToolRegistrati
 
 // tlNoContent is a tool body that returns an empty content list.
 func tlNoContent(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
-	return durable.ToolExecutionResult{Content: []ai.ToolResultMessageContent{}}, nil
+	return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}}, nil
 }
 
 type tlCall struct {
@@ -45,7 +48,7 @@ type tlCall struct {
 func tlCalls(list ...tlCall) ai.FauxResponse {
 	blocks := make([]ai.FauxContentBlock, 0, len(list))
 	for _, call := range list {
-		blocks = append(blocks, ai.FauxToolCall(call.name, call.args, call.id))
+		blocks = append(blocks, ai.FauxToolCall(call.name, call.args, &ai.FauxToolCallOptions{ID: call.id}))
 	}
 	return ai.FauxResponse{Content: blocks, StopReason: "toolUse"}
 }
@@ -118,7 +121,7 @@ func tlSystems(entries []durable.EntryRecord) []ai.SystemMessage {
 
 func tlDiagnosticCodes(entry durable.EntryRecord) []string {
 	codes := []string{}
-	for _, diagnostic := range entry.Data.(map[string]any)["diagnostics"].([]any) {
+	for _, diagnostic := range plainObject(entry.Data)["diagnostics"].([]any) {
 		code, _ := diagnostic.(map[string]any)["code"].(string)
 		codes = append(codes, code)
 	}
@@ -180,7 +183,71 @@ func tlAddedNames(system ai.SystemMessage) []string {
 	return names
 }
 
+// tool-args-typebox.test.ts is type-level (expectTypeOf): in Pi, execute() and prepareArguments() are typed by the parameter schema.
+// Go's ToolRegistration.Execute and PrepareArguments take `any`, so the schema is enforced at run time: the arguments a tool
+// executes with are the validated JSON of that schema (a required path, an optional integer offset, a string array of tags).
+func TestToolArgumentsOfASchemaReachExecuteAsTheSchemaShape(t *testing.T) {
+	setup := chatSetup(t)
+	type args struct {
+		Path   string
+		Offset *int
+		Tags   []string
+	}
+	seen := &syncList[args]{}
+	parameters := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"path":   map[string]any{"type": "string"},
+			"offset": map[string]any{"type": "integer"},
+			"tags":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+		},
+		"required": []any{"path", "tags"},
+	}
+	addTool(t, setup.Registry, ownTool("read", "Reads a file", parameters, func(_ context.Context, raw any, _ durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
+		object := raw.(map[string]any)
+		got := args{Path: object["path"].(string)}
+		if offset, ok := object["offset"].(float64); ok {
+			value := int(offset)
+			got.Offset = &value
+		}
+		for _, tag := range object["tags"].([]any) {
+			got.Tags = append(got.Tags, tag.(string))
+		}
+		seen.add(got)
+		return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}}, nil
+	}, func(tool *durable.ToolRegistration) {
+		tool.PrepareArguments = func(raw any) (any, error) {
+			object := raw.(map[string]any)
+			if _, ok := object["tags"]; !ok {
+				return map[string]any{"path": object["path"], "tags": []any{}}, nil
+			}
+			return raw, nil
+		}
+	}))
+	run := tlRun(t, setup, []ai.FauxResponseStep{tlCallsStep(
+		tlCall{"read", map[string]any{"path": "a", "offset": float64(2), "tags": []any{"x", "y"}}, "full"},
+		tlCall{"read", map[string]any{"path": "b"}, "prepared"},
+		tlCall{"read", map[string]any{"path": "c", "tags": []any{}, "offset": "abc"}, "badOffset"},
+		tlCall{"read", map[string]any{"path": []any{}, "tags": []any{}}, "badPath"},
+	), tlDone()}, nil)
+	two := 2
+	want := []args{{Path: "a", Offset: &two, Tags: []string{"x", "y"}}, {Path: "b", Tags: nil}}
+	got := seen.all()
+	slices.SortFunc(got, func(a, b args) int { return strings.Compare(a.Path, b.Path) })
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("tool ran with %+v, want %+v", got, want)
+	}
+	byId := tlResultById(run.entries)
+	for _, id := range []string{"badOffset", "badPath"} {
+		if text := tlResultText(byId[id]); !strings.Contains(text, "[error]") {
+			t.Fatalf("%s result %q, want an error result for arguments the schema refuses", id, text)
+		}
+	}
+	mustClose(t, run.harness)
+}
+
 func TestToolRound(t *testing.T) {
+	// harness-tools.test.ts:82 it("runs input, tool call, tool result, and answer, and settles the input")
 	t.Run("runs input, tool call, tool result, and answer, and settles the input", func(t *testing.T) {
 		setup := chatSetup(t)
 		addTool(t, setup.Registry, tlTool("echo", func(_ context.Context, args any, _ durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
@@ -206,7 +273,7 @@ func TestToolRound(t *testing.T) {
 			t.Fatalf("result %+v", results[0])
 		}
 		tlExpectText(t, tlResultText(results[0]), "echo hi")
-		if !reflect.DeepEqual(run.entries[3].Data, map[string]any{"diagnostics": []any{}}) {
+		if !reflect.DeepEqual(plainObject(run.entries[3].Data), map[string]any{"diagnostics": []any{}}) {
 			t.Fatalf("result data %v, want empty diagnostics", run.entries[3].Data)
 		}
 		if run.entries[3].ByTaskId == nil {
@@ -216,21 +283,55 @@ func TestToolRound(t *testing.T) {
 		if setup.Faux.CallCount() != 2 {
 			t.Fatalf("%d provider calls, want 2", setup.Faux.CallCount())
 		}
-		if live, err := run.harness.SnapshotErased(testContext, LiveDoc, run.root.Id()); err != nil || !reflect.DeepEqual(live, durable.JsonObject{}) {
+		if live, err := run.harness.SnapshotErased(testContext, LiveDoc, run.root.Id()); err != nil || live.Len() != 0 {
 			t.Fatalf("live document %v %v, want {}", live, err)
 		}
 		mustClose(t, run.harness)
 	})
 
-	t.Run("answers calls to tools the request did not offer without a task", func(t *testing.T) {
+	// #10395
+	// harness-tools.test.ts:115 it("gives tools and hooks the Harness's models")
+	t.Run("gives tools and hooks the Harness's models", func(t *testing.T) {
+		setup := chatSetup(t)
+		seen := &syncList[durable.Models]{}
+		addTool(t, setup.Registry, tlTool("echo", func(_ context.Context, _ any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
+			seen.add(api.Models())
+			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}}, nil
+		}))
+		addHooks(t, setup.Registry, ToolTask.Erased(), &ToolHooks{BeforeTool: func(_ context.Context, _ ToolHookCall, api HookApi) (*BeforeToolResult, error) {
+			seen.add(api.Models())
+			return nil, nil
+		}})
+		run := tlRun(t, setup, []ai.FauxResponseStep{tlCallsStep(tlCall{"echo", map[string]any{}, "c1"}), tlDone()}, nil)
+		if run.status != durable.SubmissionDone {
+			t.Fatalf("status %s, want done", run.status)
+		}
+		got := seen.all()
+		if len(got) != 2 {
+			t.Fatalf("%d models seen, want the hook's and the tool's", len(got))
+		}
+		if got[0] != got[1] {
+			t.Fatalf("tools and hooks read different views %v and %v of the Harness's models, want one shared view", got[0], got[1])
+		}
+		for _, models := range got {
+			if models.GetModel("faux", "faux-1") != setup.Models.GetModel("faux", "faux-1") {
+				t.Fatalf("api models %v is not a view of the Harness's models %v", models, setup.Models)
+			}
+		}
+		mustClose(t, run.harness)
+	})
+
+	// harness-tools.test.ts:138 it("answers calls to tools the request did not offer through a flagged tool task")
+	t.Run("answers calls to tools the request did not offer through a flagged tool task", func(t *testing.T) {
 		setup := chatSetup(t)
 		addTool(t, setup.Registry, tlTool("echo", tlNoContent))
 		run := tlRun(t, setup, []ai.FauxResponseStep{tlCallsStep(tlCall{"ghost", map[string]any{}, "c1"}, tlCall{"echo", map[string]any{}, "c2"}), tlDone()}, nil)
 		if run.status != durable.SubmissionDone {
 			t.Fatalf("status %s, want done", run.status)
 		}
-		results := tlResults(run.entries)
-		ghost, echo := results[0], results[1]
+		// Pi reads results[0], results[1] and the first result entry: a parallel round appends its results as its tool tasks finish, which Pi's single event loop makes the unoffered call's first (it never resolves a tool) and Go's concurrent tool tasks do not. The spec orders a round's results by call in the context (spec.md, context derivation step 7), so the Go test reads them by call ID.
+		byId := tlResultById(run.entries)
+		ghost, echo := byId["c1"], byId["c2"]
 		if ghost.ToolCallID != "c1" || !ghost.IsError {
 			t.Fatalf("ghost result %+v", ghost)
 		}
@@ -239,29 +340,72 @@ func TestToolRound(t *testing.T) {
 			t.Fatalf("echo result %+v", echo)
 		}
 		wantData := map[string]any{"diagnostics": []any{map[string]any{"severity": "error", "code": "tool_unavailable", "message": "Tool ghost is not available"}}}
-		if got := tlFirstToolResultEntry(t, run.entries).Data; !reflect.DeepEqual(got, wantData) {
+		var ghostEntry durable.EntryRecord
+		for index := range run.entries {
+			if durable.ToolResultEntry.Is(&run.entries[index]) && run.entries[index].Model[0].(ai.ToolResultMessage).ToolCallID == "c1" {
+				ghostEntry = run.entries[index]
+			}
+		}
+		if got := ghostEntry.Data; !reflect.DeepEqual(plainObject(got), wantData) {
 			t.Fatalf("ghost data %v, want %v", got, wantData)
 		}
-		if count := len(tlToolTasks(tlScanTasks(t, run.harness, run.root.Id()))); count != 1 {
-			t.Fatalf("%d tool tasks, want 1", count)
+		// #11043: the unoffered call has its own task, so `afterTool` and `control` apply to it as to any call.
+		inputs := []map[string]any{}
+		for _, task := range tlToolTasks(tlScanTasks(t, run.harness, run.root.Id())) {
+			inputs = append(inputs, plainObject(task.Input))
+		}
+		if len(inputs) != 2 {
+			t.Fatalf("%d tool tasks, want 2", len(inputs))
+		}
+		flagged, plain := 0, 0
+		for _, input := range inputs {
+			if input["unoffered"] == true && input["callId"] == "c1" {
+				flagged++
+			} else if _, has := input["unoffered"]; !has {
+				plain++
+			}
+		}
+		if flagged != 1 || plain != 1 {
+			t.Fatalf("tool task inputs %v, want one flagged unoffered for c1 and one without the flag", inputs)
 		}
 		mustClose(t, run.harness)
 	})
 
+	// #11043
+	// harness-tools.test.ts:171 it("never runs a tool the request did not offer, even when the agent has it")
+	t.Run("never runs a tool the request did not offer, even when the agent has it", func(t *testing.T) {
+		setup := chatSetup(t)
+		var ran atomic.Int32
+		addTool(t, setup.Registry, tlTool("hidden", func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
+			ran.Add(1)
+			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}}, nil
+		}, func(tool *durable.ToolRegistration) { tool.Deferred = true }))
+		run := tlRun(t, setup, []ai.FauxResponseStep{tlCallsStep(tlCall{"hidden", map[string]any{}, "c1"}), tlDone()}, nil)
+		if run.status != durable.SubmissionDone {
+			t.Fatalf("status %s, want done", run.status)
+		}
+		if ran.Load() != 0 {
+			t.Fatalf("the tool ran %d times, want 0", ran.Load())
+		}
+		tlExpectText(t, tlResultText(tlResults(run.entries)[0]), "<harness>\n[error] Tool hidden is not available\n</harness>")
+		mustClose(t, run.harness)
+	})
+
+	// harness-tools.test.ts:162 it("answers a call to a tool deactivated after preparation with tool_unavailable")
 	t.Run("answers a call to a tool deactivated after preparation with tool_unavailable", func(t *testing.T) {
 		setup := chatSetup(t)
 		var seen atomic.Int32
 		addTool(t, setup.Registry, tlTool("echo", func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			seen.Add(1)
-			return durable.ToolExecutionResult{Content: []ai.ToolResultMessageContent{}}, nil
+			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}}, nil
 		}))
 		root := &syncValue[Conversation]{}
-		deactivate := ai.FauxFactoryStep(func(ai.TranscriptContext, ai.StreamOptions, *ai.FauxProviderState, *ai.Model) (ai.FauxResponse, error) {
+		deactivate := ai.FauxFactoryStep(func(ai.TranscriptContext, ai.StreamOptions, *ai.FauxProviderState, *ai.Model) (ai.AssistantMessage, error) {
 			conversation, _ := root.get()
-			if err := conversation.Configure(testContext, AgentChange{Tools: SetTo(ToolChange{Exact: true})}); err != nil {
-				return ai.FauxResponse{}, err
+			if err := conversation.Configure(testContext, AgentChange{Tools: SetTo(ToolChange{List: []*durable.ToolRegistration{}})}); err != nil {
+				return ai.FauxResponse{}.AssistantMessage(), err
 			}
-			return tlCalls(tlCall{"echo", map[string]any{}, "c1"}), nil
+			return tlCalls(tlCall{"echo", map[string]any{}, "c1"}).AssistantMessage(), nil
 		})
 		run := tlRun(t, setup, []ai.FauxResponseStep{deactivate, tlDone()}, func(_ Harness, conversation Conversation) { root.put(conversation) })
 		if seen.Load() != 0 {
@@ -276,6 +420,7 @@ func TestToolRound(t *testing.T) {
 		mustClose(t, run.harness)
 	})
 
+	// harness-tools.test.ts:188 it("removes unregistered active tools from the offer and adds them back after re-registration")
 	t.Run("removes unregistered active tools from the offer and adds them back after re-registration", func(t *testing.T) {
 		setup := chatSetup(t)
 		echo := tlTool("echo", tlNoContent)
@@ -310,13 +455,14 @@ func TestToolRound(t *testing.T) {
 		mustClose(t, first.harness)
 	})
 
+	// harness-tools.test.ts:213 it("produces tool_unavailable when the implementation is unregistered before its task runs")
 	t.Run("produces tool_unavailable when the implementation is unregistered before its task runs", func(t *testing.T) {
 		setup := chatSetup(t)
 		second := &syncValue[installed]{}
 		addTool(t, setup.Registry, tlTool("first", func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			registration, _ := second.get()
 			registration.dispose()
-			return durable.ToolExecutionResult{Content: []ai.ToolResultMessageContent{}}, nil
+			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}}, nil
 		}, func(tool *durable.ToolRegistration) { tool.ExecutionMode = durable.ToolExecutionSequential }))
 		second.put(addTool(t, setup.Registry, tlTool("second", func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			return ownText("ran"), nil
@@ -329,6 +475,7 @@ func TestToolRound(t *testing.T) {
 		mustClose(t, run.harness)
 	})
 
+	// harness-tools.test.ts:238 it("reads the execution mode when a round starts and keeps it for the round")
 	t.Run("reads the execution mode when a round starts and keeps it for the round", func(t *testing.T) {
 		setup := chatSetup(t)
 		events := &syncList[string]{}
@@ -339,15 +486,15 @@ func TestToolRound(t *testing.T) {
 				tlSetExecution(setup, durable.ToolExecutionParallel)
 				time.Sleep(20 * time.Millisecond)
 				events.add("end " + name)
-				return durable.ToolExecutionResult{Content: []ai.ToolResultMessageContent{}}, nil
+				return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}}, nil
 			}
 		}
 		addTool(t, setup.Registry, tlTool("a", slow("a")))
 		addTool(t, setup.Registry, tlTool("b", slow("b")))
 		// Changed while the model request runs: the round that follows uses it.
-		request := ai.FauxFactoryStep(func(ai.TranscriptContext, ai.StreamOptions, *ai.FauxProviderState, *ai.Model) (ai.FauxResponse, error) {
+		request := ai.FauxFactoryStep(func(ai.TranscriptContext, ai.StreamOptions, *ai.FauxProviderState, *ai.Model) (ai.AssistantMessage, error) {
 			tlSetExecution(setup, durable.ToolExecutionSequential)
-			return tlCalls(tlCall{"a", map[string]any{}, "c1"}, tlCall{"b", map[string]any{}, "c2"}), nil
+			return tlCalls(tlCall{"a", map[string]any{}, "c1"}, tlCall{"b", map[string]any{}, "c2"}).AssistantMessage(), nil
 		})
 		run := tlRun(t, setup, []ai.FauxResponseStep{request, tlDone()}, nil)
 		if want := []string{"start a", "end a", "start b", "end b"}; !reflect.DeepEqual(events.all(), want) {
@@ -356,15 +503,32 @@ func TestToolRound(t *testing.T) {
 		mustClose(t, run.harness)
 	})
 
+	// harness-tools.test.ts:263 it("runs a round in parallel by default and sequentially when configured or required by a tool")
 	t.Run("runs a round in parallel by default and sequentially when configured or required by a tool", func(t *testing.T) {
-		trace := func(setup *chatState) []string {
+		trace := func(setup *chatState, parallel bool) ([]string, []string) {
 			events := &syncList[string]{}
+			// A parallel round's calls rendezvous: each ends only after both have started, so "both start before either ends"
+			// holds exactly when the round runs them concurrently, however late the scheduler starts the second. A sequential
+			// round gives the next call a 20ms chance to overlap.
+			var begun atomic.Int32
+			bothStarted := make(chan struct{})
 			slow := func(name string) tlExecute {
-				return func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
+				return func(ctx context.Context, _ any, _ durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 					events.add("start " + name)
-					time.Sleep(20 * time.Millisecond)
+					if !parallel {
+						time.Sleep(20 * time.Millisecond)
+					} else {
+						if begun.Add(1) == 2 {
+							close(bothStarted)
+						}
+						select {
+						case <-bothStarted:
+						case <-ctx.Done():
+						case <-time.After(10 * time.Second):
+						}
+					}
 					events.add("end " + name)
-					return durable.ToolExecutionResult{Content: []ai.ToolResultMessageContent{}}, nil
+					return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}}, nil
 				}
 			}
 			if setup.Registry.Snapshot().Extension("tool:a") == nil {
@@ -373,29 +537,44 @@ func TestToolRound(t *testing.T) {
 			if setup.Registry.Snapshot().Extension("tool:b") == nil {
 				addTool(t, setup.Registry, tlTool("b", slow("b")))
 			}
-			run := tlRun(t, setup, []ai.FauxResponseStep{tlCallsStep(tlCall{"a", map[string]any{}, "c1"}, tlCall{"b", map[string]any{}, "c2"}), tlDone()}, nil)
+			// The transcript keeps the results in the order the calls ended; the next request orders them by call.
+			results := []string{}
+			answer := ai.FauxFactoryStep(func(transcript ai.TranscriptContext, _ ai.StreamOptions, _ *ai.FauxProviderState, _ *ai.Model) (ai.AssistantMessage, error) {
+				for _, message := range transcript.Messages() {
+					if result, ok := message.(ai.ToolResultMessage); ok {
+						results = append(results, result.ToolCallID)
+					}
+				}
+				return ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxText("done")}}.AssistantMessage(), nil
+			})
+			run := tlRun(t, setup, []ai.FauxResponseStep{tlCallsStep(tlCall{"a", map[string]any{}, "c1"}, tlCall{"b", map[string]any{}, "c2"}), answer}, nil)
 			mustClose(t, run.harness)
-			return events.all()
+			return events.all(), results
 		}
-		// Upstream starts the tools of a round in call order; goroutines start in no fixed order, so only the pair is asserted.
-		if got := sortedStrings(trace(chatSetup(t))[:2]); !reflect.DeepEqual(got, []string{"start a", "start b"}) {
-			t.Fatalf("default round %v, want both tools started first", got)
+		// pig divergence (D177): the calls of a parallel round start concurrently, so the order of their starts is
+		// unspecified; both start before either ends, and the next request carries the round's results in call order.
+		defaultRound, results := trace(chatSetup(t), true)
+		if got := defaultRound[:2]; !slices.Equal(got, []string{"start a", "start b"}) && !slices.Equal(got, []string{"start b", "start a"}) {
+			t.Fatalf("default round %v, want both starts before either end", defaultRound)
+		}
+		if want := []string{"c1", "c2"}; !slices.Equal(results, want) {
+			t.Fatalf("default round results %v, want %v", results, want)
 		}
 		configured := chatSetup(t)
 		tlSetExecution(configured, durable.ToolExecutionSequential)
-		if got, want := trace(configured), []string{"start a", "end a", "start b", "end b"}; !reflect.DeepEqual(got, want) {
-			t.Fatalf("sequential round %v, want %v", got, want)
+		if got, _ := trace(configured, false); !reflect.DeepEqual(got, []string{"start a", "end a", "start b", "end b"}) {
+			t.Fatalf("sequential round %v, want [start a end a start b end b]", got)
 		}
 		perTool := chatSetup(t)
 		events := &syncList[string]{}
 		addTool(t, perTool.Registry, tlTool("a", func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			time.Sleep(20 * time.Millisecond)
 			events.add("a")
-			return durable.ToolExecutionResult{Content: []ai.ToolResultMessageContent{}}, nil
+			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}}, nil
 		}, func(tool *durable.ToolRegistration) { tool.ExecutionMode = durable.ToolExecutionSequential }))
 		addTool(t, perTool.Registry, tlTool("b", func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			events.add("b")
-			return durable.ToolExecutionResult{Content: []ai.ToolResultMessageContent{}}, nil
+			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}}, nil
 		}))
 		run := tlRun(t, perTool, []ai.FauxResponseStep{tlCallsStep(tlCall{"a", map[string]any{}, "c1"}, tlCall{"b", map[string]any{}, "c2"}), tlDone()}, nil)
 		tasks := tlScanTasks(t, run.harness, run.root.Id())
@@ -425,7 +604,11 @@ func TestToolRound(t *testing.T) {
 	})
 }
 
+// Pi source: packages/durable/src/harness/types.ts
+// mutation-checked: zeroing the results of HookApi.ConversationId fails it
+// mutation-checked: dropping the reads and writes of ShellOutputWindow.MinIntervalMs fails it
 func TestToolResults(t *testing.T) {
+	// harness-tools.test.ts:320 it("uses retained output and the last details when the result omits them, with diagnostics in order")
 	t.Run("uses retained output and the last details when the result omits them, with diagnostics in order", func(t *testing.T) {
 		setup := chatSetup(t)
 		addTool(t, setup.Registry, tlTool("log", func(ctx context.Context, _ any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
@@ -455,8 +638,9 @@ func TestToolResults(t *testing.T) {
 		mustClose(t, run.harness)
 	})
 
+	// harness-tools.test.ts:352 it("offers the tail window with the configured pace, not a head window, and accepts skipped output")
 	t.Run("offers the tail window with the configured pace, not a head window, and accepts skipped output", func(t *testing.T) {
-		// upstream: packages/durable/test/harness-tools.test.ts:328
+		// upstream: packages/durable/test/harness-tools.test.ts:352
 		setup := chatSetup(t)
 		setup.SetSettings(func(settings *HarnessSettings) {
 			settings.Progress = &ProgressPolicyPatch{OutputIntervalMs: new(250.0)}
@@ -471,7 +655,7 @@ func TestToolResults(t *testing.T) {
 		addTool(t, setup.Registry, tlTool("tailed", func(_ context.Context, _ any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			record(api.OutputWindow())
 			api.Output("dropped\n")
-			api.OutputSkipping("x\ny\n", env.ShellOutputSkip{Bytes: 8, Newlines: 1, EndsWithNewline: true})
+			api.Output("x\ny\n", env.ShellOutputSkip{Bytes: 8, Newlines: 1, EndsWithNewline: true})
 			return durable.ToolExecutionResult{}, nil
 		}, func(tool *durable.ToolRegistration) {
 			lines := 1
@@ -506,10 +690,11 @@ func TestToolResults(t *testing.T) {
 		mustClose(t, run.harness)
 	})
 
+	// harness-tools.test.ts:394 it("bounds explicit text content and keeps other content")
 	t.Run("bounds explicit text content and keeps other content", func(t *testing.T) {
 		setup := chatSetup(t)
 		addTool(t, setup.Registry, tlTool("big", func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
-			return durable.ToolExecutionResult{Content: []ai.ToolResultMessageContent{
+			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{
 				ai.TextContent{Text: "a\nb\n"}, ai.ImageContent{Data: "AAAA", MimeType: "image/png"}, ai.TextContent{Text: "c\nd\n"},
 			}}, nil
 		}, func(tool *durable.ToolRegistration) {
@@ -521,6 +706,7 @@ func TestToolResults(t *testing.T) {
 		mustClose(t, run.harness)
 	})
 
+	// harness-tools.test.ts:414 it("turns a throw into a tool_error result with the partial output")
 	t.Run("turns a throw into a tool_error result with the partial output", func(t *testing.T) {
 		setup := chatSetup(t)
 		addTool(t, setup.Registry, tlTool("fail", func(_ context.Context, _ any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
@@ -539,15 +725,63 @@ func TestToolResults(t *testing.T) {
 		mustClose(t, run.harness)
 	})
 
+	// #10549
+	// harness-tools.test.ts:432 it("records how long execute() took, excluding hooks, and nothing for calls that did not run")
+	t.Run("records how long execute() took, excluding hooks, and nothing for calls that did not run", func(t *testing.T) {
+		setup := chatSetup(t)
+		sleep := func(ms int) { time.Sleep(time.Duration(ms) * time.Millisecond) }
+		addTool(t, setup.Registry, tlTool("slow", func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
+			sleep(30)
+			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}}, nil
+		}))
+		addTool(t, setup.Registry, tlTool("thrower", func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
+			sleep(30)
+			return durable.ToolExecutionResult{}, errors.New("boom")
+		}))
+		addHooks(t, setup.Registry, ToolTask.Erased(), &ToolHooks{BeforeTool: func(_ context.Context, call ToolHookCall, _ HookApi) (*BeforeToolResult, error) {
+			sleep(100)
+			if call.ID == "blocked" {
+				reason := "no"
+				return &BeforeToolResult{Block: &reason}, nil
+			}
+			return nil, nil
+		}})
+		run := tlRun(t, setup, []ai.FauxResponseStep{
+			tlCallsStep(tlCall{"slow", map[string]any{}, "slow"}, tlCall{"thrower", map[string]any{}, "thrower"}, tlCall{"slow", map[string]any{}, "blocked"}),
+			tlDone(),
+		}, nil)
+		byId := map[string]ai.ToolResultMessage{}
+		for _, result := range tlResults(run.entries) {
+			byId[result.ToolCallID] = result
+		}
+		for _, id := range []string{"slow", "thrower"} {
+			duration := byId[id].DurationMs
+			if duration == nil {
+				t.Fatalf("%s recorded no durationMs, want [25, 100)", id)
+			}
+			if *duration < 25 || *duration >= 100 {
+				t.Fatalf("%s durationMs %d, want [25, 100): the execute() time, not the hook's", id, *duration)
+			}
+		}
+		if !byId["thrower"].IsError {
+			t.Fatalf("thrower result %+v is not an error", byId["thrower"])
+		}
+		if byId["blocked"].DurationMs != nil {
+			t.Fatalf("blocked call has durationMs %d, want none", *byId["blocked"].DurationMs)
+		}
+		mustClose(t, run.harness)
+	})
+
+	// harness-tools.test.ts:469 it("validates arguments before and after beforeTool and applies blocks and replacements")
 	t.Run("validates arguments before and after beforeTool and applies blocks and replacements", func(t *testing.T) {
 		setup := chatSetup(t)
 		seen := &syncList[string]{}
 		addTool(t, setup.Registry, tlTool("echo", func(_ context.Context, args any, _ durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			text, _ := args.(map[string]any)["text"].(string)
 			seen.add(text)
-			return durable.ToolExecutionResult{Content: []ai.ToolResultMessageContent{}}, nil
+			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}}, nil
 		}))
-		addHooks(t, setup.Registry, ToolTask, &ToolHooks{BeforeTool: func(_ context.Context, call ai.ToolCall, _ HookApi) (*BeforeToolResult, error) {
+		addHooks(t, setup.Registry, ToolTask.Erased(), &ToolHooks{BeforeTool: func(_ context.Context, call ToolHookCall, _ HookApi) (*BeforeToolResult, error) {
 			switch call.ID {
 			case "block":
 				reason := "not today"
@@ -555,9 +789,9 @@ func TestToolResults(t *testing.T) {
 			case "throw":
 				return nil, errors.New("hook failed")
 			case "bad":
-				return &BeforeToolResult{Arguments: durable.JsonObject{"text": map[string]any{"not": "a string"}}}, nil
+				return &BeforeToolResult{Arguments: map[string]any{"text": map[string]any{"not": "a string"}}}, nil
 			}
-			return &BeforeToolResult{Arguments: durable.JsonObject{"text": fmt.Sprintf("%v!", call.Arguments["text"])}}, nil
+			return &BeforeToolResult{Arguments: map[string]any{"text": fmt.Sprintf("%v!", call.Arguments["text"])}}, nil
 		}})
 		run := tlRun(t, setup, []ai.FauxResponseStep{tlCallsStep(
 			tlCall{"echo", map[string]any{"text": float64(1)}, "coerced"},
@@ -599,16 +833,17 @@ func TestToolResults(t *testing.T) {
 		mustClose(t, run.harness)
 	})
 
+	// harness-tools.test.ts:514 it("repairs arguments with prepareArguments before validation, and a throwing repair is invalid")
 	t.Run("repairs arguments with prepareArguments before validation, and a throwing repair is invalid", func(t *testing.T) {
 		setup := chatSetup(t)
 		seen := &syncList[string]{}
 		addTool(t, setup.Registry, tlTool("echo", func(_ context.Context, args any, _ durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			text, _ := args.(map[string]any)["text"].(string)
 			seen.add(text)
-			return durable.ToolExecutionResult{Content: []ai.ToolResultMessageContent{}}, nil
+			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}}, nil
 		}, func(tool *durable.ToolRegistration) {
 			tool.PrepareArguments = func(args any) (any, error) {
-				text := args.(durable.JsonObject)["text"]
+				text := args.(map[string]any)["text"]
 				if text == "throw" {
 					return nil, errors.New("cannot repair")
 				}
@@ -639,19 +874,20 @@ func TestToolResults(t *testing.T) {
 		mustClose(t, run.harness)
 	})
 
+	// harness-tools.test.ts:548 it("lets the first beforeTool block win and skips later handlers")
 	t.Run("lets the first beforeTool block win and skips later handlers", func(t *testing.T) {
 		setup := chatSetup(t)
 		addTool(t, setup.Registry, tlTool("echo", tlNoContent))
 		asked := &syncList[string]{}
 		block := func(label string) *ToolHooks {
-			return &ToolHooks{BeforeTool: func(context.Context, ai.ToolCall, HookApi) (*BeforeToolResult, error) {
+			return &ToolHooks{BeforeTool: func(context.Context, ToolHookCall, HookApi) (*BeforeToolResult, error) {
 				asked.add(label)
 				reason := label + " says no"
 				return &BeforeToolResult{Block: &reason}, nil
 			}}
 		}
-		addHooks(t, setup.Registry, ToolTask, block("first"))
-		addHooks(t, setup.Registry, ToolTask, block("second"))
+		addHooks(t, setup.Registry, ToolTask.Erased(), block("first"))
+		addHooks(t, setup.Registry, ToolTask.Erased(), block("second"))
 		run := tlRun(t, setup, []ai.FauxResponseStep{tlCallsStep(tlCall{"echo", map[string]any{}, "c1"}), tlDone()}, nil)
 		if !reflect.DeepEqual(asked.all(), []string{"first"}) {
 			t.Fatalf("asked %v, want [first]", asked.all())
@@ -660,23 +896,26 @@ func TestToolResults(t *testing.T) {
 		mustClose(t, run.harness)
 	})
 
+	// harness-tools.test.ts:573 it("chains afterTool replacements and observes the round with afterTools")
 	t.Run("chains afterTool replacements and observes the round with afterTools", func(t *testing.T) {
 		setup := chatSetup(t)
 		addTool(t, setup.Registry, tlTool("echo", func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			return ownText("raw"), nil
 		}))
-		addHooks(t, setup.Registry, ToolTask, &ToolHooks{AfterTool: func(_ context.Context, _ ai.ToolCall, result durable.ToolExecutionResult, _ HookApi) (*durable.ToolExecutionResult, error) {
-			result.Content = []ai.ToolResultMessageContent{ai.TextContent{Text: "first"}}
+		addHooks(t, setup.Registry, ToolTask.Erased(), &ToolHooks{AfterTool: func(_ context.Context, _ ToolHookCall, result durable.ToolExecutionResult, _ HookApi) (*durable.ToolExecutionResult, error) {
+			result.Output = []ai.ToolResultMessageContent{ai.TextContent{Text: "first"}}
 			return &result, nil
 		}})
-		addHooks(t, setup.Registry, ToolTask, &ToolHooks{AfterTool: func(_ context.Context, _ ai.ToolCall, result durable.ToolExecutionResult, _ HookApi) (*durable.ToolExecutionResult, error) {
-			text := ""
-			for _, item := range result.Content {
+		addHooks(t, setup.Registry, ToolTask.Erased(), &ToolHooks{AfterTool: func(_ context.Context, _ ToolHookCall, result durable.ToolExecutionResult, _ HookApi) (*durable.ToolExecutionResult, error) {
+			parts := make([]string, 0, len(result.Output))
+			for _, item := range result.Output {
+				text := ""
 				if content, ok := item.(ai.TextContent); ok {
-					text += content.Text
+					text = content.Text
 				}
+				parts = append(parts, text)
 			}
-			result.Details, result.HasDetails = map[string]any{"replaced": text}, true
+			result.Details, result.HasDetails = map[string]any{"replaced": strings.Join(parts, "|")}, true
 			return &result, nil
 		}})
 		type observation struct {
@@ -684,7 +923,7 @@ func TestToolResults(t *testing.T) {
 			results   []durable.EntryId
 		}
 		observed := &syncList[observation]{}
-		addHooks(t, setup.Registry, GenerationTask, &GenerationHooks{AfterTools: func(_ context.Context, assistant durable.EntryId, results []durable.EntryId, _ HookApi) error {
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{AfterTools: func(_ context.Context, assistant durable.EntryId, results []durable.EntryId, _ HookApi) error {
 			observed.add(observation{assistant, results})
 			return nil
 		}})
@@ -701,11 +940,12 @@ func TestToolResults(t *testing.T) {
 		mustClose(t, run.harness)
 	})
 
+	// harness-tools.test.ts:603 it("runs the hooks of the selected extensions; a task-owned child copies its owner's selection")
 	t.Run("runs the hooks of the selected extensions; a task-owned child copies its owner's selection", func(t *testing.T) {
 		setup := chatSetup(t)
 		calledIn := &syncList[durable.ConversationId]{}
 		echo := new(durable.Extension{Name: "echo", Tools: []*durable.ToolRegistration{tlTool("echo", tlNoContent)}})
-		audit := new(durable.Extension{Name: "audit", Hooks: []durable.HookRegistration{Hook(ToolTask, &ToolHooks{BeforeTool: func(_ context.Context, _ ai.ToolCall, api HookApi) (*BeforeToolResult, error) {
+		audit := new(durable.Extension{Name: "audit", Hooks: []durable.HookRegistration{Hook(ToolTask, &ToolHooks{BeforeTool: func(_ context.Context, _ ToolHookCall, api HookApi) (*BeforeToolResult, error) {
 			calledIn.add(api.ConversationId())
 			return nil, nil
 		}})}})
@@ -713,7 +953,7 @@ func TestToolResults(t *testing.T) {
 		// Audit is installed but not in the default selection.
 		tlSetExtensions(setup, []*durable.Extension{echo})
 		first := tlRun(t, setup, []ai.FauxResponseStep{tlDone()}, nil)
-		mustConfigure(t, first.root, AgentChange{Extensions: SetTo(ExtensionChange{Add: []*durable.Extension{audit}})})
+		mustConfigure(t, first.root, AgentChange{Extensions: SetTo(ExtensionChange{Edit: &ExtensionEdit{Add: []*durable.Extension{audit}}})})
 		// An owner task no registered definition takes stays live and pending.
 		type ownerInput struct{}
 		owner := durable.DefineTask(durable.TaskDefinition[ownerInput, stepState, durable.JsonValue, any]{
@@ -754,19 +994,20 @@ func TestToolResults(t *testing.T) {
 		mustClose(t, first.harness)
 	})
 
+	// harness-tools.test.ts:646 it("applies addTools and terminates only when every result of the round asks to")
 	t.Run("applies addTools and terminates only when every result of the round asks to", func(t *testing.T) {
 		setup := chatSetup(t)
 		stop := tlTool("stop", func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
-			return durable.ToolExecutionResult{Content: []ai.ToolResultMessageContent{}, Control: &durable.ToolControl{Terminate: true}}, nil
+			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}, Control: &durable.ToolControl{Terminate: true}}, nil
 		})
 		grow := tlTool("grow", func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
-			return durable.ToolExecutionResult{Content: []ai.ToolResultMessageContent{}, Control: &durable.ToolControl{AddTools: []string{"extra", "stop"}}}, nil
+			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}, Control: &durable.ToolControl{AddTools: []string{"extra", "stop"}}}, nil
 		})
 		addTool(t, setup.Registry, stop)
 		addTool(t, setup.Registry, grow)
 		addTool(t, setup.Registry, tlTool("extra", tlNoContent))
 		first := tlRun(t, setup, []ai.FauxResponseStep{tlCallsStep(tlCall{"stop", map[string]any{}, "c1"})}, func(_ Harness, root Conversation) {
-			mustConfigure(t, root, AgentChange{Tools: SetTo(ToolChange{Exact: true, List: []*durable.ToolRegistration{stop, grow}})})
+			mustConfigure(t, root, AgentChange{Tools: SetTo(ToolChange{List: []*durable.ToolRegistration{stop, grow}})})
 		})
 		if first.status != durable.SubmissionDone {
 			t.Fatalf("status %s, want done", first.status)
@@ -795,6 +1036,26 @@ func TestToolResults(t *testing.T) {
 		}
 		mustClose(t, first.harness)
 	})
+
+	// harness-tools.test.ts:677 (Pi 6085986e, #10858) it("does not terminate on terminate: false"). Go's Terminate is a
+	// bool whose false is absent, so the control is no-op as Pi's `terminate?: boolean` false is.
+	t.Run("does not terminate on terminate: false", func(t *testing.T) {
+		setup := chatSetup(t)
+		keep := tlTool("keep", func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
+			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}, Control: &durable.ToolControl{Terminate: false}}, nil
+		})
+		addTool(t, setup.Registry, keep)
+		run := tlRun(t, setup, []ai.FauxResponseStep{tlCallsStep(tlCall{"keep", map[string]any{}, "c1"}), tlDone()}, func(_ Harness, root Conversation) {
+			mustConfigure(t, root, AgentChange{Tools: SetTo(ToolChange{List: []*durable.ToolRegistration{keep}})})
+		})
+		if run.status != durable.SubmissionDone {
+			t.Fatalf("status %s, want done", run.status)
+		}
+		if last := run.entries[len(run.entries)-1].Kind; last != "pi.assistant" {
+			t.Fatalf("last entry %s, want pi.assistant", last)
+		}
+		mustClose(t, run.harness)
+	})
 }
 
 func tlRoleText(message ai.Message) string {
@@ -813,29 +1074,30 @@ func tlRoleText(message ai.Message) string {
 }
 
 func TestGenerationHooks(t *testing.T) {
+	// harness-tools.test.ts:679 it("replaces request messages, observes responses, and continues on yield")
 	t.Run("replaces request messages, observes responses, and continues on yield", func(t *testing.T) {
 		setup := chatSetup(t)
 		requests := &syncList[[]string]{}
-		record := ai.FauxFactoryStep(func(request ai.TranscriptContext, _ ai.StreamOptions, _ *ai.FauxProviderState, _ *ai.Model) (ai.FauxResponse, error) {
+		record := ai.FauxFactoryStep(func(request ai.TranscriptContext, _ ai.StreamOptions, _ *ai.FauxProviderState, _ *ai.Model) (ai.AssistantMessage, error) {
 			rendered := []string{}
 			for _, message := range request.Messages() {
 				rendered = append(rendered, tlRoleText(message))
 			}
 			requests.add(rendered)
-			return ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxText(fmt.Sprintf("answer %d", requests.len()))}}, nil
+			return ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxText(fmt.Sprintf("answer %d", requests.len()))}}.AssistantMessage(), nil
 		})
-		addHooks(t, setup.Registry, GenerationTask, &GenerationHooks{BeforeRequest: func(_ context.Context, request GenerationRequest, _ HookApi) (*GenerationRequest, error) {
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{BeforeRequest: func(_ context.Context, request GenerationRequest, _ HookApi) (*GenerationRequest, error) {
 			messages := append(slices.Clone(request.Messages), ai.UserMessage{Content: ai.UserText("injected"), Timestamp: 0})
 			return &GenerationRequest{Messages: messages}, nil
 		}})
 		responses := &syncList[string]{}
-		addHooks(t, setup.Registry, GenerationTask, &GenerationHooks{AfterResponse: func(_ context.Context, message ai.AssistantMessage, _ HookApi) error {
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{AfterResponse: func(_ context.Context, message ai.AssistantMessage, _ HookApi) error {
 			text, _ := textOf(message)
 			responses.add(text)
 			return nil
 		}})
 		var yields atomic.Int32
-		addHooks(t, setup.Registry, GenerationTask, &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (*YieldContinue, error) {
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (*YieldContinue, error) {
 			if yields.Add(1) == 1 {
 				return &YieldContinue{Continue: ai.UserContentBlocks{ai.TextContent{Text: "keep going"}}}, nil
 			}
@@ -870,27 +1132,122 @@ func TestGenerationHooks(t *testing.T) {
 		mustClose(t, run.harness)
 	})
 
+	// harness-tools.test.ts:755 it("chains beforeProviderRequest over every provider request body") (Pi d280e1ff)
+	t.Run("chains beforeProviderRequest over every provider request body", func(t *testing.T) {
+		setup := chatSetup(t)
+		type seenRequest struct {
+			hook    string
+			model   string
+			payload any
+		}
+		seen := &syncList[seenRequest]{}
+		extend := func(payload any, key string) map[string]any {
+			next := maps.Clone(payload.(map[string]any))
+			next[key] = true
+			return next
+		}
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{BeforeProviderRequest: func(_ context.Context, request ProviderRequest, _ HookApi) (*ProviderPayload, error) {
+			seen.add(seenRequest{"first", request.Model.ProviderMeta.ProviderID + "/" + request.Model.ID, request.Payload})
+			return &ProviderPayload{Payload: extend(request.Payload, "first")}, nil
+		}})
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{BeforeProviderRequest: func(_ context.Context, request ProviderRequest, _ HookApi) (*ProviderPayload, error) {
+			seen.add(seenRequest{"keep", request.Model.ProviderMeta.ProviderID + "/" + request.Model.ID, request.Payload})
+			return nil, nil
+		}})
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{BeforeProviderRequest: func(_ context.Context, request ProviderRequest, _ HookApi) (*ProviderPayload, error) {
+			return &ProviderPayload{Payload: extend(request.Payload, "last")}, nil
+		}})
+		sent := &syncList[any]{}
+		// pi-ai builds a body per provider call, and again when it resends within one attempt.
+		respond := ai.FauxFactoryStep(func(_ ai.TranscriptContext, options ai.StreamOptions, _ *ai.FauxProviderState, model *ai.Model) (ai.AssistantMessage, error) {
+			for _, body := range []float64{1, 2} {
+				replaced, err := options.OnPayload(map[string]any{"body": body}, model)
+				if err != nil {
+					return ai.AssistantMessage{}, err
+				}
+				sent.add(replaced)
+			}
+			return ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxText("done")}}.AssistantMessage(), nil
+		})
+		run := tlRun(t, setup, []ai.FauxResponseStep{respond}, nil)
+		if run.status != durable.SubmissionDone {
+			t.Fatalf("status %s, want done", run.status)
+		}
+		wantSent := []any{
+			map[string]any{"body": 1.0, "first": true, "last": true},
+			map[string]any{"body": 2.0, "first": true, "last": true},
+		}
+		if !reflect.DeepEqual(sent.all(), wantSent) {
+			t.Fatalf("sent %v, want %v", sent.all(), wantSent)
+		}
+		wantSeen := []seenRequest{
+			{"first", "faux/faux-1", map[string]any{"body": 1.0}},
+			{"keep", "faux/faux-1", map[string]any{"body": 1.0, "first": true}},
+			{"first", "faux/faux-1", map[string]any{"body": 2.0}},
+			{"keep", "faux/faux-1", map[string]any{"body": 2.0, "first": true}},
+		}
+		if !reflect.DeepEqual(seen.all(), wantSeen) {
+			t.Fatalf("seen %v, want %v", seen.all(), wantSeen)
+		}
+		mustClose(t, run.harness)
+	})
+
+	// harness-tools.test.ts:787 it("reports a throwing beforeProviderRequest hook and continues the chain") (Pi d280e1ff)
+	t.Run("reports a throwing beforeProviderRequest hook and continues the chain", func(t *testing.T) {
+		setup := chatSetup(t)
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{BeforeProviderRequest: func(context.Context, ProviderRequest, HookApi) (*ProviderPayload, error) {
+			return nil, errors.New("broken hook")
+		}}, "broken")
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{BeforeProviderRequest: func(_ context.Context, request ProviderRequest, _ HookApi) (*ProviderPayload, error) {
+			next := maps.Clone(request.Payload.(map[string]any))
+			next["after"] = true
+			return &ProviderPayload{Payload: next}, nil
+		}})
+		sent := &syncValue[any]{}
+		respond := ai.FauxFactoryStep(func(_ ai.TranscriptContext, options ai.StreamOptions, _ *ai.FauxProviderState, model *ai.Model) (ai.AssistantMessage, error) {
+			replaced, err := options.OnPayload(map[string]any{"body": 1.0}, model)
+			if err != nil {
+				return ai.AssistantMessage{}, err
+			}
+			sent.put(replaced)
+			return ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxText("done")}}.AssistantMessage(), nil
+		})
+		run := tlRun(t, setup, []ai.FauxResponseStep{respond}, nil)
+		if run.status != durable.SubmissionDone {
+			t.Fatalf("status %s, want done", run.status)
+		}
+		if got, _ := sent.get(); !reflect.DeepEqual(got, map[string]any{"body": 1.0, "after": true}) {
+			t.Fatalf("sent %v, want body 1 with after", got)
+		}
+		infos := arInfosOf(setup, durable.ReportExtensionError)
+		if len(infos) != 1 || infos[0].Extension != "broken" {
+			t.Fatalf("extension_error infos = %+v, want one for broken", infos)
+		}
+		mustClose(t, run.harness)
+	})
+
+	// harness-tools.test.ts:709 it("keeps the run's input open across an onYield continuation and answers it with the final answer")
 	t.Run("keeps the run's input open across an onYield continuation and answers it with the final answer", func(t *testing.T) {
 		setup := chatSetup(t)
 		var yields atomic.Int32
 		harnessRef := &syncValue[Harness]{}
 		input := &syncValue[durable.SubmissionId]{}
 		statusAtSecondRequest := &syncValue[durable.SubmissionStatus]{}
-		addHooks(t, setup.Registry, GenerationTask, &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (*YieldContinue, error) {
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (*YieldContinue, error) {
 			if yields.Add(1) == 1 {
 				return &YieldContinue{Continue: ai.UserText("again")}, nil
 			}
 			return nil, nil
 		}})
-		second := ai.FauxFactoryStep(func(ai.TranscriptContext, ai.StreamOptions, *ai.FauxProviderState, *ai.Model) (ai.FauxResponse, error) {
+		second := ai.FauxFactoryStep(func(ai.TranscriptContext, ai.StreamOptions, *ai.FauxProviderState, *ai.Model) (ai.AssistantMessage, error) {
 			harness, _ := harnessRef.get()
 			live, err := durable.Snapshot[LiveState](testContext, harness, LiveDoc, durable.ConversationId(1))
 			if err != nil || live == nil || live.Run == nil || len(live.Run.Inputs) == 0 {
-				return ai.FauxResponse{}, fmt.Errorf("live run %+v: %w", live, err)
+				return ai.FauxResponse{}.AssistantMessage(), fmt.Errorf("live run %+v: %w", live, err)
 			}
 			input.put(live.Run.Inputs[0])
 			statusAtSecondRequest.put(ownSubmissionStatus(t, harness, live.Run.Inputs[0]).Status)
-			return ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxText("second")}}, nil
+			return ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxText("second")}}.AssistantMessage(), nil
 		})
 		run := tlRun(t, setup, []ai.FauxResponseStep{fauxAnswer("first"), second}, func(harness Harness, _ Conversation) { harnessRef.put(harness) })
 		if status, _ := statusAtSecondRequest.get(); status != durable.SubmissionPlaced {
@@ -910,10 +1267,11 @@ func TestGenerationHooks(t *testing.T) {
 		mustClose(t, run.harness)
 	})
 
+	// harness-tools.test.ts:735 it("observes responses that arrive by polling a deferred request")
 	t.Run("observes responses that arrive by polling a deferred request", func(t *testing.T) {
 		setup := chatSetup(t, ai.FauxConfig{Deferred: &ai.FauxDeferredConfig{PendingFetches: 1, PollAfterMS: new(int64(1))}})
 		observed := &syncList[string]{}
-		addHooks(t, setup.Registry, GenerationTask, &GenerationHooks{AfterResponse: func(_ context.Context, message ai.AssistantMessage, _ HookApi) error {
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{AfterResponse: func(_ context.Context, message ai.AssistantMessage, _ HookApi) error {
 			text, _ := textOf(message)
 			observed.add(fmt.Sprintf("%s:%s", message.StopReason, text))
 			return nil
@@ -932,25 +1290,26 @@ func TestGenerationHooks(t *testing.T) {
 		mustClose(t, run.harness)
 	})
 
+	// harness-tools.test.ts:749 it("lets the first onYield continuation win and reports throws without stopping later handlers")
 	t.Run("lets the first onYield continuation win and reports throws without stopping later handlers", func(t *testing.T) {
 		setup := chatSetup(t)
 		called := &syncList[string]{}
-		addHooks(t, setup.Registry, GenerationTask, &GenerationHooks{AfterResponse: func(context.Context, ai.AssistantMessage, HookApi) error {
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{AfterResponse: func(context.Context, ai.AssistantMessage, HookApi) error {
 			called.add("throwing observer")
 			return errors.New("observer failed")
 		}})
-		addHooks(t, setup.Registry, GenerationTask, &GenerationHooks{AfterResponse: func(context.Context, ai.AssistantMessage, HookApi) error {
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{AfterResponse: func(context.Context, ai.AssistantMessage, HookApi) error {
 			called.add("next observer")
 			return nil
 		}})
 		var yields atomic.Int32
-		addHooks(t, setup.Registry, GenerationTask, &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (*YieldContinue, error) {
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (*YieldContinue, error) {
 			if yields.Add(1) == 1 {
 				return &YieldContinue{Continue: ai.UserText("first")}, nil
 			}
 			return nil, nil
 		}})
-		addHooks(t, setup.Registry, GenerationTask, &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (*YieldContinue, error) {
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (*YieldContinue, error) {
 			called.add("second onYield")
 			count := 0
 			for _, name := range called.all() {
@@ -997,11 +1356,12 @@ func TestGenerationHooks(t *testing.T) {
 		mustClose(t, run.harness)
 	})
 
+	// harness-tools.test.ts:783 it("keeps durable hook decisions in task memos")
 	t.Run("keeps durable hook decisions in task memos", func(t *testing.T) {
 		setup := chatSetup(t)
 		var asked atomic.Int32
 		addTool(t, setup.Registry, tlTool("echo", tlNoContent))
-		addHooks(t, setup.Registry, ToolTask, &ToolHooks{BeforeTool: func(ctx context.Context, _ ai.ToolCall, api HookApi) (*BeforeToolResult, error) {
+		addHooks(t, setup.Registry, ToolTask.Erased(), &ToolHooks{BeforeTool: func(ctx context.Context, _ ToolHookCall, api HookApi) (*BeforeToolResult, error) {
 			asked.Add(1)
 			decision, err := api.MemoCandidate(ctx, "approval:decision", "approved")
 			if err != nil {
@@ -1028,7 +1388,11 @@ func TestGenerationHooks(t *testing.T) {
 	})
 }
 
+// Pi: packages/durable/src/harness/types.ts:173 (agent).
+// Pi: packages/durable/src/harness/types.ts:169 (callId).
+// Pi: packages/durable/src/harness/types.ts:171 (registry).
 func TestToolExecutionApi(t *testing.T) {
+	// harness-tools.test.ts:805 it("builds the environment per call from the conversation's cwd and runs commits, memos, and child tasks")
 	t.Run("builds the environment per call from the conversation's cwd and runs commits, memos, and child tasks", func(t *testing.T) {
 		setup := chatSetup(t)
 		type childInput struct {
@@ -1049,7 +1413,7 @@ func TestToolExecutionApi(t *testing.T) {
 			},
 			Abort: tkNoopAbort[childInput, stepState, durable.JsonValue, any],
 		})
-		addTask(t, setup.Registry, child)
+		addTask(t, setup.Registry, child.Erased())
 		seen := &syncList[any]{}
 		probe := tlTool("probe", func(ctx context.Context, _ any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			seen.add(api.Env().Cwd())
@@ -1086,7 +1450,7 @@ func TestToolExecutionApi(t *testing.T) {
 			seen.add(first)
 			seen.add(second)
 			input, _ := durable.ToJsonValue(childInput{N: 21})
-			id, err := api.CreateTaskErased(testContext, child, input, durable.TaskOptions{Ownership: conversationOwned})
+			id, err := api.CreateTaskErased(testContext, child.Erased(), input, durable.TaskOptions{Ownership: conversationOwned})
 			if err != nil {
 				return durable.ToolExecutionResult{}, err
 			}
@@ -1095,7 +1459,22 @@ func TestToolExecutionApi(t *testing.T) {
 				return durable.ToolExecutionResult{}, err
 			}
 			seen.add(describeOutcome(*done.State.Outcome))
-			return durable.ToolExecutionResult{Content: []ai.ToolResultMessageContent{}}, nil
+			// packages/durable/src/harness/types.ts:192 memo(name) reads the stored memo; :200 getTask(id) reads the child's record.
+			stored, present, err := api.Memo(testContext, "m")
+			if err != nil || !present || stored != first {
+				t.Errorf("Memo(m) = %v, %v, %v; want the first candidate %v", stored, present, err, first)
+			}
+			if _, absent, err := api.Memo(testContext, "never-written"); err != nil || absent {
+				t.Errorf("Memo(never-written) = %v, %v", absent, err)
+			}
+			record, err := api.GetTask(testContext, id)
+			if err != nil || record == nil || record.State.Outcome == nil || describeOutcome(*record.State.Outcome) != describeOutcome(*done.State.Outcome) {
+				t.Errorf("GetTask(%v) = %+v, %v", id, record, err)
+			}
+			if missing, err := api.GetTask(testContext, id+1000000); err != nil || missing != nil {
+				t.Errorf("GetTask(absent) = %+v, %v", missing, err)
+			}
+			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}}, nil
 		})
 		addTool(t, setup.Registry, probe)
 		setup.Faux.SetResponses([]ai.FauxResponseStep{tlCallsStep(tlCall{"probe", map[string]any{}, "c1"}, tlCall{"probe", map[string]any{}, "c2"}), tlDone()})
@@ -1133,6 +1512,7 @@ func TestToolExecutionApi(t *testing.T) {
 		mustClose(t, harness)
 	})
 
+	// harness-tools.test.ts:859 it("answers a throwing environment with a tool_error result and reports it once while preparing")
 	t.Run("answers a throwing environment with a tool_error result and reports it once while preparing", func(t *testing.T) {
 		setup := chatSetup(t)
 		addTool(t, setup.Registry, tlTool("probe", func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {

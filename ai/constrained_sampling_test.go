@@ -59,7 +59,7 @@ func TestMakeStrictJSONSchema(t *testing.T) {
 		"required": []any{"path", "metadata"},
 	}
 
-	strict, err := makeStrictJSONSchema(parameters)
+	strict, err := MakeStrictJSONSchema(parameters, nil)
 	if err != nil {
 		t.Fatalf("makeStrictJSONSchema: %v", err)
 	}
@@ -94,20 +94,20 @@ func TestStrictJSONSchemaEmptyObjectsUseRequiredArray(t *testing.T) {
 		{"type": "object", "properties": map[string]any{}, "required": []string{}},
 	}
 	for index, parameters := range rootCases {
-		strict, err := makeStrictJSONSchema(parameters)
+		strict, err := MakeStrictJSONSchema(parameters, nil)
 		if err != nil {
 			t.Fatalf("root case %d: %v", index, err)
 		}
 		assertSerializedRequiredArray(t, strict, "root")
 	}
 
-	strict, err := makeStrictJSONSchema(map[string]any{
+	strict, err := MakeStrictJSONSchema(map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"nested": map[string]any{"type": "object"},
 		},
 		"required": []string{"nested"},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("nested schema: %v", err)
 	}
@@ -131,14 +131,14 @@ func assertSerializedRequiredArray(t *testing.T, schema map[string]any, name str
 }
 
 func TestStrictJSONSchemaRequiredIsCompleteAndUnique(t *testing.T) {
-	strict, err := makeStrictJSONSchema(map[string]any{
+	strict, err := MakeStrictJSONSchema(map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"b": map[string]any{"type": "string"},
 			"a": map[string]any{"type": "number"},
 		},
 		"required": []any{"b", "b"},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("makeStrictJSONSchema: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestStrictJSONSchemaRequiredIsCompleteAndUnique(t *testing.T) {
 }
 
 func TestStrictJSONSchemaReportsUnsupportedKeywordBeforeRootType(t *testing.T) {
-	_, err := makeStrictJSONSchema(map[string]any{"type": "array", "$ref": "https://example.test/schema"})
+	_, err := MakeStrictJSONSchema(map[string]any{"type": "array", "$ref": "https://example.test/schema"}, nil)
 	if err == nil || !strings.Contains(err.Error(), "$ref schemas are unsupported") {
 		t.Fatalf("error = %v, want unsupported $ref", err)
 	}
@@ -187,7 +187,7 @@ func TestStrictJSONSchemaUnsupported(t *testing.T) {
 
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			if _, err := makeStrictJSONSchema(test.parameters); err == nil || !strings.Contains(err.Error(), test.wantError) {
+			if _, err := MakeStrictJSONSchema(test.parameters, nil); err == nil || !strings.Contains(err.Error(), test.wantError) {
 				t.Fatalf("makeStrictJSONSchema error = %v, want %q", err, test.wantError)
 			}
 			tool := ToolSchema{Name: "sample_tool", Parameters: test.parameters, ConstrainedSampling: &ConstrainedSamplingConfig{Type: "json_schema", Strict: "prefer"}}
@@ -205,19 +205,19 @@ func TestStrictJSONSchemaUnsupported(t *testing.T) {
 
 // TestResolveGrammarConstrainedSampling mirrors upstream resolveGrammarConstrainedSampling.
 func TestResolveGrammarConstrainedSampling(t *testing.T) {
-	lark := sampleGrammarTool(&ConstrainedSamplingConfig{Type: "grammar", Variants: map[string]string{GrammarFormatOpenAILark: "start: /[a-z]+/"}})
+	lark := sampleGrammarTool(&ConstrainedSamplingConfig{Type: "grammar", Variants: GrammarVariants{GrammarFormatOpenAILark: "start: /[a-z]+/"}})
 	g, err := resolveGrammarConstrainedSampling(lark, true)
 	if err != nil || g == nil || g.Format != "lark" || g.Definition != "start: /[a-z]+/" || g.InputProperty != "payload" {
 		t.Fatalf("lark grammar = %+v err %v", g, err)
 	}
 	// regex-only variant.
-	rx := sampleGrammarTool(&ConstrainedSamplingConfig{Type: "grammar", Variants: map[string]string{GrammarFormatOpenAIRegex: "[0-9]+"}})
+	rx := sampleGrammarTool(&ConstrainedSamplingConfig{Type: "grammar", Variants: GrammarVariants{GrammarFormatOpenAIRegex: "[0-9]+"}})
 	g, err = resolveGrammarConstrainedSampling(rx, true)
 	if err != nil || g == nil || g.Format != "regex" || g.Definition != "[0-9]+" {
 		t.Fatalf("regex grammar = %+v err %v", g, err)
 	}
 	// lark preferred over regex when both present.
-	both := sampleGrammarTool(&ConstrainedSamplingConfig{Type: "grammar", Variants: map[string]string{GrammarFormatOpenAILark: "L", GrammarFormatOpenAIRegex: "R"}})
+	both := sampleGrammarTool(&ConstrainedSamplingConfig{Type: "grammar", Variants: GrammarVariants{GrammarFormatOpenAILark: "L", GrammarFormatOpenAIRegex: "R"}})
 	g, _ = resolveGrammarConstrainedSampling(both, true)
 	if g == nil || g.Format != "lark" || g.Definition != "L" {
 		t.Fatalf("lark+regex = %+v, want lark preferred", g)
@@ -228,7 +228,7 @@ func TestResolveGrammarConstrainedSampling(t *testing.T) {
 		t.Fatalf("unsupported grammar: got %+v err %v, want nil", g, err)
 	}
 	// no variant → error.
-	_, err = resolveGrammarConstrainedSampling(sampleGrammarTool(&ConstrainedSamplingConfig{Type: "grammar", Variants: map[string]string{}}), true)
+	_, err = resolveGrammarConstrainedSampling(sampleGrammarTool(&ConstrainedSamplingConfig{Type: "grammar", Variants: GrammarVariants{}}), true)
 	if err == nil || !strings.Contains(err.Error(), "no supported grammar variant was provided") {
 		t.Fatalf("empty variants err = %v", err)
 	}
@@ -282,8 +282,9 @@ func TestGetGrammarToolInput(t *testing.T) {
 // Reconstructed deltas preserve the input; an idempotent close yields no delta, and a post-close change errors.
 func TestAppendGrammarToolInputJSONDelta(t *testing.T) {
 	buf := &grammarToolInputJSONBuffer{}
-	first, ok1, err1 := appendGrammarToolInputJSONDelta(buf, "payload", `a"`, false)
-	second, ok2, err2 := appendGrammarToolInputJSONDelta(buf, "payload", "a\"\nb", true)
+	first, ok1, err1 := appendGrammarToolInputJSONDelta(buf, "payload", `a"`)
+	finalInput := "a\"\nb"
+	second, ok2, err2 := closeGrammarToolInputJSON(buf, "payload", &finalInput)
 	if err1 != nil || err2 != nil || !ok1 || !ok2 {
 		t.Fatalf("append errors: %v %v (ok %v %v)", err1, err2, ok1, ok2)
 	}
@@ -295,23 +296,42 @@ func TestAppendGrammarToolInputJSONDelta(t *testing.T) {
 		t.Fatalf("reconstructed payload = %q, want %q", out["payload"], "a\"\nb")
 	}
 	// Idempotent close → no delta.
-	if _, ok, err := appendGrammarToolInputJSONDelta(buf, "payload", "a\"\nb", true); ok || err != nil {
+	if _, ok, err := closeGrammarToolInputJSON(buf, "payload", &finalInput); ok || err != nil {
 		t.Fatalf("idempotent close: ok %v err %v, want no delta", ok, err)
 	}
 	// Change after close → error.
-	if _, _, err := appendGrammarToolInputJSONDelta(buf, "payload", "changed", true); err == nil ||
+	changed := "changed"
+	if _, _, err := closeGrammarToolInputJSON(buf, "payload", &changed); err == nil ||
 		!strings.Contains(err.Error(), `grammar tool input for property "payload" changed after it was closed`) {
 		t.Fatalf("post-close change err = %v", err)
+	}
+	if _, _, err := appendGrammarToolInputJSONDelta(buf, "payload", "x"); err == nil ||
+		!strings.Contains(err.Error(), `grammar tool input for property "payload" changed after it was closed`) {
+		t.Fatalf("post-close append err = %v", err)
+	}
+}
+
+// upstream: constrained-sampling.test.ts "rejects a final grammar input that does not continue the streamed input".
+func TestCloseGrammarToolInputJSONRejectsAFinalInputThatDoesNotContinueTheStreamedInput(t *testing.T) {
+	buf := &grammarToolInputJSONBuffer{}
+	if _, _, err := appendGrammarToolInputJSONDelta(buf, "payload", "abc"); err != nil {
+		t.Fatal(err)
+	}
+	final := "abd"
+	if _, _, err := closeGrammarToolInputJSON(buf, "payload", &final); err == nil ||
+		!strings.Contains(err.Error(), `grammar tool input for property "payload" changed non-monotonically`) {
+		t.Fatalf("err = %v", err)
 	}
 }
 
 // TestAppendGrammarToolInputJSONDelta_NonMonotonic pins the monotonicity guard.
 func TestAppendGrammarToolInputJSONDelta_NonMonotonic(t *testing.T) {
 	buf := &grammarToolInputJSONBuffer{}
-	if _, _, err := appendGrammarToolInputJSONDelta(buf, "payload", "hello", false); err != nil {
+	if _, _, err := appendGrammarToolInputJSONDelta(buf, "payload", "hello"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if _, _, err := appendGrammarToolInputJSONDelta(buf, "payload", "help", false); err == nil ||
+	help := "help"
+	if _, _, err := closeGrammarToolInputJSON(buf, "payload", &help); err == nil ||
 		!strings.Contains(err.Error(), "changed non-monotonically") {
 		t.Fatalf("non-monotonic err = %v", err)
 	}
@@ -330,7 +350,7 @@ func TestJSONStringJS(t *testing.T) {
 // TestCreateGrammarToolInputProperties mirrors upstream createGrammarToolInputProperties.
 func TestCreateGrammarToolInputProperties(t *testing.T) {
 	tools := []ToolSchema{
-		sampleGrammarTool(&ConstrainedSamplingConfig{Type: "grammar", Variants: map[string]string{GrammarFormatOpenAILark: "L"}}),
+		sampleGrammarTool(&ConstrainedSamplingConfig{Type: "grammar", Variants: GrammarVariants{GrammarFormatOpenAILark: "L"}}),
 		{Name: "plain", Parameters: map[string]any{"type": "object"}},
 	}
 	props, err := createGrammarToolInputProperties(tools, true)

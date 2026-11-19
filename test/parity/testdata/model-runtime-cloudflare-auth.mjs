@@ -1,3 +1,4 @@
+import { PI_PACKAGE_VERSION } from "./pi-version.mjs";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -5,14 +6,14 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 if (process.argv[2] === "pig") {
-  const output = execFileSync("go", ["test", "./coding", "-run", "^TestModelRuntimeCloudflareCompatUpstream$", "-count=1", "-v"], { encoding: "utf8" });
+  const output = execFileSync("./test/parity/testdata/prebuilt-go-test.sh", ["./coding", "-run", "^TestModelRuntimeCloudflareCompatUpstream$", "-count=1", "-v"], { encoding: "utf8" });
   const records = output.split("\n").filter(line => line.startsWith("CLOUDFLARE_REQUEST "));
   assert.equal(records.length, [false, true].length, "direct and extension-style requests");
   for (const record of records) console.log(record);
 } else {
   assert.equal(process.argv[2], "pi");
   const root = process.env.PI_PACKAGE_ROOT ?? resolve("extensions/sdk-ts/node_modules/@earendil-works/pi-coding-agent");
-  assert.equal(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version, "1.0.3");
+  assert.equal(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version, PI_PACKAGE_VERSION);
   const { AuthStorage } = await import(pathToFileURL(join(root, "dist/core/auth-storage.js")));
   const { ModelRuntime } = await import(pathToFileURL(join(root, "dist/core/model-runtime.js")));
   const { ModelRegistry } = await import(pathToFileURL(join(root, "dist/core/model-registry.js")));

@@ -5,7 +5,7 @@ version = 1
 [[annotations]]
 path = "**"
 precedence = "closest"
-SPDX-FileCopyrightText = "Copyright Hewlett Packard Enterprise Development LP"
+SPDX-FileCopyrightText = "Copyright Michael Kinsy"
 SPDX-License-Identifier = "MIT"
 
 # Public website documents adapt Pi documentation. PiG-authored revisions
@@ -14,7 +14,7 @@ SPDX-License-Identifier = "MIT"
 path = "docs/site/docs/**"
 precedence = "closest"
 SPDX-FileCopyrightText = [
-  "Copyright Hewlett Packard Enterprise Development LP",
+  "Copyright Michael Kinsy",
   "Copyright (c) 2025 Mario Zechner",
 ]
 SPDX-License-Identifier = "MIT"
@@ -25,7 +25,7 @@ SPDX-License-Identifier = "MIT"
 path = "docs/assets/pig-project-banner.png"
 precedence = "closest"
 SPDX-FileCopyrightText = [
-  "Copyright Hewlett Packard Enterprise Development LP",
+  "Copyright Michael Kinsy",
   "Go gopher designed by Renee French",
 ]
 SPDX-License-Identifier = "MIT AND CC-BY-4.0"
@@ -46,7 +46,7 @@ path = [
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = [
-  "Copyright Hewlett Packard Enterprise Development LP",
+  "Copyright Michael Kinsy",
   "Copyright (c) 2025 Mario Zechner",
 ]
 SPDX-License-Identifier = "MIT"
@@ -60,7 +60,7 @@ path = [
   "coding/extension/pigsdk/**",
 ]
 precedence = "closest"
-SPDX-FileCopyrightText = "Copyright Hewlett Packard Enterprise Development LP"
+SPDX-FileCopyrightText = "Copyright Michael Kinsy"
 SPDX-License-Identifier = "MIT"
 
 # The Mermaid renderer is a Go port of grok-mermaid 0.2.2. Files with more
@@ -69,7 +69,7 @@ SPDX-License-Identifier = "MIT"
 path = "internal/mermaid/**"
 precedence = "closest"
 SPDX-FileCopyrightText = [
-  "Copyright Hewlett Packard Enterprise Development LP",
+  "Copyright Michael Kinsy",
   "Copyright 2023-2026 SpaceXAI",
   "Copyright 2026 Alexey Zaytsev",
 ]
@@ -81,7 +81,7 @@ SPDX-License-Identifier = "Apache-2.0 AND MIT"
 path = "internal/nodesemver/**"
 precedence = "closest"
 SPDX-FileCopyrightText = [
-  "Copyright Hewlett Packard Enterprise Development LP",
+  "Copyright Michael Kinsy",
   "Copyright (c) Isaac Z. Schlueter and Contributors",
 ]
 SPDX-License-Identifier = "MIT AND ISC"
@@ -92,7 +92,7 @@ SPDX-License-Identifier = "MIT AND ISC"
 path = "internal/nodespawn/**"
 precedence = "closest"
 SPDX-FileCopyrightText = [
-  "Copyright Hewlett Packard Enterprise Development LP",
+  "Copyright Michael Kinsy",
   "Copyright Joyent, Inc. and other Node contributors",
 ]
 SPDX-License-Identifier = "MIT"
@@ -105,7 +105,7 @@ path = [
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = [
-  "Copyright Hewlett Packard Enterprise Development LP",
+  "Copyright Michael Kinsy",
   "Copyright (c) 2025 Mario Zechner",
   "Copyright (c) 2025 opentui",
 ]
@@ -118,7 +118,7 @@ path = [
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = [
-  "Copyright Hewlett Packard Enterprise Development LP",
+  "Copyright Michael Kinsy",
   "Copyright (c) 2025 Mario Zechner",
   "Copyright (c) Sindre Sorhus <sindresorhus@gmail.com> (https://sindresorhus.com)",
 ]
@@ -131,15 +131,15 @@ precedence = "override"
 SPDX-FileCopyrightText = "Copyright (c) 2025 Mario Zechner"
 SPDX-License-Identifier = "MIT"
 
-# Pinned export vendor assets remain unmodified so the complete exported page matches Pi.
+# Pinned export vendor assets remain unmodified so the complete exported page matches Pi; the .gz files are the same bytes compressed for the binary.
 [[annotations]]
-path = "internal/codingagent/export/assets/vendor/highlight.min.js"
+path = ["internal/codingagent/export/assets/vendor/highlight.min.js", "internal/codingagent/export/assets/vendor/highlight.min.js.gz"]
 precedence = "override"
 SPDX-FileCopyrightText = "Copyright (c) 2006, Ivan Sagalaev"
 SPDX-License-Identifier = "BSD-3-Clause"
 
 [[annotations]]
-path = "internal/codingagent/export/assets/vendor/marked.min.js"
+path = ["internal/codingagent/export/assets/vendor/marked.min.js", "internal/codingagent/export/assets/vendor/marked.min.js.gz"]
 precedence = "override"
 SPDX-FileCopyrightText = [
   "Copyright (c) 2018+, MarkedJS",
@@ -147,6 +147,12 @@ SPDX-FileCopyrightText = [
   "Copyright 2004 John Gruber",
 ]
 SPDX-License-Identifier = "MIT AND BSD-3-Clause"
+
+[[annotations]]
+path = ["internal/codingagent/export/assets/vendor/marked-cjk-friendly.min.js", "internal/codingagent/export/assets/vendor/marked-cjk-friendly.min.js.gz"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2024 Tatsunori Uchino, and authors and contributors of original packages"
+SPDX-License-Identifier = "MIT"
 
 # Unicode character data embedded in the generated width tables.
 [[annotations]]
@@ -161,6 +167,32 @@ SPDX-License-Identifier = "Unicode-3.0"
 path = "coding/extension/host/subprocess/runtime-node/shims/pi-dist/**"
 precedence = "override"
 SPDX-FileCopyrightText = "Copyright (c) 2025 Mario Zechner"
+SPDX-License-Identifier = "MIT"
+
+# Verbatim copies of Pi's chord sources and the two packages they run on (pi-schema, pi-telemetry), run by the Node subprocess of the plugins
+# component (automation/gen/vendor-chord-plugins-node.sh).
+[[annotations]]
+path = "chord/nextnode/plugins/node/pi/chord/**"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2025 Mario Zechner"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "chord/nextnode/plugins/node/pi/node_modules/@earendil-works/pi-telemetry/**"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2025 Mario Zechner"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "chord/nextnode/plugins/node/pi/schema/**"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2025 Mario Zechner"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "chord/nextnode/plugins/node/pi/schema/LICENSES/typebox-LICENSE"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2017-2026 Haydn Paterson"
 SPDX-License-Identifier = "MIT"
 
 # The unmodified ES module build of yaml 2.9.0, the YAML library Pi uses.
@@ -182,6 +214,13 @@ SPDX-FileCopyrightText = [
 ]
 SPDX-License-Identifier = "MIT AND BSD-3-Clause"
 
+# The unmodified marked-cjk-friendly 0.1.2 package, which pi-tui's Markdown component uses to close emphasis next to CJK punctuation.
+[[annotations]]
+path = "coding/extension/host/subprocess/runtime-node/shims/marked-cjk-friendly/**"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2024 Tatsunori Uchino, and authors and contributors of original packages"
+SPDX-License-Identifier = "MIT"
+
 # The unmodified CommonJS build (lib/) of highlight.js 10.7.3, which Pi
 # 0.87.1's highlightCode tokenizes code with.
 [[annotations]]
@@ -197,7 +236,7 @@ SPDX-License-Identifier = "BSD-3-Clause"
 path = "tui/internal/hljs/*.go"
 precedence = "closest"
 SPDX-FileCopyrightText = [
-  "Copyright Hewlett Packard Enterprise Development LP",
+  "Copyright Michael Kinsy",
   "Copyright (c) 2006, Ivan Sagalaev",
 ]
 SPDX-License-Identifier = "MIT AND BSD-3-Clause"
@@ -208,7 +247,7 @@ SPDX-License-Identifier = "MIT AND BSD-3-Clause"
 path = "internal/jsarray/sort.go"
 precedence = "closest"
 SPDX-FileCopyrightText = [
-  "Copyright Hewlett Packard Enterprise Development LP",
+  "Copyright Michael Kinsy",
   "Copyright (c) 2001-2018 Python Software Foundation",
 ]
 SPDX-License-Identifier = "MIT AND PSF-2.0"
@@ -314,6 +353,30 @@ SPDX-FileCopyrightText = "Copyright (c) Isaac Z. Schlueter and Contributors"
 SPDX-License-Identifier = "ISC"
 
 [[annotations]]
+path = "test/parity/dependency-sources/minimatch/**"
+precedence = "override"
+SPDX-FileCopyrightText = "minimatch contributors"
+SPDX-License-Identifier = "BlueOak-1.0.0"
+
+[[annotations]]
+path = "test/parity/dependency-sources/@isaacs/**"
+precedence = "override"
+SPDX-FileCopyrightText = "nonrecursive-glob-match contributors"
+SPDX-License-Identifier = "BlueOak-1.0.0"
+
+[[annotations]]
+path = "test/parity/dependency-sources/node/**"
+precedence = "override"
+SPDX-FileCopyrightText = "minimatch contributors"
+SPDX-License-Identifier = "BlueOak-1.0.0"
+
+[[annotations]]
+path = "test/parity/dependency-sources/brace-expansion/**"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright Julian Gruber <julian@juliangruber.com>"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
 path = "coding/extension/host/subprocess/runtime-node/shims/minimatch/**"
 precedence = "override"
 SPDX-FileCopyrightText = "minimatch contributors"
@@ -379,7 +442,7 @@ SPDX-License-Identifier = "ISC"
 path = "internal/wordsegmenter/**"
 precedence = "closest"
 SPDX-FileCopyrightText = [
-  "Copyright Hewlett Packard Enterprise Development LP",
+  "Copyright Michael Kinsy",
   "© 2016 and later: Unicode, Inc. and others.",
   "Copyright (C) 2006-2016, International Business Machines Corporation and others.",
   "Copyright (C) 1999-2016, International Business Machines Corporation and others.",
@@ -391,7 +454,7 @@ SPDX-License-Identifier = "MIT AND Unicode-3.0 AND LicenseRef-ICU-CJK AND Licens
 
 # The QuickJS WebAssembly module and the codemode prelude are Pi's, embedded byte for byte.
 [[annotations]]
-path = "codemode/assets/quickjs.wasm"
+path = ["codemode/assets/quickjs.wasm", "codemode/assets/quickjs.wasm.gz"]
 precedence = "closest"
 SPDX-FileCopyrightText = [
   "Copyright (c) 2026 Vercel, Inc.",
@@ -407,3 +470,114 @@ path = "codemode/assets/prelude.js"
 precedence = "closest"
 SPDX-FileCopyrightText = "Copyright (c) 2025 Mario Zechner"
 SPDX-License-Identifier = "MIT"
+
+# schema is a Go port of Pi's packages/schema. Its format checks are translated
+# from TypeBox 1.3.27 (MIT); the test suite and meta-schemas under testdata are
+# the JSON Schema organization's files, unmodified.
+[[annotations]]
+path = "schema/**"
+precedence = "closest"
+SPDX-FileCopyrightText = [
+  "Copyright Michael Kinsy",
+  "Copyright (c) 2025 Mario Zechner",
+]
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = [
+  "schema/formats/typebox_*.go",
+  "schema/formats/internal/idna/**",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = [
+  "Copyright Michael Kinsy",
+  "Copyright (c) 2017-2026 Haydn Paterson",
+]
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "schema/testdata/json-schema-test-suite/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "Copyright (c) 2012 Julian Berman"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "schema/testdata/meta-schemas/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "Copyright the JSON Schema organization"
+SPDX-License-Identifier = "BSD-3-Clause"
+
+# The schema-switch fixtures of Chord v2 (chord/next/host/testdata/schema-switch) are Pi's test files, byte for byte
+# (packages/chord/test/next/schema at b556cfe5): the recorded fingerprints and the stored SQLite store and archive.
+[[annotations]]
+path = "chord/next/host/testdata/schema-switch/**"
+precedence = "closest"
+SPDX-FileCopyrightText = [
+  "Copyright Michael Kinsy",
+  "Copyright (c) 2025 Mario Zechner",
+]
+SPDX-License-Identifier = "MIT"
+
+# PiG fork of santhosh-tekuri/jsonschema v6.0.2 (third_party/jsonschema/FORK.md).
+[[annotations]]
+path = "third_party/jsonschema/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "Copyright the santhosh-tekuri/jsonschema authors"
+SPDX-License-Identifier = "Apache-2.0"
+
+# PiG fork of yuin/goldmark v1.8.5 (third_party/goldmark/FORK.md).
+[[annotations]]
+path = "third_party/goldmark/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "Copyright (c) 2019 Yusuke Inuzuka"
+SPDX-License-Identifier = "MIT"
+
+# PiG fork of Masterminds/semver v3.5.0 (third_party/semver/FORK.md).
+[[annotations]]
+path = "third_party/semver/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "Copyright (C) 2014-2019 Matt Butcher and Matt Farina"
+SPDX-License-Identifier = "MIT"
+
+
+# Test bitmaps of the image-rs repository (tests/images/bmp, v0.24.9), several of them files of Jason Summers' BMP Suite (public domain),
+# which the Photon BMP decoder corpus reads (internal/photonimage/testdata/bmp-real).
+[[annotations]]
+path = "internal/photonimage/testdata/bmp-real/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "The image-rs Developers"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+# Test GIF files of the image-rs repository (tests/images/gif, v0.24.9) and of the Go repository (src/image/testdata, in the go directory), which the Photon GIF
+# decoder corpus reads (internal/photonimage/testdata/gif-real).
+[[annotations]]
+path = "internal/photonimage/testdata/gif-real/*.gif"
+precedence = "closest"
+SPDX-FileCopyrightText = "The image-rs Developers"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = "internal/photonimage/testdata/gif-real/go/*.gif"
+precedence = "closest"
+SPDX-FileCopyrightText = "The Go Authors"
+SPDX-License-Identifier = "BSD-3-Clause"
+
+# The PNG files of the Photon PNG decoder corpus (internal/photonimage/testdata/png-real): PngSuite by Willem van Schaik, the PNG test files of the
+# image-rs repository (tests/images/png, v0.24.9) and those of the Go repository (src/image/png/testdata and src/image/testdata).
+[[annotations]]
+path = "internal/photonimage/testdata/png-real/pngsuite/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "Willem van Schaik, 1996, 2011"
+SPDX-License-Identifier = "LicenseRef-PngSuite"
+
+[[annotations]]
+path = "internal/photonimage/testdata/png-real/image-rs/*.png"
+precedence = "closest"
+SPDX-FileCopyrightText = "The image-rs Developers"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = "internal/photonimage/testdata/png-real/go/*.png"
+precedence = "closest"
+SPDX-FileCopyrightText = "The Go Authors"
+SPDX-License-Identifier = "BSD-3-Clause"

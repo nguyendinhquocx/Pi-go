@@ -5,8 +5,6 @@ import (
 	"runtime"
 	"strings"
 	"unicode/utf8"
-
-	"golang.org/x/net/idna"
 )
 
 // Error is an error Node's url.fileURLToPath throws, with its code. URIError
@@ -18,19 +16,21 @@ type Error struct {
 
 func (e *Error) Error() string { return e.Message }
 
+// Thrown is String(e) of the error Node throws: its name, code and message, `TypeError [ERR_INVALID_FILE_URL_PATH]: File URL path must be absolute`, or `URIError: URI malformed` for the decodeURIComponent failure, which has no code. A program that does not catch it reports this headline.
+func (e *Error) Thrown() string {
+	if e.Code == "" {
+		return "URIError: " + e.Message
+	}
+	return "TypeError [" + e.Code + "]: " + e.Message
+}
+
 var (
-	errInvalidURL         = &Error{Code: "ERR_INVALID_URL", Message: "Invalid URL"}
-	errInvalidURLScheme   = &Error{Code: "ERR_INVALID_URL_SCHEME", Message: "The URL must be of scheme file"}
-	errPathNotAbsolute    = &Error{Code: "ERR_INVALID_FILE_URL_PATH", Message: "File URL path must be absolute"}
-	errURIMalformed       = &Error{Message: "URI malformed"}
-	errEncodedSeparators  = &Error{Code: "ERR_INVALID_FILE_URL_PATH", Message: `File URL path must not include encoded \ or / characters`}
-	errEncodedSlash       = &Error{Code: "ERR_INVALID_FILE_URL_PATH", Message: "File URL path must not include encoded / characters"}
-	whatwgDomainToUnicode = idna.New(
-		idna.MapForLookup(),
-		idna.Transitional(false),
-		idna.StrictDomainName(false),
-		idna.CheckHyphens(false),
-	)
+	errInvalidURL        = &Error{Code: "ERR_INVALID_URL", Message: "Invalid URL"}
+	errInvalidURLScheme  = &Error{Code: "ERR_INVALID_URL_SCHEME", Message: "The URL must be of scheme file"}
+	errPathNotAbsolute   = &Error{Code: "ERR_INVALID_FILE_URL_PATH", Message: "File URL path must be absolute"}
+	errURIMalformed      = &Error{Message: "URI malformed"}
+	errEncodedSeparators = &Error{Code: "ERR_INVALID_FILE_URL_PATH", Message: `File URL path must not include encoded \ or / characters`}
+	errEncodedSlash      = &Error{Code: "ERR_INVALID_FILE_URL_PATH", Message: "File URL path must not include encoded / characters"}
 )
 
 // FileURLToPath converts raw as Node's url.fileURLToPath(raw, {windows})
@@ -69,7 +69,11 @@ func FileURLToPath(raw string, windows bool) (string, error) {
 }
 
 // DomainToUnicode is Node's url.domainToUnicode for a host FileHost returned:
-// an IP address is unchanged, and a domain's IDNA labels become Unicode.
+// an IP address is unchanged, and a domain's IDNA labels become Unicode. As in
+// ada's to_unicode, which never fails, a label that starts with "xn--" is
+// decoded only when it is ASCII, decodes as Punycode to a non-empty non-ASCII
+// label that is stable under mapping and normalization and is a valid label;
+// any other label is kept as it is.
 func DomainToUnicode(host string) string {
 	if strings.HasPrefix(host, "[") {
 		return host
@@ -77,22 +81,25 @@ func DomainToUnicode(host string) string {
 	if _, err := netip.ParseAddr(host); err == nil {
 		return host
 	}
-	unicode, err := whatwgDomainToUnicode.ToUnicode(host)
-	if err != nil {
-		return ""
+	labels := strings.Split(host, ".")
+	for i, label := range labels {
+		if !strings.HasPrefix(label, "xn--") {
+			continue
+		}
+		if decoded, ok := decodeACELabel(label); ok {
+			labels[i] = decoded
+		}
 	}
-	return unicode
+	return strings.Join(labels, ".")
+}
+
+func isASCII(s string) bool {
+	return !strings.ContainsFunc(s, func(r rune) bool { return r >= utf8.RuneSelf })
 }
 
 // PrepareInput applies the URL parser's C0/space trimming and tab/newline removal.
 func PrepareInput(raw string) string {
-	input := strings.TrimFunc(raw, func(r rune) bool { return r <= 0x20 })
-	return strings.Map(func(r rune) rune {
-		if r == '\t' || r == '\n' || r == '\r' {
-			return -1
-		}
-		return r
-	}, input)
+	return removeTabAndNewline(strings.TrimFunc(raw, func(r rune) bool { return r <= 0x20 }))
 }
 
 // parseFileURL runs the WHATWG URL parser on raw far enough to return a file
@@ -186,6 +193,9 @@ func splitSegments(rest string) []string {
 func isSlash(c byte) bool { return c == '/' || c == '\\' }
 
 func isScheme(s string) bool {
+	if s == "" {
+		return false
+	}
 	for i := range len(s) {
 		c := s[i] | 0x20
 		switch {
@@ -221,8 +231,10 @@ func containsEncoded(pathname, hex string) bool {
 	return strings.Contains(strings.ToLower(pathname), "%"+hex)
 }
 
-// decodeURIComponent is JavaScript's decodeURIComponent: every %XX becomes
+// DecodeURIComponent is JavaScript's decodeURIComponent: every %XX becomes
 // its byte, and a malformed escape or invalid UTF-8 is a URIError.
+func DecodeURIComponent(s string) (string, error) { return decodeURIComponent(s) }
+
 func decodeURIComponent(s string) (string, error) {
 	if !strings.Contains(s, "%") {
 		return s, nil

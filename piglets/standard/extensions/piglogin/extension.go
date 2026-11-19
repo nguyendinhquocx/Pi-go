@@ -19,7 +19,11 @@ type state struct {
 func Extension() *sdk.Extension {
 	ext := sdk.New("piglogin")
 	ext.OnSessionStart(func(ctx sdk.Context, _ map[string]any) (any, error) {
-		return nil, ctx.SetLogin(LoginDefinitionFor(loadVariant(ctx.ConfigHome())))
+		configHome, err := ctx.ConfigHome()
+		if err != nil {
+			return nil, err
+		}
+		return nil, ctx.SetLogin(LoginDefinitionFor(loadVariant(configHome)))
 	})
 	ext.Command("sprite", "Select the PiG Standard login sprite.", selectSprite)
 	return ext
@@ -45,10 +49,11 @@ func selectSpriteInteractively(ctx sdk.Context) error {
 	for i, variant := range Variants {
 		options[i] = fmt.Sprintf("%s: %s", variant.Name, variant.Tagline)
 	}
-	selected, ok, err := ctx.Select("Choose a PiG Standard sprite", options)
+	answer, ok, err := ctx.Select("Choose a PiG Standard sprite", options)
 	if err != nil || !ok {
 		return err
 	}
+	selected, _ := answer.(string)
 	for i, option := range options {
 		if selected == option {
 			return activateVariant(ctx, Variants[i].ID)
@@ -62,7 +67,11 @@ func activateVariant(ctx sdk.Context, id string) error {
 	if !ok {
 		return fmt.Errorf("unknown sprite %q; available: %s", id, variantIDs())
 	}
-	if err := saveVariant(ctx.ConfigHome(), variant.ID); err != nil {
+	configHome, err := ctx.ConfigHome()
+	if err != nil {
+		return err
+	}
+	if err := saveVariant(configHome, variant.ID); err != nil {
 		return err
 	}
 	return ctx.SetLogin(LoginDefinitionFor(variant))

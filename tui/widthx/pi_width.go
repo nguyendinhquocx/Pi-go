@@ -1,5 +1,7 @@
 package widthx
 
+// Ports packages/tui/src/utils.ts (graphemeWidth and the grapheme and word class lookups)
+
 // pi_width.go ports upstream pi-tui's per-grapheme width and grapheme
 // segmentation (packages/tui/src/utils.ts graphemeWidth + Intl.Segmenter)
 // onto tables generated from the same data Pi uses at runtime
@@ -9,6 +11,7 @@ package widthx
 
 import (
 	"sort"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
@@ -98,7 +101,15 @@ var (
 	// point (all property bits fit in 16 bits), so the per-rune lookup on the
 	// segmentation and width paths is one load instead of a binary search.
 	bmpProps [0x10000]uint16
-	rgiSet   map[string]struct{}
+
+	// rgiSet holds the multi-code-point RGI emoji sequences. Only a segment of several code points reads it, so it is built on first use rather than at process start.
+	rgiSet = sync.OnceValue(func() map[string]struct{} {
+		set := make(map[string]struct{}, len(rgiSequences))
+		for _, s := range &rgiSequences {
+			set[s] = struct{}{}
+		}
+		return set
+	})
 )
 
 func init() {
@@ -113,10 +124,6 @@ func init() {
 		for cp := lo; cp <= min(hi, 0xFFFF); cp++ {
 			bmpProps[cp] = uint16(p)
 		}
-	}
-	rgiSet = make(map[string]struct{}, len(rgiSequences))
-	for _, s := range rgiSequences {
-		rgiSet[s] = struct{}{}
 	}
 }
 
@@ -255,6 +262,7 @@ func GraphemeWidth(seg string) int {
 	allTSM, allZW, count := true, true, 0
 	for rest := seg; rest != ""; {
 		r, size := jsstring.DecodeRuneInString(rest)
+		//portlint:allow utf16units utils.ts graphemeWidth iterates the segment by code point (for..of): size is the byte size of the rune just decoded, not a UTF-16 offset
 		rest = rest[size:]
 		p := props(r)
 		if p&pTSM == 0 {
@@ -294,6 +302,7 @@ func GraphemeWidth(seg string) int {
 	followsMark := false
 	for rest := base[n:]; rest != ""; {
 		c, size := jsstring.DecodeRuneInString(rest)
+		//portlint:allow utf16units utils.ts graphemeWidth iterates the segment by code point (for..of): size is the byte size of the rune just decoded, not a UTF-16 offset
 		rest = rest[size:]
 		p := props(c)
 		switch {
@@ -324,6 +333,7 @@ func couldBeEmoji(seg string) bool {
 	units := 0
 	for rest := seg; rest != ""; {
 		r, size := jsstring.DecodeRuneInString(rest)
+		//portlint:allow utf16units utils.ts graphemeWidth iterates the segment by code point (for..of): size is the byte size of the rune just decoded, not a UTF-16 offset
 		rest = rest[size:]
 		if r == 0xFE0F {
 			return true
@@ -345,6 +355,6 @@ func isRGIEmoji(seg string) bool {
 	if !utf8.ValidString(seg) {
 		seg = jsstring.FromUTF16(jsstring.ToUTF16(seg))
 	}
-	_, ok := rgiSet[seg]
+	_, ok := rgiSet()[seg]
 	return ok
 }

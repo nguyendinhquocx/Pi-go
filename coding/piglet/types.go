@@ -28,7 +28,7 @@ import (
 	sourceref "github.com/MichaelKinsy/PiG/coding/source"
 	agenttools "github.com/MichaelKinsy/PiG/internal/codingagent/tools"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // checkKnownKeys validates that all mapping keys in a YAML node are recognized
@@ -101,14 +101,18 @@ type Piglet struct {
 	Extensions       []ExtensionEntry    `yaml:"extensions,omitempty"`
 	Skills           []SkillEntry        `yaml:"skills,omitempty"`
 	Discovery        *Discovery          `yaml:"discovery,omitempty"`
+	ContextFiles     string              `yaml:"contextFiles,omitempty"` // pig additive (D211): trusted-only withholds an untrusted project's context files.
 	SystemPrompt     *PromptRef          `yaml:"systemPrompt,omitempty"`
 	AgentEnv         *AgentEnvironment   `yaml:"agentEnv,omitempty"`
 	Model            *ModelConfig        `yaml:"model,omitempty"`
+	Slots            *Slots              `yaml:"slots,omitempty"`
 	Build            *BuildSpec          `yaml:"build,omitempty"`
 	Release          *ReleaseSpec        `yaml:"release,omitempty"`
 	Secrets          []SecretDeclaration `yaml:"secrets,omitempty"`
+	Strip            *StripSpec          `yaml:"strip,omitempty"` // pig additive (D92): built-ins this Piglet disables at runtime.
 	sourceDir        string              // Parse(path) anchor for relative origins; never serialized.
 	sourcePath       string              // Canonical parsed Piglet path; never serialized.
+	installScripts   bool                // lets the package manager run lifecycle scripts while the Packages install; never serialized.
 	packageMu        sync.Mutex
 	packageResults   map[string]packageResolution
 	present          map[string]bool // authored top-level fields; never serialized
@@ -116,14 +120,17 @@ type Piglet struct {
 	lineage          []LineageEntry  // exact resolved lineage; never serialized
 	effectiveDigest  string
 	graphDigest      string
-	workspaceRoot    string // invocation-selected workspace; never serialized
-	devContainerPath string // resolved workspace-anchored path; never serialized
+	workspaceRoot    string          // invocation-selected workspace; never serialized
+	bakedSkills      map[string]bool // skills a Piglet Binary baked that an overlay left unchanged; never serialized
+	devContainerPath string          // resolved workspace-anchored path; never serialized
 }
 
 // ExtendsSpec selects one base Piglet source plus an optional author version
-// constraint. Resolution pins the exact content digest in lineage.
+// constraint. Resolution pins the exact content digest in lineage. A block
+// without a source extends the Piglet Binary that runs the Piglet as an
+// overlay (D202), so it carries only remove and allowWiden.
 type ExtendsSpec struct {
-	Source     string      `yaml:"source"`
+	Source     string      `yaml:"source,omitempty"`
 	Version    string      `yaml:"version,omitempty"`
 	AllowWiden bool        `yaml:"allowWiden,omitempty"`
 	Remove     *RemoveSpec `yaml:"remove,omitempty"`
@@ -135,6 +142,33 @@ type RemoveSpec struct {
 	Packages   []string `yaml:"packages,omitempty"`
 	Extensions []string `yaml:"extensions,omitempty"`
 	Skills     []string `yaml:"skills,omitempty"`
+	// Slots names inherited slots whose member is removed, so PiG's own
+	// part applies again.
+	// pig additive (D91): a Piglet frontend member draws the interactive mode.
+	Slots []string `yaml:"slots,omitempty"`
+	// Strip re-enables inherited strip entries. It widens the base, so it
+	// requires allowWiden.
+	// pig additive (D92): Piglet strip lists.
+	Strip *StripSpec `yaml:"strip,omitempty"`
+}
+
+// Slots names the members that replace a part of PiG. A child Piglet
+// inherits each slot, replaces a slot by naming it, or removes one with
+// extends.remove.slots.
+// pig additive (D91): a Piglet frontend member draws the interactive mode.
+type Slots struct {
+	// Frontend is the frontend member: a Go module whose root package
+	// exports func Frontend() frontend.Frontend. The native builder fuses
+	// it into the Binary.
+	Frontend *SlotMember `yaml:"frontend,omitempty"`
+}
+
+// SlotMember is the member that fills one slot.
+type SlotMember struct {
+	// Member is the member's directory, relative to the Piglet file that
+	// names it.
+	Member string `yaml:"member"`
+	dir    string // resolution-anchored absolute directory; never serialized
 }
 
 // SecretDeclaration declares a logical secret name and exactly one machine-
@@ -345,6 +379,13 @@ type BuildSpec struct {
 	Targets              []string `yaml:"targets,omitempty"`
 	OutputName           string   `yaml:"outputName,omitempty"`
 	ExtensionRealization string   `yaml:"extensionRealization,omitempty"`
+	// Closed makes the Piglet Binary built from this Piglet run only its baked Piglet: it refuses a Piglet selected at
+	// launch (--piglet, PIG_PIGLET_PATH, PIG_PIGLET_NAME) and --system-prompt, and discovers no ambient extensions or
+	// skills. Default false: the Binary behaves as stock pig started with its Piglet. Like all of build it is authored on
+	// the Piglet that is built and is not inherited through extends.
+	//
+	// pig additive (D202): a Piglet Binary accepts overlay Piglets unless built closed.
+	Closed bool `yaml:"closed,omitempty"`
 }
 
 // ReleaseSpec carries Piglet release identity, separate from portable build
@@ -405,6 +446,18 @@ func ParseBytes(data []byte) (*Piglet, error) {
 			}
 		}
 	}
+	// pig additive (D92): keep mode expands here, against the running core's
+	// strip table, after the null and one-mode-per-list checks on the file as
+	// written.
+	if len(document.Content) > 0 {
+		if err := validateStripKeepNulls(document.Content[0]); err != nil {
+			return nil, err
+		}
+	}
+	if err := validateStripModes("strip", p.Strip); err != nil {
+		return nil, err
+	}
+	p.Strip.expandKeep()
 	if err := p.Validate(); err != nil {
 		return nil, err
 	}
@@ -434,16 +487,43 @@ func (p *Piglet) Validate() error {
 	if err := validateDiscovery(p.Discovery); err != nil {
 		return err
 	}
+	if err := validateContextFiles(p.ContextFiles); err != nil {
+		return err
+	}
+	if err := validateStrip("strip", p.Strip); err != nil {
+		return err
+	}
+	if p.Strip.HasFeature("skills") && len(p.Skills) > 0 {
+		return fmt.Errorf("strip.features: %q disables the declared skills; remove them with extends.remove.skills or drop the skills entries", "skills")
+	}
+	if err := validateStripFloor(p.Strip); err != nil {
+		return err
+	}
 	if p.Extends != nil {
-		ref, err := validateTypedSource(p.Extends.Source, sourceref.BareReject)
-		if err != nil {
-			return fmt.Errorf("extends.source: %w", err)
-		}
-		if ref.Kind == sourceref.KindContributed && !installresolver.SupportsSourceScheme(ref.Scheme) {
-			return fmt.Errorf("extends.source: source scheme %q has no installed resolver", ref.Scheme)
+		// pig additive (D202): no source means the Piglet Binary that runs this Piglet as an overlay. Resolution refuses it anywhere else.
+		if p.Extends.Source == "" {
+			if p.Extends.Version != "" {
+				return fmt.Errorf("extends.version requires extends.source: an extends block without a source extends a Piglet Binary, which has no release version to constrain")
+			}
+		} else {
+			ref, err := validateTypedSource(p.Extends.Source, sourceref.BareReject)
+			if err != nil {
+				return fmt.Errorf("extends.source: %w", err)
+			}
+			if ref.Kind == sourceref.KindContributed && !installresolver.SupportsSourceScheme(ref.Scheme) {
+				return fmt.Errorf("extends.source: source scheme %q has no installed resolver", ref.Scheme)
+			}
 		}
 		if p.Extends.Version != strings.TrimSpace(p.Extends.Version) {
 			return fmt.Errorf("extends.version must not have surrounding whitespace")
+		}
+		if p.Extends.Remove != nil {
+			if err := validateRemoveStrip(p.Extends.Remove.Strip); err != nil {
+				return err
+			}
+			if err := validateStrip("extends.remove.strip", p.Extends.Remove.Strip); err != nil {
+				return err
+			}
 		}
 	}
 	packageAliases := make(map[string]struct{}, len(p.Packages))
@@ -524,11 +604,53 @@ func (p *Piglet) Validate() error {
 			targets[binding.Target.Env] = true
 		}
 	}
+	if err := validateSlots(p.Slots, p.Extends); err != nil {
+		return err
+	}
 	if err := validateBuildSpec(p.Build); err != nil {
 		return err
 	}
 	if err := validateReleaseSpec(p.Release); err != nil {
 		return err
+	}
+	return nil
+}
+
+// slotIDs are the slots a Piglet can fill.
+var slotIDs = []string{"frontend"}
+
+// The closed value sets of the Piglet vocabulary that are not a registry. piglet.schema.json lists the same values;
+// TestSchemaVocabularyMatchesParser fails when the two differ.
+var (
+	// discoverySources are the ambient Resource scopes discovery.extensions and discovery.skills may name.
+	discoverySources = []string{"workspace", "user"}
+	// agentRuntimeModes are the agentEnv.pigRuntime.mode values.
+	agentRuntimeModes = []string{"inject", "image"}
+	// agentPolicyPresets are the agentEnv.policy.preset values.
+	agentPolicyPresets = []string{"minimal", "standard", "elevated"}
+	// extensionRealizations are the build.extensionRealization values.
+	extensionRealizations = []string{"fused"}
+)
+
+// validateSlots checks that each member is a relative path inside the
+// Piglet's directory and that extends.remove.slots names known slots.
+func validateSlots(slots *Slots, extends *ExtendsSpec) error {
+	if slots != nil && slots.Frontend != nil {
+		member := slots.Frontend.Member
+		if member == "" {
+			return fmt.Errorf("slots.frontend.member is required")
+		}
+		clean := filepath.ToSlash(filepath.Clean(member))
+		if filepath.IsAbs(member) || strings.HasPrefix(member, "/") || filepath.VolumeName(member) != "" || clean == ".." || strings.HasPrefix(clean, "../") || strings.Contains(member, "\\") {
+			return fmt.Errorf("slots.frontend.member %q must be a relative path inside the Piglet directory", member)
+		}
+	}
+	if extends != nil && extends.Remove != nil {
+		for i, id := range extends.Remove.Slots {
+			if !slices.Contains(slotIDs, id) {
+				return fmt.Errorf("extends.remove.slots[%d]: unknown slot %q (known: %s)", i, id, strings.Join(slotIDs, ", "))
+			}
+		}
 	}
 	return nil
 }
@@ -559,6 +681,25 @@ func validateToolAllowlist(location string, values *[]string, allowed []string) 
 	return nil
 }
 
+// Context file modes a Piglet may set. ContextFilesAll is Pi's behaviour: every project context file loads. ContextFilesTrustedOnly withholds the project's context files until the project is trusted.
+const (
+	ContextFilesAll         = "all"
+	ContextFilesTrustedOnly = "trusted-only"
+)
+
+func validateContextFiles(mode string) error {
+	switch mode {
+	case "", ContextFilesAll, ContextFilesTrustedOnly:
+		return nil
+	}
+	return fmt.Errorf("contextFiles must be %q or %q, got %q", ContextFilesAll, ContextFilesTrustedOnly, mode)
+}
+
+// WithholdsUntrustedContextFiles reports whether the Piglet withholds an untrusted project's context files. A nil Piglet does not.
+func (p *Piglet) WithholdsUntrustedContextFiles() bool {
+	return p != nil && p.ContextFiles == ContextFilesTrustedOnly
+}
+
 func validateDiscovery(discovery *Discovery) error {
 	if discovery == nil {
 		return nil
@@ -572,7 +713,7 @@ func validateDiscovery(discovery *Discovery) error {
 	} {
 		seen := make(map[string]struct{}, len(entry.sources))
 		for i, source := range entry.sources {
-			if source != "workspace" && source != "user" {
+			if !slices.Contains(discoverySources, source) {
 				return fmt.Errorf("discovery.%s[%d] must be workspace or user, got %q", entry.kind, i, source)
 			}
 			if _, exists := seen[source]; exists {
@@ -636,14 +777,14 @@ func validateAgentEnvironment(environment *AgentEnvironment) error {
 		}
 	}
 	if environment.PigRuntime != nil {
-		if environment.PigRuntime.Mode != "" && environment.PigRuntime.Mode != "inject" && environment.PigRuntime.Mode != "image" {
+		if environment.PigRuntime.Mode != "" && !slices.Contains(agentRuntimeModes, environment.PigRuntime.Mode) {
 			return fmt.Errorf("agentEnv.pigRuntime.mode must be inject or image")
 		}
 		if strings.ContainsAny(environment.PigRuntime.Version, " \t\r\n") {
 			return fmt.Errorf("agentEnv.pigRuntime.version must not contain whitespace")
 		}
 	}
-	if environment.Policy != nil && environment.Policy.Preset != "" && environment.Policy.Preset != "minimal" && environment.Policy.Preset != "standard" && environment.Policy.Preset != "elevated" {
+	if environment.Policy != nil && environment.Policy.Preset != "" && !slices.Contains(agentPolicyPresets, environment.Policy.Preset) {
 		return fmt.Errorf("agentEnv.policy.preset must be minimal, standard, or elevated")
 	}
 	if err := validateAgentWorkspace(environment.Workspace); err != nil {
@@ -749,7 +890,7 @@ func validateBuildSpec(build *BuildSpec) error {
 		}
 		seenTargets[target] = struct{}{}
 	}
-	if build.ExtensionRealization != "" && build.ExtensionRealization != "fused" {
+	if build.ExtensionRealization != "" && !slices.Contains(extensionRealizations, build.ExtensionRealization) {
 		return fmt.Errorf("build.extensionRealization %q must be fused", build.ExtensionRealization)
 	}
 	if build.OutputName != "" {

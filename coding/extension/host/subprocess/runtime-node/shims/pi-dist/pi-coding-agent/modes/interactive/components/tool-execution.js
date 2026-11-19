@@ -2,7 +2,7 @@ import { Box, Container, getCapabilities, Image, MouseRegion, Spacer, Text, } fr
 import { formatToolCallWithArgs, getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.js";
 import { ensurePngTranscoder } from "../../../utils/image-convert.js";
 import { theme } from "../theme/theme.js";
-import { keyHint } from "./keybinding-hints.js";
+import { keyHint, keyText } from "./keybinding-hints.js";
 const FALLBACK_PREVIEW_LINES = 10;
 export class ToolExecutionComponent extends Container {
     contentBox;
@@ -23,12 +23,15 @@ export class ToolExecutionComponent extends Container {
     expanded = false;
     showImages;
     imageWidthCells;
+    outputPad;
     isPartial = true;
     toolDefinition;
     ui;
     cwd;
     executionStarted = false;
     argsComplete = false;
+    /** `updateArgs()` ran since the last display update; the next render applies it. */
+    argsPending = false;
     result;
     hideComponent = false;
     constructor(toolName, toolCallId, args, options = {}, toolDefinition, ui, cwd) {
@@ -39,6 +42,7 @@ export class ToolExecutionComponent extends Container {
         this.toolDefinition = toolDefinition;
         this.showImages = options.showImages ?? true;
         this.imageWidthCells = options.imageWidthCells ?? 60;
+        this.outputPad = options.outputPad ?? 1;
         this.ui = ui;
         this.cwd = cwd;
         this.addChild(new Spacer(1));
@@ -86,6 +90,10 @@ export class ToolExecutionComponent extends Container {
             expanded: this.expanded,
             showImages: this.showImages,
             isError: this.result?.isError ?? false,
+            durationMs: this.isPartial ? undefined : this.result?.durationMs,
+            outputPad: this.outputPad,
+            keyText,
+            keyHint,
         };
     }
     createCallFallback() {
@@ -113,9 +121,14 @@ export class ToolExecutionComponent extends Container {
             return { handled: true };
         });
     }
+    /**
+     * Show new partial arguments. Applied at the next render, so a call streaming many argument deltas between two
+     * frames runs its renderer once per frame, not once per delta (#9265).
+     */
     updateArgs(args) {
         this.args = args;
-        this.updateDisplay();
+        this.argsPending = true;
+        this.ui.requestRender();
     }
     markExecutionStarted() {
         this.executionStarted = true;
@@ -136,6 +149,10 @@ export class ToolExecutionComponent extends Container {
         this.expanded = expanded;
         this.updateDisplay();
     }
+    setOutputPad(outputPad) {
+        this.outputPad = outputPad;
+        this.updateDisplay();
+    }
     setShowImages(show) {
         this.showImages = show;
         this.updateDisplay();
@@ -149,6 +166,8 @@ export class ToolExecutionComponent extends Container {
         this.updateDisplay();
     }
     render(width) {
+        if (this.argsPending)
+            this.updateDisplay();
         if (this.hideComponent) {
             return [];
         }
@@ -189,6 +208,7 @@ export class ToolExecutionComponent extends Container {
         });
     }
     updateDisplay() {
+        this.argsPending = false;
         const bgFn = this.isPartial
             ? (text) => theme.bg("toolPendingBg", text)
             : this.result?.isError
@@ -200,6 +220,7 @@ export class ToolExecutionComponent extends Container {
             const renderContainer = this.getRenderShell() === "self" ? this.selfRenderContainer : this.contentBox;
             if (renderContainer instanceof Box) {
                 renderContainer.setBgFn(bgFn);
+                renderContainer.setPaddingX(this.outputPad);
             }
             renderContainer.clear();
             const callRenderer = this.getCallRenderer();
@@ -249,6 +270,7 @@ export class ToolExecutionComponent extends Container {
         }
         else {
             this.contentText.setCustomBgFn(bgFn);
+            this.contentText.setPaddingX(this.outputPad);
             this.contentText.setText(this.formatToolExecution());
             hasContent = true;
         }

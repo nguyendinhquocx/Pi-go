@@ -13,6 +13,8 @@ tags = ["fast", "hermetic", "tui"]
 driver = "cli-mode"
 
 [env]
+pig_go_tests = ["./internal/codingagent"]
+pig_go_programs = ["./test/parity/testdata/markdown-components-pig"]
 override_base_args = true
 pig_bin = "/usr/bin/env"
 pi_bin = "/usr/bin/env"
@@ -28,5 +30,5 @@ timeout_seconds = 60
 [assert]
 exit_code = 0
 output_equal = true
-both_contain = ['"name":"transform-cache"', '"name":"user-invalidation"', '"name":"user-builtin-transform"']
+both_contain = ['"name":"cjk-url-english-trim"', '"name":"transform-cache"', '"name":"user-invalidation"', '"name":"user-builtin-transform"']
 runs = 3

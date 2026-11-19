@@ -1,7 +1,7 @@
 package ai
 
 // Ports packages/ai/src/api/system-one-shared.ts, typesafe-system-one.ts and cloudflare-workers-ai-system-one.ts,
-// and the classifier counterpart in providers/cloudflare-stream.ts.
+// the classifier counterpart in providers/cloudflare-stream.ts, and packages/ai/src/providers/compat-schema.ts (SystemOneCompatSchema: SystemOneCompat).
 
 import (
 	"bytes"
@@ -9,30 +9,136 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
-	"net/url"
+	"iter"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/MichaelKinsy/PiG/internal/jsnumber"
+	"github.com/MichaelKinsy/PiG/internal/nodeurl"
 )
 
 const (
 	ClassifierAPITypesafeSystemOne            ClassifierAPI = "typesafe-system-one"
 	ClassifierAPICloudflareWorkersAISystemOne ClassifierAPI = "cloudflare-workers-ai-system-one"
 	ClassifierAPILlamaCppClassify             ClassifierAPI = "llama-cpp-classify"
+	ClassifierAPIOpenAIDecisions              ClassifierAPI = "openai-decisions"
 )
 
-// systemOneWireRequest is the System One request body without the transport-specific envelope.
-type systemOneWireRequest struct {
-	state     JsonObject
-	questions systemOneWireQuestions
+// SystemOneImageAsset is a System One image asset: base64 file bytes, referenced by its name from the state.
+type SystemOneImageAsset struct {
+	Format     string
+	DataBase64 string
 }
 
-// systemOneWireQuestions are the questions as System One names them: a public bool question is a wire-level noul.
-type systemOneWireQuestions ClassifierQuestions
+func (a SystemOneImageAsset) MarshalJSON() ([]byte, error) {
+	return fmt.Appendf(nil, `{"type":"image","format":%s,"data_base64":%s}`, marshalJSONString(a.Format), marshalJSONString(a.DataBase64)), nil
+}
 
-func (q systemOneWireQuestions) MarshalJSON() ([]byte, error) {
+// SystemOneImageAssets are the assets in insertion order, keyed by the names the state references.
+type SystemOneImageAssets struct {
+	Names  []string
+	Assets []SystemOneImageAsset
+}
+
+// All yields the assets in insertion order.
+func (a SystemOneImageAssets) All() iter.Seq2[string, SystemOneImageAsset] {
+	return func(yield func(string, SystemOneImageAsset) bool) {
+		for i, name := range a.Names {
+			if !yield(name, a.Assets[i]) {
+				return
+			}
+		}
+	}
+}
+
+// Get returns the asset with the given name.
+func (a SystemOneImageAssets) Get(name string) (SystemOneImageAsset, bool) {
+	for i, have := range a.Names {
+		if have == name {
+			return a.Assets[i], true
+		}
+	}
+	return SystemOneImageAsset{}, false
+}
+
+func (a SystemOneImageAssets) MarshalJSON() ([]byte, error) {
+	//perf:ok once per image asset of a classifier request, which makes an HTTP call
+	return writeJSONObject(len(a.Names), func(i int) string { return a.Names[i] }, func(i int) ([]byte, error) { return a.Assets[i].MarshalJSON() })
+}
+
+// SystemOneWireRequest is the System One request body without the transport-specific envelope.
+type SystemOneWireRequest struct {
+	// State is the context state, or with images a list of the images or their asset names followed by the state.
+	State     any
+	Questions SystemOneWireQuestions
+	// Assets are the images as System One assets, keyed by the names the state references.
+	Assets *SystemOneImageAssets `json:",omitempty"`
+	// Images are the images as data URLs, Clef's extension to System One. nil is an absent `images` member and an empty slice
+	// is an explicit `[]` (system-one-shared.ts SystemOneRequest.images?: string[]); Body and MarshalJSON both keep that difference.
+	Images []string
+}
+
+// MarshalJSON writes the request's members in field order, with an absent assets or images member left out and an empty images list kept as [].
+func (r SystemOneWireRequest) MarshalJSON() ([]byte, error) {
+	wire := struct {
+		State     any
+		Questions SystemOneWireQuestions
+		Assets    *SystemOneImageAssets `json:",omitempty"`
+		Images    *[]string             `json:",omitempty"`
+	}{State: r.State, Questions: r.Questions, Assets: r.Assets}
+	if r.Images != nil {
+		wire.Images = &r.Images
+	}
+	//perf:ok once per classifier request, which makes an HTTP call
+	return json.Marshal(wire)
+}
+
+// Body is the request's members in Pi's insertion order: state, questions, then assets or images.
+func (r SystemOneWireRequest) Body() map[string]any {
+	body := map[string]any{"state": r.State, "questions": r.Questions}
+	if r.Assets != nil {
+		body["assets"] = r.Assets
+	}
+	if r.Images != nil {
+		body["images"] = r.Images
+	}
+	return body
+}
+
+// SystemOneImageInput is how a service takes classifier images (SystemOneCompat.ImageInput).
+type SystemOneImageInput string
+
+const (
+	// SystemOneImageInputAssets is TypeSafe's assets map, with the names placed before the state. PNG and JPEG only.
+	SystemOneImageInputAssets SystemOneImageInput = "assets"
+	// SystemOneImageInputImages is Clef's images list of data URLs: PNG, JPEG and WebP, at most four.
+	SystemOneImageInputImages SystemOneImageInput = "images"
+	// SystemOneImageInputStateImageURLs is OpenRouter's form: data URL parts placed before the state.
+	SystemOneImageInputStateImageURLs SystemOneImageInput = "state-image-urls"
+)
+
+// SystemOneCompat holds the compatibility settings of System One classifier APIs (compat-schema.ts SystemOneCompatSchema).
+// An unset field is detected from the provider, baseUrl and model ID.
+type SystemOneCompat struct {
+	ImageInput SystemOneImageInput `json:"imageInput,omitempty"`
+	// SendImageOptInHeader sends TypeSafe-Danger-Zone-Images: true with requests that carry images.
+	SendImageOptInHeader *bool `json:"sendImageOptInHeader,omitempty"`
+}
+
+// ResolvedSystemOneCompat is SystemOneCompat with every field resolved.
+type ResolvedSystemOneCompat struct {
+	ImageInput           SystemOneImageInput
+	SendImageOptInHeader bool
+}
+
+// systemOneImageOptInHeaders is TypeSafe's opt-in header for its experimental image input.
+var systemOneImageOptInHeaders = ProviderHeadersFromStrings(map[string]string{"TypeSafe-Danger-Zone-Images": "true"})
+
+// SystemOneWireQuestions are the questions as System One names them: a public bool question is a wire-level noul.
+type SystemOneWireQuestions ClassifierQuestions
+
+func (q SystemOneWireQuestions) MarshalJSON() ([]byte, error) {
 	return writeJSONObject(len(q), func(i int) string { return q[i].ID }, func(i int) ([]byte, error) {
 		if bool, ok := q[i].Question.(ClassifierBoolQuestion); ok {
 			return fmt.Appendf(nil, `{"type":"noul","instructions":%s,"criteria":{"true":%s,"false":%s}}`, marshalJSONString(bool.Instructions), marshalJSONString(bool.Criteria.True), marshalJSONString(bool.Criteria.False)), nil
@@ -41,20 +147,22 @@ func (q systemOneWireQuestions) MarshalJSON() ([]byte, error) {
 	})
 }
 
-// systemOneTransport holds the differences between services that serve System One models.
-type systemOneTransport struct {
-	// api is the classifier API this transport implements.
-	api ClassifierAPI
-	// label names the service in error messages.
-	label string
-	url   func(model ClassifierModel) string
-	// payload wraps the System One request in the service's request envelope.
-	payload func(model ClassifierModel, request systemOneWireRequest) map[string]any
-	// output extracts the System One output ({ answers, usage }) from the service's response envelope.
-	output func(body json.RawMessage) (map[string]json.RawMessage, error)
+// SystemOneTransport holds the differences between services that serve System One models.
+type SystemOneTransport struct {
+	// API is the classifier API this transport implements.
+	API ClassifierAPI
+	// DetectCompat gives the settings of models that do not set them in Compat.
+	DetectCompat func(model ClassifierModel) ResolvedSystemOneCompat
+	// Label names the service in error messages.
+	Label string
+	URL   func(model ClassifierModel) string
+	// Payload wraps the System One request in the service's request envelope.
+	Payload func(model ClassifierModel, request SystemOneWireRequest) map[string]any
+	// Output extracts the System One output ({ answers, usage }) from the service's response envelope.
+	Output func(body json.RawMessage) (map[string]json.RawMessage, error)
 }
 
-func requiredNumber(label string, value json.RawMessage, field string) (float64, error) {
+func RequiredNumber(label string, value json.RawMessage, field string) (float64, error) {
 	number, ok := finiteNumberOf(value)
 	if !ok {
 		return 0, fmt.Errorf("%s returned an invalid %s", label, field)
@@ -63,7 +171,7 @@ func requiredNumber(label string, value json.RawMessage, field string) (float64,
 }
 
 func parseProbabilities(label string, raw json.RawMessage, id string) ([]ClassifierProbability, error) {
-	if _, ok := jsonObjectOf(raw); !ok {
+	if !IsRecord(raw) {
 		return nil, fmt.Errorf("%s returned invalid probabilities for %s", label, id)
 	}
 	entries, err := orderedJSONObject(raw)
@@ -79,7 +187,7 @@ func parseProbabilities(label string, raw json.RawMessage, id string) ([]Classif
 	probabilities := make([]ClassifierProbability, 0, len(entries))
 	for _, index := range jsObjectKeyOrder(keys) {
 		entry := entries[index]
-		probability, err := requiredNumber(label, entry.value, fmt.Sprintf("probability for %s.%s", id, entry.key))
+		probability, err := RequiredNumber(label, entry.value, fmt.Sprintf("probability for %s.%s", id, entry.key))
 		if err != nil {
 			return nil, err
 		}
@@ -137,7 +245,7 @@ func parseAnswers(label string, raw json.RawMessage, request ClassifierContext) 
 			if err != nil {
 				return nil, err
 			}
-			confidence, err := requiredNumber(label, answer["confidence"], "confidence for "+id)
+			confidence, err := RequiredNumber(label, answer["confidence"], "confidence for "+id)
 			if err != nil {
 				return nil, err
 			}
@@ -146,11 +254,11 @@ func parseAnswers(label string, raw json.RawMessage, request ClassifierContext) 
 			if answerType != "score" {
 				return nil, fmt.Errorf("%s did not return a score answer for %s", label, id)
 			}
-			score, err := requiredNumber(label, answer["score"], "score for "+id)
+			score, err := RequiredNumber(label, answer["score"], "score for "+id)
 			if err != nil {
 				return nil, err
 			}
-			confidence, err := requiredNumber(label, answer["confidence"], "confidence for "+id)
+			confidence, err := RequiredNumber(label, answer["confidence"], "confidence for "+id)
 			if err != nil {
 				return nil, err
 			}
@@ -159,7 +267,7 @@ func parseAnswers(label string, raw json.RawMessage, request ClassifierContext) 
 			if answerType != "noul" {
 				return nil, fmt.Errorf("%s did not return a bool answer for %s", label, id)
 			}
-			probability, err := requiredNumber(label, answer["noul"], "probability for "+id)
+			probability, err := RequiredNumber(label, answer["noul"], "probability for "+id)
 			if err != nil {
 				return nil, err
 			}
@@ -169,93 +277,56 @@ func parseAnswers(label string, raw json.RawMessage, request ClassifierContext) 
 	return orderAnswers(answers), nil
 }
 
-func tokenCount(raw json.RawMessage, present bool) int {
-	if !present {
-		return 0
-	}
-	if value, ok := finiteNumberOf(raw); ok && value > 0 {
-		return int(math.Min(value, math.MaxInt32))
-	}
-	return 0
-}
-
-// parseUsage reads System One's { input_tokens, output_tokens } and prices it from the model catalog like chat usage.
-// A missing or malformed usage object leaves the result without usage instead of failing it.
-func parseUsage(raw json.RawMessage, model ClassifierModel) *Usage {
-	value, ok := jsonObjectOf(raw)
-	if !ok {
-		return nil
-	}
-	inputRaw, hasInput := value["input_tokens"]
-	outputRaw, hasOutput := value["output_tokens"]
-	if !hasInput && !hasOutput {
-		return nil
-	}
-	usage := Usage{Input: tokenCount(inputRaw, hasInput), Output: tokenCount(outputRaw, hasOutput)}
-	usage.TotalTokens = usage.Input + usage.Output
-	CalculateCost(&model, &usage)
-	return &usage
-}
-
-func systemOneRequestHeaders(model ClassifierModel, apiKey string, options ProviderHeaders) []classifierHeader {
-	return classifierRequestHeaders(ProviderHeadersFromStrings(map[string]string{"authorization": "Bearer " + apiKey, "content-type": "application/json"}), ProviderHeadersFromStrings(model.Headers), options)
-}
-
-// classifySystemOne runs one System One classification over the given transport.
-func classifySystemOne(ctx context.Context, transport systemOneTransport, model ClassifierModel, request ClassifierContext, options ClassifierOptions) ClassifierResult {
+// ClassifySystemOne runs one System One classification over the given transport.
+func ClassifySystemOne(ctx context.Context, transport SystemOneTransport, model ClassifierModel, request ClassifierContext, options ClassifierOptions) ClassifierResult {
+	//portlint:allow clock system-one-shared.ts:111 `timestamp: Date.now()`; ai's clock seams are per-struct (oauth, bedrock backoff), none covers classifiers
 	output := ClassifierResult{API: model.API, Provider: model.Provider, Model: model.ID, Answers: ClassifierAnswers{}, StopReason: ClassifierStopReasonStop, Timestamp: time.Now().UnixMilli()}
 	fail := func(err error) ClassifierResult {
 		output.StopReason = ClassifierStopReasonError
 		if ctx.Err() != nil {
 			output.StopReason = ClassifierStopReasonAborted
 		}
-		output.ErrorMessage = classifierErrorMessage(err, transport.label)
+		output.ErrorMessage = classifierErrorMessage(err, transport.Label)
 		return output
 	}
-	if model.API != transport.api {
+	if model.API != transport.API {
 		return fail(fmt.Errorf("Unsupported classifier API: %s", model.API))
 	}
-	if options.APIKey == "" {
-		return fail(fmt.Errorf("No API key for provider: %s", model.Provider))
-	}
-	var payload any = transport.payload(model, systemOneWireRequest{state: request.State, questions: systemOneWireQuestions(request.Questions)})
-	if options.OnPayload != nil {
-		transformed, replace, err := options.OnPayload(payload, model)
-		if err != nil {
+	wire := SystemOneWireRequest{State: request.State, Questions: SystemOneWireQuestions(request.Questions)}
+	requestOptions := options
+	if len(request.Images) > 0 {
+		if !slices.Contains(model.Input, "image") {
+			return fail(fmt.Errorf("%s does not support image input for %s", transport.Label, model.ID))
+		}
+		detected := transport.DetectCompat(model)
+		imageInput := detected.ImageInput
+		sendHeader := detected.SendImageOptInHeader
+		if model.Compat != nil {
+			if model.Compat.ImageInput != "" {
+				imageInput = model.Compat.ImageInput
+			}
+			if model.Compat.SendImageOptInHeader != nil {
+				sendHeader = *model.Compat.SendImageOptInHeader
+			}
+		}
+		if err := addSystemOneImages(transport.Label, model, imageInput, request.Images, &wire); err != nil {
 			return fail(err)
 		}
-		if replace {
-			payload = transformed
+		if sendHeader {
+			requestOptions.Headers = MergeProviderHeaders(systemOneImageOptInHeaders, options.Headers)
 		}
 	}
-	body, err := marshalJSONValue(payload)
+	envelope, err := PostClassifierRequest(ctx, transport.Label, transport.URL(model), model, transport.Payload(model, wire), requestOptions, nil)
 	if err != nil {
 		return fail(err)
 	}
-	headers := systemOneRequestHeaders(model, options.APIKey, options.Headers)
-	target := transport.url(model)
-	response, err := retryClassifierRequest(ctx, options, func() (classifierResponse, error) {
-		return classifierPost(ctx, options, transport.label, target, headers, body)
-	})
-	if err != nil {
-		return fail(err)
-	}
-	if options.OnResponse != nil {
-		if err := options.OnResponse(ProviderResponse{Status: response.status, Headers: headersToRecord(response.headers)}, model); err != nil {
-			return fail(err)
-		}
-	}
-	var envelope json.RawMessage = response.body
-	if !json.Valid(envelope) {
-		return fail(errors.New("Unexpected response body: invalid JSON"))
-	}
-	result, err := transport.output(envelope)
+	result, err := transport.Output(envelope)
 	if err != nil {
 		return fail(err)
 	}
 	// Set before parsing answers: a request with malformed answers was still billed.
-	output.Usage = parseUsage(result["usage"], model)
-	answers, err := parseAnswers(transport.label, result["answers"], request)
+	output.Usage = ParseClassifierUsage(result["usage"], model)
+	answers, err := parseAnswers(transport.Label, result["answers"], request)
 	if err != nil {
 		return fail(err)
 	}
@@ -263,24 +334,100 @@ func classifySystemOne(ctx context.Context, transport systemOneTransport, model 
 	return output
 }
 
+var systemOneAssetFormats = map[string]string{"image/png": "png", "image/jpeg": "jpeg"}
+
+// maxSystemOneDataURLImages is how many images Clef accepts per request.
+const maxSystemOneDataURLImages = 4
+
+// addSystemOneImages adds the context images to request in the service's form (system-one-shared.ts addImages).
+func addSystemOneImages(label string, model ClassifierModel, input SystemOneImageInput, images []ImageContent, request *SystemOneWireRequest) error {
+	switch input {
+	case SystemOneImageInputImages:
+		if len(images) > maxSystemOneDataURLImages {
+			return fmt.Errorf("%s accepts at most %d images for %s, got %d", label, maxSystemOneDataURLImages, model.ID, len(images))
+		}
+		urls := make([]string, len(images))
+		for i, image := range images {
+			if image.MimeType != "image/png" && image.MimeType != "image/jpeg" && image.MimeType != "image/webp" {
+				return fmt.Errorf("%s accepts PNG, JPEG, and WebP images for %s, got %s", label, model.ID, image.MimeType)
+			}
+			urls[i] = "data:" + image.MimeType + ";base64," + image.Data
+		}
+		request.Images = urls
+		return nil
+	case SystemOneImageInputStateImageURLs:
+		// OpenRouter validates the images against the model that serves the request.
+		state := make([]any, 0, len(images)+1)
+		for _, image := range images {
+			state = append(state, map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:" + image.MimeType + ";base64," + image.Data}})
+		}
+		state = append(state, request.State)
+		request.State = state
+		return nil
+	}
+	assets := &SystemOneImageAssets{}
+	for i, image := range images {
+		format, ok := systemOneAssetFormats[image.MimeType]
+		if !ok {
+			return fmt.Errorf("%s accepts PNG and JPEG images for %s, got %s", label, model.ID, image.MimeType)
+		}
+		//perf:ok once per image of a classifier request, which makes an HTTP call
+		assets.Names = append(assets.Names, fmt.Sprintf("<image-%d>", i+1))
+		assets.Assets = append(assets.Assets, SystemOneImageAsset{Format: format, DataBase64: image.Data})
+	}
+	request.Assets = assets
+	// Every asset must be referenced from the request. The names go before the state, where Clef also places its images.
+	state := make([]any, 0, len(assets.Names)+1)
+	for _, name := range assets.Names {
+		state = append(state, name)
+	}
+	state = append(state, request.State)
+	request.State = state
+	return nil
+}
+
+// serviceURL is `new URL(path, \`${baseUrl.replace(/\/+$/u, "")}/\`)` as the System One and decisions transports build it. Pi's constructor throws inside the request's try block; the URL field returns a
+// string, so an invalid base URL comes back concatenated and the request then fails on it.
 func serviceURL(baseURL, path string) string {
-	base, err := url.Parse(strings.TrimRight(baseURL, "/") + "/")
+	resolved, err := resolveServiceURL(baseURL, path)
 	if err != nil {
 		return strings.TrimRight(baseURL, "/") + "/" + path
 	}
-	return base.JoinPath(path).String()
+	return resolved
+}
+
+func resolveServiceURL(baseURL, path string) (string, error) {
+	base, err := nodeurl.ParseURL(strings.TrimRight(baseURL, "/") + "/")
+	if err != nil {
+		return "", err
+	}
+	resolved, err := base.ResolveRelativePath(path)
+	if err != nil {
+		return "", err
+	}
+	return resolved.Href(), nil
 }
 
 // typesafeSystemOneTransport is TypeSafe's native System One protocol. OpenRouter serves the same protocol, so both
 // providers use this API with different base URLs.
-var typesafeSystemOneTransport = systemOneTransport{
-	api:   ClassifierAPITypesafeSystemOne,
-	label: "System One API",
-	url:   func(model ClassifierModel) string { return serviceURL(model.BaseURL, "systemone") },
-	payload: func(model ClassifierModel, request systemOneWireRequest) map[string]any {
-		return map[string]any{"model": model.ID, "state": request.state, "questions": request.questions}
+var typesafeSystemOneTransport = SystemOneTransport{
+	API:   ClassifierAPITypesafeSystemOne,
+	Label: "System One API",
+	// OpenRouter by provider ID, which survives baseUrl overrides, or by host, which covers regional endpoints.
+	DetectCompat: func(model ClassifierModel) ResolvedSystemOneCompat {
+		//portlint:allow providerliteral typesafe-system-one.ts:20 detectCompat tests model.provider === "openrouter" || model.baseUrl.includes("openrouter.ai")
+		if model.Provider == "openrouter" || strings.Contains(model.BaseURL, "openrouter.ai") {
+			return ResolvedSystemOneCompat{ImageInput: SystemOneImageInputStateImageURLs}
+		}
+		return ResolvedSystemOneCompat{ImageInput: SystemOneImageInputAssets, SendImageOptInHeader: true}
 	},
-	output: func(body json.RawMessage) (map[string]json.RawMessage, error) {
+	URL: func(model ClassifierModel) string { return serviceURL(model.BaseURL, "systemone") },
+	Payload: func(model ClassifierModel, request SystemOneWireRequest) map[string]any {
+		body := request.Body()
+		body["model"] = model.ID
+		return body
+	},
+	Output: func(body json.RawMessage) (map[string]json.RawMessage, error) {
 		object, ok := jsonObjectOf(body)
 		if !ok {
 			return nil, errors.New("System One API returned an unexpected response")
@@ -292,7 +439,7 @@ var typesafeSystemOneTransport = systemOneTransport{
 // ClassifyTypesafeSystemOne runs TypeSafe's native System One protocol with public bool values mapped to wire-level
 // noul. OpenRouter, OpenCode Zen and Vercel AI Gateway serve the same protocol at other base URLs.
 func ClassifyTypesafeSystemOne(ctx context.Context, model ClassifierModel, request ClassifierContext, options ClassifierOptions) ClassifierResult {
-	return classifySystemOne(ctx, typesafeSystemOneTransport, model, request, options)
+	return ClassifySystemOne(ctx, typesafeSystemOneTransport, model, request, options)
 }
 
 const cloudflareSystemOneLabel = "Cloudflare Workers AI"
@@ -318,14 +465,21 @@ func cloudflareErrorMessage(errors json.RawMessage) string {
 // with { model, input }. The REST API wraps the model output in Cloudflare's API envelope. Third-party models such as
 // typesafe/jev add a run record: { success, result: { state: "Completed", result: { answers, usage } } }. Cloudflare-hosted
 // models such as @cf/cloudflare/clef return the output directly: { success, result: { model, answers, usage } }.
-var cloudflareSystemOneTransport = systemOneTransport{
-	api:   ClassifierAPICloudflareWorkersAISystemOne,
-	label: cloudflareSystemOneLabel,
-	url:   func(model ClassifierModel) string { return serviceURL(model.BaseURL, "run") },
-	payload: func(model ClassifierModel, request systemOneWireRequest) map[string]any {
-		return map[string]any{"model": model.ID, "input": map[string]any{"state": request.state, "questions": request.questions}}
+var cloudflareSystemOneTransport = SystemOneTransport{
+	API:   ClassifierAPICloudflareWorkersAISystemOne,
+	Label: cloudflareSystemOneLabel,
+	// Clef models take images as an images list of data URLs; TypeSafe's models take System One assets without the opt-in header.
+	DetectCompat: func(model ClassifierModel) ResolvedSystemOneCompat {
+		if strings.HasPrefix(model.ID, "@cf/cloudflare/clef") {
+			return ResolvedSystemOneCompat{ImageInput: SystemOneImageInputImages}
+		}
+		return ResolvedSystemOneCompat{ImageInput: SystemOneImageInputAssets}
 	},
-	output: func(body json.RawMessage) (map[string]json.RawMessage, error) {
+	URL: func(model ClassifierModel) string { return serviceURL(model.BaseURL, "run") },
+	Payload: func(model ClassifierModel, request SystemOneWireRequest) map[string]any {
+		return map[string]any{"model": model.ID, "input": request.Body()}
+	},
+	Output: func(body json.RawMessage) (map[string]json.RawMessage, error) {
 		object, ok := jsonObjectOf(body)
 		if !ok {
 			return nil, errors.New(cloudflareSystemOneLabel + " returned an unexpected response")
@@ -337,7 +491,7 @@ var cloudflareSystemOneTransport = systemOneTransport{
 		if !ok {
 			return nil, errors.New(cloudflareSystemOneLabel + " returned an unexpected response")
 		}
-		// upstream: packages/ai/src/api/cloudflare-workers-ai-system-one.ts:transport.output (`"answers" in result`).
+		// upstream: packages/ai/src/api/cloudflare-workers-ai-system-one.ts:transport.Output (`"answers" in result`).
 		if _, direct := run["answers"]; direct {
 			return run, nil
 		}
@@ -379,7 +533,7 @@ func jsJSONValueString(raw json.RawMessage) string {
 		}
 		return strings.Join(parts, ",")
 	}
-	if _, ok := jsonObjectOf(raw); ok {
+	if IsRecord(raw) {
 		return "[object Object]"
 	}
 	return string(bytes.TrimSpace(raw))
@@ -388,10 +542,10 @@ func jsJSONValueString(raw json.RawMessage) string {
 // ClassifyCloudflareWorkersAISystemOne runs System One models on the Workers AI REST endpoint, with public bool values
 // mapped to wire-level noul.
 func ClassifyCloudflareWorkersAISystemOne(ctx context.Context, model ClassifierModel, request ClassifierContext, options ClassifierOptions) ClassifierResult {
-	return classifySystemOne(ctx, cloudflareSystemOneTransport, model, request, options)
+	return ClassifySystemOne(ctx, cloudflareSystemOneTransport, model, request, options)
 }
 
-func classifierModule(classify func(context.Context, ClassifierModel, ClassifierContext, ClassifierOptions) ClassifierResult) *ProviderClassifier {
+func classifierModule(classify ClassifierFunction) *ProviderClassifier {
 	return &ProviderClassifier{Classify: func(ctx context.Context, model *ClassifierModel, request ClassifierContext, options ClassifierOptions) (ClassifierResult, error) {
 		return classify(ctx, *model, request, options), nil
 	}}
@@ -406,15 +560,14 @@ func CloudflareWorkersAISystemOneAPI() *ProviderClassifier {
 }
 
 // CloudflareClassifier wraps a classifier module so Cloudflare account and gateway endpoint placeholders materialize
-// from the resolved provider env before dispatch.
+// from the resolved provider env before dispatch (cloudflare-stream.ts:31-36). The classifier receives model itself when nothing changes.
 func CloudflareClassifier(classifier *ProviderClassifier) *ProviderClassifier {
 	return &ProviderClassifier{Classify: func(ctx context.Context, model *ClassifierModel, request ClassifierContext, options ClassifierOptions) (ClassifierResult, error) {
-		resolved := *model
-		baseURL, err := ResolveCloudflareBaseURL("cloudflare-workers-ai", model.BaseURL, options.Env)
-		if err != nil {
-			return ClassifierResult{}, err
+		if baseURL := resolveCloudflarePlaceholders(model.BaseURL, options.Env); baseURL != model.BaseURL {
+			resolved := *model
+			resolved.BaseURL = baseURL
+			model = &resolved
 		}
-		resolved.BaseURL = baseURL
-		return classifier.Classify(ctx, &resolved, request, options)
+		return classifier.Classify(ctx, model, request, options)
 	}}
 }

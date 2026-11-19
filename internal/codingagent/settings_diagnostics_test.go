@@ -1,5 +1,8 @@
 package codingagent
 
+// pi: packages/coding-agent/src/core/settings-diagnostics.ts
+// pi: packages/coding-agent/src/core/agent-session-services.ts
+
 import (
 	"errors"
 	"os"

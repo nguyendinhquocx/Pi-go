@@ -2,8 +2,13 @@
  * Agent loop that works with AgentMessage throughout.
  * Transforms to Message[] only at the LLM call boundary.
  */
-import { EventStream, getCurrentTools, getToolStateChanges, normalizeContext, toToolDeclaration, validateToolArguments, } from "../pi-ai/sdk-bundle/index.js";
+import { EventStream, getCurrentTools, getToolStateChanges, mergeClientIdentity, normalizeContext, PI_ATTRIBUTION, toToolDeclaration, validateToolArguments, } from "../pi-ai/sdk-bundle/index.js";
 import { getDefaultStreamFn } from "./stream-fn.js";
+/**
+ * Request identity of agent loops: pi-ai's defaults with provider attribution to pi. `AgentLoopConfig.identity`
+ * overrides it field by field.
+ */
+export const DEFAULT_AGENT_IDENTITY = { attribution: PI_ATTRIBUTION };
 /**
  * Start an agent loop with a new prompt message.
  * The prompt is added to the context and events are emitted for it.
@@ -271,6 +276,7 @@ async function streamAssistantResponse(context, config, signal, emit, streamFunc
     const response = await streamFunction(config.model, llmContext, {
         ...config,
         apiKey: resolvedApiKey,
+        identity: mergeClientIdentity(DEFAULT_AGENT_IDENTITY, config.identity),
         signal,
     });
     // Record the requested level, whichever stream function answered.
@@ -568,22 +574,27 @@ export async function runToolCall(toolCall, options) {
 async function executePreparedToolCall(prepared, signal, onUpdate) {
     const updateEvents = [];
     let acceptingUpdates = true;
+    const startedAt = performance.now();
+    const elapsed = () => Math.round(performance.now() - startedAt);
     try {
         const result = await prepared.tool.execute(prepared.toolCall.id, prepared.args, signal, (partialResult) => {
             if (!acceptingUpdates)
                 return;
             updateEvents.push(Promise.resolve(onUpdate(partialResult)));
         });
+        const durationMs = elapsed();
         acceptingUpdates = false;
         await Promise.all(updateEvents);
-        return { result, isError: result.isError === true };
+        return { result, isError: result.isError === true, durationMs };
     }
     catch (error) {
+        const durationMs = elapsed();
         acceptingUpdates = false;
         await Promise.all(updateEvents);
         return {
             result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
             isError: true,
+            durationMs,
         };
     }
     finally {
@@ -629,6 +640,7 @@ async function finalizeExecutedToolCall(currentContext, assistantMessage, prepar
         toolCall: prepared.toolCall,
         result,
         isError,
+        durationMs: executed.durationMs,
     };
 }
 function createErrorToolResult(message) {
@@ -644,6 +656,7 @@ async function emitToolExecutionEnd(finalized, emit) {
         toolName: finalized.toolCall.name,
         result: finalized.result,
         isError: finalized.isError,
+        ...(finalized.durationMs === undefined ? {} : { durationMs: finalized.durationMs }),
     });
 }
 function createToolResultMessage(finalized) {
@@ -657,6 +670,7 @@ function createToolResultMessage(finalized) {
         details: finalized.result.details,
         usage: finalized.result.usage,
         isError: finalized.isError,
+        ...(finalized.durationMs === undefined ? {} : { durationMs: finalized.durationMs }),
         timestamp: Date.now(),
     };
 }

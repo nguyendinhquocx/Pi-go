@@ -106,28 +106,41 @@ type pigletVerifyOutput struct {
 	Signer   string              `json:"signer,omitempty"`
 	Trusted  bool                `json:"trusted"`
 	Manifest *signature.Manifest `json:"manifest,omitempty"`
-	Error    string              `json:"error,omitempty"`
+	// Provenance reports the check against a source Piglet named with --source.
+	// pig additive (D170): `pig piglet verify --source` rechecks the Binary's recorded Piglet digests against the source.
+	Provenance *ProvenanceCheck `json:"provenance,omitempty"`
+	Error      string           `json:"error,omitempty"`
 }
 
 // cmdVerify checks one Piglet Binary's signature against the user's trust
 // store without running it. It succeeds only when a signature verifies; an
 // unsigned binary has nothing to verify.
 func cmdVerify(args []string, stdout, stderr io.Writer) int {
-	jsonMode, path := false, ""
-	for _, arg := range args {
-		switch {
+	const usage = "Usage: pig piglet verify <piglet-binary> [--source <name|path>] [--workspace <dir>] [--json]"
+	jsonMode, path, source, workspace := false, "", "", ""
+	for i := 0; i < len(args); i++ {
+		switch arg := args[i]; {
 		case arg == "--json":
 			jsonMode = true
+		case arg == "--source" && i+1 < len(args) && source == "":
+			i++
+			source = args[i]
+		case arg == "--workspace" && i+1 < len(args) && workspace == "":
+			i++
+			workspace = args[i]
 		case strings.HasPrefix(arg, "-") || path != "":
-			_, _ = fmt.Fprintln(stderr, "Usage: pig piglet verify <piglet-binary> [--json]")
+			_, _ = fmt.Fprintln(stderr, usage)
 			return 2
 		default:
 			path = arg
 		}
 	}
 	if path == "" {
-		_, _ = fmt.Fprintln(stderr, "Usage: pig piglet verify <piglet-binary> [--json]")
+		_, _ = fmt.Fprintln(stderr, usage)
 		return 2
+	}
+	if workspace == "" {
+		workspace, _ = os.Getwd()
 	}
 	output := pigletVerifyOutput{Path: path}
 	status, err := checkBinarySignature(path)
@@ -141,6 +154,15 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 		output.Status = "FAILED: " + err.Error()
 	}
 	output.Verified = err == nil && status.Signed
+	if source != "" && output.Manifest != nil && err == nil {
+		check, checkErr := CheckProvenance(*output.Manifest, source, workspace)
+		output.Provenance = check
+		if checkErr != nil {
+			output.Error = checkErr.Error()
+			output.Status = "FAILED: " + checkErr.Error()
+			output.Verified = false
+		}
+	}
 	if jsonMode {
 		data, _ := json.MarshalIndent(output, "", "  ")
 		_, _ = fmt.Fprintln(stdout, string(data))
@@ -164,6 +186,7 @@ func checkBinarySignature(path string) (signature.Status, error) {
 
 func renderVerify(stdout io.Writer, output pigletVerifyOutput) {
 	_, _ = fmt.Fprintf(stdout, "Piglet Binary: %s\nSignature: %s\n", output.Path, output.Status)
+	renderProvenance(stdout, output.Provenance)
 	if output.Manifest == nil || output.Error != "" {
 		return
 	}

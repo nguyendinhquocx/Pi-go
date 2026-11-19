@@ -36,13 +36,14 @@ type piPackage struct {
 
 // piPackages are the specifiers Pi's extension loader serves from its own
 // bundle (core/extensions/virtual-modules.ts): pi-coding-agent, pi-tui, the
-// pi-ai root (served as its compat entry point), pi-ai/compat and
-// pi-ai/providers/all, and pi-agent-core.
+// pi-ai root (served as its compat entry point), pi-ai/compat, pi-ai/models
+// and pi-ai/providers/all, and pi-agent-core.
 var piPackages = []piPackage{
 	{"pi-coding-agent", "@earendil-works/pi-coding-agent", ".", "shims/pi-coding-agent.mjs"},
 	{"pi-tui", "@earendil-works/pi-tui", ".", "shims/pi-tui.mjs"},
 	{"pi-ai", "@earendil-works/pi-ai", ".", "shims/pi-ai.mjs"},
 	{"pi-ai/compat", "@earendil-works/pi-ai", "./compat", "shims/pi-ai.mjs"},
+	{"pi-ai/models", "@earendil-works/pi-ai", "./models", "shims/pi-ai-models.mjs"},
 	{"pi-ai/providers/all", "@earendil-works/pi-ai", "./providers/all", "shims/pi-dist/pi-ai/providers/all.js"},
 	{"pi-agent-core", "@earendil-works/pi-agent-core", ".", "shims/pi-agent-core.mjs"},
 }
@@ -107,6 +108,10 @@ func packageExports(root string) ([]probePackage, error) {
 			}
 			switch i.Kind {
 			case "class", "function", "variable":
+			case "external":
+				// A re-export from a third-party package: a runtime value
+				// (typebox's Type, marked's Marked) or a type, which the
+				// probe tells apart by whether the runtime serves it.
 			default:
 				continue // type-only declarations have no runtime value
 			}
@@ -118,6 +123,11 @@ func packageExports(root string) ([]probePackage, error) {
 				sort.Strings(exp.Members)
 			}
 			pkg.Exports = append(pkg.Exports, exp)
+		}
+		// Pi serves both pi-ai specifiers from the coding agent's extension view (core/extensions/virtual-modules.ts, pi-ai-extension-view.ts): the
+		// compat entry plus TypeBox's Type, which pi-ai's own entrypoints no longer export, so the .d.ts inventory has no row for it.
+		if p.module == "pi-ai" || p.module == "pi-ai/compat" {
+			pkg.Exports = append(pkg.Exports, probeExport{Name: "Type", Kind: "external"})
 		}
 		if len(pkg.Exports) == 0 {
 			return nil, fmt.Errorf("inventory has no runtime exports for %s %s", p.name, p.entrypoint)
@@ -153,6 +163,7 @@ func runProbe(root string, packages []probePackage) (*probeResult, error) {
 		return nil, err
 	}
 	outputPath := filepath.Join(dir, "report.json")
+	//nolint:gosec // G204 (class a): program is literal node; args are the repo probe.mjs, runtime dir from root, and temp request/output paths.
 	cmd := exec.Command("node", probe, runtimeDir, requestPath, outputPath)
 	cmd.Dir = dir
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -188,6 +199,9 @@ func packageRows(packages []probePackage, probe *probeResult) []matrixRow {
 		group := "Package exports: " + pkg.Module
 		for _, exp := range pkg.Exports {
 			got := report[exp.Name]
+			if exp.Kind == "external" && got.Status == "missing" {
+				continue // a re-exported type: no runtime value to realize
+			}
 			rows = append(rows, matrixRow{
 				surfaceRow: surfaceRow{Group: group, Key: pkg.Module + ": " + exp.Name, Decl: exp.Kind + " " + exp.Name, Kind: kindExport},
 				Cells:      map[string]cell{"node": nodeCell(got.probeCell)},

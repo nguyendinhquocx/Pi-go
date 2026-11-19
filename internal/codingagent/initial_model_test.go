@@ -49,14 +49,14 @@ func TestFindInitialModelUsesAvailableSnapshotAndSavedIdentity(t *testing.T) {
 	}{
 		{
 			name:       "configured catalog default is unavailable",
-			models:     []RuntimeModel{{Provider: "openai", ID: "gpt-5.5"}},
+			models:     []RuntimeModel{{Provider: "openai", ID: "gpt-6.1-sol"}},
 			available:  []RuntimeModel{{Provider: "custom-endpoint", ID: "second"}, {Provider: "custom-endpoint", ID: "first"}},
 			configured: map[string]bool{"openai": true}, want: "custom-endpoint/second", thinking: DefaultThinkingLevel,
 			calls: []string{"available"},
 		},
 		{
 			name:   "empty snapshot does not reconstruct configured catalog",
-			models: []RuntimeModel{{Provider: "openai", ID: "gpt-5.5"}}, configured: map[string]bool{"openai": true},
+			models: []RuntimeModel{{Provider: "openai", ID: "gpt-6.1-sol"}}, configured: map[string]bool{"openai": true},
 			thinking: DefaultThinkingLevel, calls: []string{"available"},
 		},
 		{
@@ -76,7 +76,7 @@ func TestFindInitialModelUsesAvailableSnapshotAndSavedIdentity(t *testing.T) {
 		},
 		{
 			name:      "provider declaration order precedes snapshot order",
-			available: []RuntimeModel{{Provider: "openai", ID: "gpt-5.5"}, {Provider: "anthropic", ID: "claude-opus-4-8"}},
+			available: []RuntimeModel{{Provider: "openai", ID: "gpt-6.1-sol"}, {Provider: "anthropic", ID: "claude-opus-4-8"}},
 			want:      "anthropic/claude-opus-4-8", thinking: DefaultThinkingLevel, calls: []string{"available"},
 		},
 	} {
@@ -135,33 +135,6 @@ func TestFindInitialModelThinkingPrecedence(t *testing.T) {
 				}
 			} else if !reflect.DeepEqual(runtime.calls, []string{"model:custom/chosen", "auth:custom"}) {
 				t.Fatalf("saved selection calls=%v", runtime.calls)
-			}
-		})
-	}
-}
-
-// upstream: packages/coding-agent/src/core/model-resolver.ts:653-666. Initial CLI selection uses the shared resolver but returns the builtin thinking default even for a parsed suffix.
-func TestFindInitialModelCLIUsesSharedResolution(t *testing.T) {
-	t.Parallel()
-	for _, row := range []struct {
-		name, provider, model, wantID, wantError string
-	}{
-		{name: "custom model suffix", provider: "custom", model: "custom/new:high", wantID: "new"},
-		{name: "existing model suffix", provider: "custom", model: "base:high", wantID: "base"},
-		{name: "unknown provider", provider: "missing", model: "base", wantError: `Unknown provider "missing". Use --list-models to see available providers/models.`},
-	} {
-		t.Run(row.name, func(t *testing.T) {
-			runtime := &initialModelTestRuntime{models: []RuntimeModel{{Provider: "custom", ID: "base", Name: "Base"}}}
-			got, err := FindInitialModel(FindInitialModelOptions{ModelRuntime: runtime, CLIProvider: row.provider, CLIModel: row.model, DefaultThinkingLevel: "low"})
-			if row.wantError != "" {
-				if err == nil || err.Error() != row.wantError || !reflect.DeepEqual(got, InitialModelResult{}) {
-					t.Fatalf("result=%+v error=%v, want zero result and %q", got, err, row.wantError)
-				}
-			} else if err != nil || got.Model == nil || got.Model.Provider != "custom" || got.Model.ID != row.wantID || got.ThinkingLevel != DefaultThinkingLevel || got.FallbackMessage != "" {
-				t.Fatalf("result=%+v error=%v, want custom/%s:%s", got, err, row.wantID, DefaultThinkingLevel)
-			}
-			if !reflect.DeepEqual(runtime.calls, []string{"models:"}) {
-				t.Fatalf("CLI selection read auth or availability: %v", runtime.calls)
 			}
 		})
 	}

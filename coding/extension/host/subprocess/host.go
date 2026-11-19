@@ -18,10 +18,19 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MichaelKinsy/PiG/coding/extension/host/tsruntime"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/timings"
+	"github.com/MichaelKinsy/PiG/internal/configroot"
+	"github.com/MichaelKinsy/PiG/internal/handleryield"
+
 	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
+	"github.com/MichaelKinsy/PiG/internal/boundarywire"
+	"github.com/MichaelKinsy/PiG/internal/eventwire"
 	"github.com/MichaelKinsy/PiG/internal/installchange"
+	"github.com/MichaelKinsy/PiG/internal/jsloop"
 	"github.com/MichaelKinsy/PiG/internal/linkerexec"
 	"github.com/MichaelKinsy/PiG/internal/orderedjson"
+	"github.com/MichaelKinsy/PiG/internal/pigsdklock"
 	"github.com/MichaelKinsy/PiG/internal/toolchain"
 
 	"github.com/MichaelKinsy/PiG/agent"
@@ -52,6 +61,11 @@ type ExtConfig struct {
 	// extension and every command it registers.
 	SourceInfo extension.SourceInfo
 
+	// PackageRoot is the root of the package the extension was resolved from (package-manager.ts PathMetadata.packageRoot):
+	// a local directory or an installed npm or git package. It is empty for a project or user extension and for a local file
+	// source, which belongs to no package root.
+	PackageRoot string
+
 	// Enabled controls whether the extension is loaded. Default: true.
 	Enabled bool
 
@@ -73,6 +87,9 @@ type ExtConfig struct {
 
 	selectedPath string
 	resolveErr   error
+	// sourceCheck is set when this package derived ContentHash from the source files: it reports an error once they no longer hash
+	// to it. A cell build runs it before it publishes (see fillContentHash).
+	sourceCheck func() error
 	// identity is the extension identity when Name is a host key made unique
 	// for a second copy of the same extension from another path.
 	identity string
@@ -230,6 +247,14 @@ func extensionSourcePaths(config ExtConfig) (path, resolvedPath string) {
 	return path, resolvedPath
 }
 
+// registeredIdentityMismatch is the load error for an extension whose register frame names an identity other than the one its selection gave it, isolated or packed.
+func registeredIdentityMismatch(config ExtConfig, registered string) *LoadError {
+	return newLoadError(config.Name, "register", "name_mismatch", fmt.Errorf(
+		"selected identity %q does not match registered identity %q for source %s; a direct directory must be renamed/reselected under %q, or selected through a Package/Piglet declaration with that exact member identity",
+		config.Name, registered, extConfigOrigin(config), registered,
+	))
+}
+
 func extConfigOrigin(config ExtConfig) string {
 	if config.selectedPath != "" {
 		return config.selectedPath
@@ -258,10 +283,22 @@ type Host struct {
 	// providerConfigRefs maps a provider to the xref of its effective registered configuration root in the owning Node realm.
 	providerConfigRefs map[string]providerConfigRef
 	eventBus           hostEventBus
+	// loopTurns holds each forwarded loop turn until every recipient took it (forwardLoopTurned).
+	loopTurns loopTurns
+	// childSessions holds the child agent sessions each connection created (child_session.go).
+	childSessions childSessionTable
+	// timerTurns holds the calls an extension runtime marks as made by a timer or an immediate until Pi's loop would run them (SetTimerTurns); nil holds nothing.
+	timerTurns atomic.Pointer[jsloop.Turns]
 	// nested tracks executeTool calls in flight (host_extension_api.go).
 	nested nestedCalls
+	// sessionGraphObjects holds the session graph objects each connection built; sessionGraphBackend serves them (session_graph.go).
+	sessionGraphObjects sessionGraphTable
+	sessionGraphMu      sync.Mutex
+	sessionGraphBackend SessionGraphBackend
 	// runSignals numbers the active run's signal and watches it for its abort (run_signal.go).
 	runSignals runSignals
+	// messageUpdateShare is the message_update payload every extension of the host shares while the partial has not published (message_update_delta.go).
+	messageUpdateShare messageUpdateShare
 	// virtualModelOwners names the extension whose definition the runtime holds for each virtual model: the last one that registered it. Guarded by mu.
 	virtualModelOwners map[VirtualModelRef]*managedExt
 	// loadOrder ranks extension names by their position in the configured
@@ -283,7 +320,8 @@ type Host struct {
 	sessionLogSubs map[string]struct{}
 
 	cwd       string
-	mode      string // run mode: tui|rpc|json|print, sent in ReadyPayload (ctx.mode)
+	mode      string   // run mode: tui|rpc|json|print, sent in ReadyPayload (ctx.mode)
+	hostInfo  HostInfo // getAgentDir, CONFIG_DIR_NAME and VERSION, sent to extension processes in PIG_EXT_HOST_INFO
 	socketDir string
 
 	// harnessBinary and harnessArgs are the executable and command-line
@@ -300,14 +338,18 @@ type Host struct {
 	// sockets, created lazily under socketDir. Isolating sockets per Host keeps
 	// parallel Pig instances (same user, same extensions) from computing the same
 	// socket path and deleting each other's live sockets. Removed on Shutdown.
-	sockRuntimeOnce sync.Once
-	sockRuntimeDir  string
-	sockRuntimeErr  error
+	//
+	// Creating, allocating from and removing the directory are one state machine
+	// (not created, created, removed) under sockMu. After removal every allocation
+	// refuses with errSockRuntimeRemoved: a path inside the deleted directory is
+	// never handed out.
+	sockMu         sync.Mutex
+	sockRuntimeDir string
+	sockRuntimeErr error
+	sockRemoved    bool
 
-	// sockNames maps an extension name to its short, stable socket leaf within
-	// sockRuntimeDir (guarded by sockMu).
-	sockMu    sync.Mutex
-	sockNames map[string]string
+	// sockSeq counts the socket paths this Host has handed out (newSocketPath).
+	sockSeq atomic.Uint32
 
 	// shuttingDown is set when Shutdown is called. Crash handlers check
 	// this to suppress "connection closed" noise during normal exit.
@@ -320,9 +362,13 @@ type Host struct {
 	// applies to every Node extension it starts.
 	nodeRuntimeMu    sync.Mutex
 	nodeRuntimeReady bool
+	tsRuntimes       typeScriptRuntimes
 
 	// uiBridge handles extension→host UI calls and widget pushes.
 	uiBridge *UIBridge
+	// earlyBridge answers the load-time model stream of a Host that has no UI bridge, see SetEarlyModelStream.
+	earlyBridge     *UIBridge
+	earlyBridgeOnce sync.Once
 
 	// staleMessage, once set, makes the Host reject every extension→host call with that message.
 	staleMessage atomic.Pointer[string]
@@ -334,19 +380,26 @@ type Host struct {
 	// (e.g. ui.notify). Set by the host wiring layer.
 	onCall func(extName string, call *CallPayload) (*CallResultPayload, error)
 
+	// inboundObserver, when set, sees every frame an extension sends (see
+	// SetInboundObserver).
+	inboundObserver func(extName string, env *Envelope)
+	// outboundObserver, when set, sees every frame the host writes to an extension (see SetOutboundObserver).
+	outboundObserver func(extName string, frame []byte)
+
 	// onCrash is called when an extension process exits unexpectedly.
 	// The callback receives the extension name and the supervisor's decision
-	// (delay before restart, or error if circuit breaker tripped).
-	onCrash func(name string, delay time.Duration, disabled bool, reason string)
+	// (delay before restart, or error if circuit breaker tripped). The wiring
+	// layer sets it again on every reload while connection and recovery
+	// goroutines read it.
+	onCrash atomic.Pointer[func(name string, delay time.Duration, disabled bool, reason string)]
 
 	// configLoader supplies the authoritative normalized startup resolver for
 	// Reload. Startup and reload must use the same extension inputs.
 	configLoader func() ([]ExtConfig, error)
 
-	providerRuntime          *extension.ExtensionRuntime
-	onRegisterNativeProvider func(context.Context, *extension.NativeProvider) error
-	nativeProviders          map[*Conn]map[string]*nativeProviderProxy
-	nativeProviderHandles    map[string]*nativeProviderProxy
+	providerRuntime       *extension.ExtensionRuntime
+	nativeProviders       map[*Conn]map[string]*nativeProviderProxy
+	nativeProviderHandles map[string]*nativeProviderProxy
 
 	// oauthLoginSessions holds the in-flight OAuth login callbacks per extension
 	// name so the oauth.cb.* calls an extension issues during login route back
@@ -416,7 +469,6 @@ type Host struct {
 	retained       *RuntimeRetention
 	retainedShared bool
 	epoch          int
-	parkSeq        atomic.Int64
 
 	// loadErrors holds the formatted errors from the most recent LoadAll so the
 	// interactive session can surface startup load/build/register failures
@@ -428,13 +480,20 @@ type Host struct {
 	// when startup tracing is enabled; extension hosting otherwise pays one nil check.
 	startupMark func(string)
 
+	// acceptGate is a test seam over an extension's Accept (acceptGateFunc). Production leaves it nil.
+	acceptGate acceptGateFunc
+
 	runtimeDrainHandler func()
 	// runtimeDrains holds, per Node process and report, the connections that reported it. Guarded by h.mu.
 	runtimeDrains map[runtimeDrainKey]*runtimeDrainReports
-	// drainTasks joins the goroutines that finish a drain after a connection closed; drainTasksClosed stops new ones once Shutdown waits. Guarded by drainTasksMu.
+	// drainTasks joins the goroutines that finish a drain after a connection closed and the crash-restart backoffs; drainTasksClosed stops new ones once Shutdown waits. Guarded by drainTasksMu.
 	drainTasksMu     sync.Mutex
 	drainTasks       sync.WaitGroup
 	drainTasksClosed bool
+	// hostStatePushQueued is set while a fan-out of a host state change waits to run (see hostStateChanged); the fan-out clears it before it reads the targets, so a change that arrives while it runs queues the next one.
+	hostStatePushQueued atomic.Bool
+	// stopMcpServersObserver removes the observer that reports each change of the runtime's MCP server registry to hostStateChanged. Guarded by h.mu.
+	stopMcpServersObserver func()
 	// retirements are the stops of replaced generations that a running command deferred (retireGeneration). retirementTasks joins the goroutines that run them; retirementsClosed stops new ones once Shutdown has run the pending stops. Guarded by retirementMu.
 	retirementMu      sync.Mutex
 	retirements       map[*generationRetirement]struct{}
@@ -456,12 +515,18 @@ type Host struct {
 	commandWindowHandler  func(suspended int)
 	tailFlights           map[*tailFlight]struct{}
 	settleTailHandler     func(suspended int)
+	// backgroundGate is the embedder's hold on calls no request started (SetBackgroundCallGate).
+	backgroundGate atomic.Pointer[func() <-chan struct{}]
+	// syncRuns holds the Session busy for every extension while a handler that sent a triggering message has not yet yielded (sync_run_hold.go).
+	syncRuns syncRunHolds
 
 	// widthFunc and heightFunc return the current terminal dimensions. Set by
 	// the wiring layer (interactive mode) so the host can pass real geometry
-	// to extensions in the ready payload and in change notifications.
-	widthFunc  func() int
-	heightFunc func() int
+	// to extensions in the ready payload and in change notifications. The
+	// wiring layer sets them again on every reload while host goroutines read
+	// them.
+	widthFunc  atomic.Pointer[func() int]
+	heightFunc atomic.Pointer[func() int]
 
 	// geometryMu orders geometry with its delivery: a goroutine records the
 	// value an extension has seen and enqueues the ready payload or change
@@ -562,13 +627,20 @@ func frameSkewHint(cfg ExtConfig, size uint64, recent bool) string {
 }
 
 type managedExt struct {
+	// messageUpdates is the message_update payload the extension's connection last received (message_update_delta.go).
+	messageUpdates messageUpdateStream
+	// toolUpdates are the tool_execution_update payloads it last received, one for each tool call (tool_update_delta.go).
+	toolUpdates  toolUpdateStreams
 	facetBridge  *FacetBridge
 	pendingReady *Envelope
-	nodeEntry    string
-	replacement  atomic.Pointer[managedExt]
-	config       ExtConfig
-	host         *Host
-	supervisor   *Supervisor
+	// earlyOwnsThinkingRuns is an ownThinkingRuns call that arrived before the registration built the Extension; Host.mu guards it.
+	// pig additive (D214)
+	earlyOwnsThinkingRuns *bool
+	nodeEntry             string
+	replacement           atomic.Pointer[managedExt]
+	config                ExtConfig
+	host                  *Host
+	supervisor            *Supervisor
 	// conn is the current connection. Only setConnLocked stores it, and only while holding Host.mu, so a Host.mu holder reads a stable value; every other reader loads it once through connection() and keeps that snapshot for the whole operation.
 	conn atomic.Pointer[Conn]
 	// procMu guards the process handle: proc, processTree, cmd and exitedCh. An automatic restart replaces them in startExt while a stop, a crash handler or a status reader can run; it is a leaf lock, never held while calling out.
@@ -580,11 +652,13 @@ type managedExt struct {
 	parentCtx       context.Context      // Context the extension was started under; if cancelled, an exit is intentional teardown, not a crash
 	exitedCh        <-chan struct{}      // Closed by the process reaper when cmd.Wait returns
 	waitErr         error                // Process exit status; read only after <-exitedCh (channel close synchronizes)
-	ext             *extension.Extension // Populated after successful register
+	ext             *extension.Extension // Populated after successful register; written under Host.mu once me is in Host.exts
 	flagNames       []string
 	flagDefaults    map[string]any
 	wantsSessionLog bool
-	nodeRuntime     bool // isolated extension hosted by the Node runtime; a packed one reports through packedProcess.node
+	// wantsModelRegistry records RegisterPayload.WantsModelRegistry: only such a runtime is sent model-registry snapshots.
+	wantsModelRegistry bool
+	nodeRuntime        bool // isolated extension hosted by the Node runtime; a packed one reports through packedProcess.node
 	// commands counts the command requests running on this generation, so a reload that replaces it waits for them (retireGeneration).
 	commands commandGate
 	// replaced is set when a commit replaces or removes this generation; its later host calls fail as stale (runCall).
@@ -597,21 +671,33 @@ type managedExt struct {
 	entryCursor           int
 	entryCursorMu         sync.Mutex
 	sessionTransferActive bool
-	providerNames         []string
-	mcpServerNames        []string          // MCP servers this extension registered, guarded by Host.mu
-	virtualModels         []VirtualModelRef // virtual models this extension registered, guarded by Host.mu
-	oauthProviderNames    []string          // subset of providerNames that also registered a bridged OAuth provider
-	stderrLogPath         string
-	stderrLog             *processStderrLog
-	sockPath              string               // Socket file path (for cleanup)
-	packedCellKey         string               // Non-empty when hosted by a packed runtime cell
-	packedProcess         *packedProcessState  // Shared process authority for packed-member sockets.
-	shuttingDown          atomic.Bool          // True when graceful shutdown was initiated
-	inProcServe           func(net.Conn) error // Non-nil for a fused in-process extension (D31)
-	nodeRealm             bool                 // Hosted by a Node process, which is one xref realm
-	releaseLiveness       func()               // Releases heartbeat ownership for live provider state.
-	livenessOwnerMu       sync.Mutex
-	cacheLease            *runtimecell.UsageLease
+	// lastStatePush remembers what each connection's runtime last received
+	// in a state_update, guarded by entryCursorMu. pushStateTo uses it to
+	// skip identical writes and to omit catalog fields the recipient already
+	// holds byte-for-byte.
+	lastStatePush map[*Conn]*connStatePushCache
+	// statePushQueue coalesces the pushes of host state changes to this extension (see queueStatePush).
+	statePushQueue statePushQueue
+	// runtimeStateGen counts the moments a runtime changed its own copy of the
+	// state ahead of the host (thinking level, editor text), so
+	// a push the host would otherwise skip still corrects the runtime. A cache
+	// from an older generation is not trusted.
+	runtimeStateGen    atomic.Uint64
+	providerNames      []string
+	mcpServerNames     []string          // MCP servers this extension registered, guarded by Host.mu
+	virtualModels      []VirtualModelRef // virtual models this extension registered, guarded by Host.mu
+	oauthProviderNames []string          // subset of providerNames that also registered a bridged OAuth provider
+	stderrLogPath      string
+	stderrLog          *processStderrLog
+	sockPath           string               // This generation's own socket path, listened on at its start and removed by its stop; no other generation holds it
+	packedCellKey      string               // Non-empty when hosted by a packed runtime cell
+	packedProcess      *packedProcessState  // Shared process authority for packed-member sockets.
+	shuttingDown       atomic.Bool          // True when graceful shutdown was initiated
+	inProcServe        func(net.Conn) error // Non-nil for a fused in-process extension (D31)
+	nodeRealm          bool                 // Hosted by a Node process, which is one xref realm
+	releaseLiveness    func()               // Releases heartbeat ownership for live provider state.
+	livenessOwnerMu    sync.Mutex
+	cacheLease         *runtimecell.UsageLease
 	// share counts the extensions hosted by this isolated Node process, which Pi's loader re-invokes factories in across reloads. procOwner is the extension that spawned it, and retainedFrom the process a pending start will re-invoke its factory in.
 	share         *processShare
 	shareReleased atomic.Bool
@@ -662,7 +748,7 @@ type stagedManagedExt struct {
 // NewHost creates an extension host using the process environment's Pig config
 // root. Product assembly should prefer [NewHostWithConfigRoot].
 func NewHost(cwd string) *Host {
-	return NewHostWithConfigRoot(cwd, resolveConfigRoot())
+	return NewHostWithConfigRoot(cwd, configroot.Dir())
 }
 
 // NewHostWithConfigRoot creates an extension host pinned to configRoot. The
@@ -670,7 +756,7 @@ func NewHost(cwd string) *Host {
 // $XDG_RUNTIME_DIR/pig/ or $TMPDIR/pig-<uid>/).
 func NewHostWithConfigRoot(cwd, configRoot string) *Host {
 	if strings.TrimSpace(configRoot) == "" {
-		configRoot = resolveConfigRoot()
+		configRoot = configroot.Dir()
 	}
 	cacheDir := filepath.Join(configRoot, "cache", "ext")
 	recoveryContext, recoveryCancel := context.WithCancel(context.Background())
@@ -698,6 +784,13 @@ func (h *Host) SetStartupTrace(mark func(string)) {
 }
 
 func (h *Host) markExtension(name, phase string) {
+	// loader.ts:630, :645: a started extension process is the module import, its register handshake the factory (PI_TIMING=1, "extensions").
+	switch phase {
+	case "spawn-done":
+		timings.Time(name+" module import", timings.Extensions)
+	case "handshake-done":
+		timings.Time(name+" factory", timings.Extensions)
+	}
 	if h.startupMark == nil {
 		return
 	}
@@ -713,6 +806,26 @@ func (h *Host) markExtension(name, phase string) {
 		name = name[:64]
 	}
 	h.startupMark("extension." + name + "." + phase)
+}
+
+// SetInboundObserver registers a diagnostic observer of every frame an
+// extension sends, in wire order, for every load mode (isolated, packed,
+// fused). It runs on the connection's read loop before the frame is routed,
+// so it must not block and must neither modify nor retain env. Nil (the
+// default) observes nothing at no cost. Must be called before [Host.Load],
+// [Host.LoadInProcess] or [Host.Reload].
+//
+// pig additive (D107): conformance uses it to read the component kit's image
+// transport (docs/plan/extension-component-kit.md §7, §10).
+func (h *Host) SetInboundObserver(fn func(extName string, env *Envelope)) {
+	h.inboundObserver = fn
+}
+
+// SetOutboundObserver registers a diagnostic observer of the JSON of every frame the host writes to an extension, in write order, for every load mode (isolated, packed, fused). It runs on the connection's write loop before the frame is written, so it must not block and must neither modify nor retain frame. Nil (the default) observes nothing at no cost. Must be called before [Host.Load], [Host.LoadInProcess] or [Host.Reload].
+//
+// pig additive (D107): conformance uses it to prove that every frame is the encoder's json.Marshal of its envelope.
+func (h *Host) SetOutboundObserver(fn func(extName string, frame []byte)) {
+	h.outboundObserver = fn
 }
 
 // SetCallHandler registers the callback for extension→host calls (ui.notify,
@@ -748,6 +861,55 @@ func (h *Host) Invalidate(message string) {
 	}
 }
 
+// notifyReloadStarted sends NotifyReloadStarted to every connected Node generation. Reload calls it before it admits a replacement generation to a running process's control channel, which a Node runtime waiting in place for the host's next step would not read. Other runtimes have no such wait.
+func (h *Host) notifyReloadStarted() {
+	h.mu.Lock()
+	conns := make([]*Conn, 0, len(h.exts))
+	for _, me := range h.exts {
+		if conn := me.connection(); conn != nil && me.nodeRealm {
+			conns = append(conns, conn)
+		}
+	}
+	h.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Send(&Envelope{Type: MsgNotify, Notify: &NotifyPayload{Method: NotifyReloadStarted}})
+	}
+}
+
+// forwardLoopTurned queues NotifyLoopTurned on every connection of every Node runtime process other than from's, and answers from with NotifyLoopTurnTaken once each of those connections took the turn or closed (loopTurns). from's read loop calls it before it reads the next frame, such as the response of the handler that turned the loop, so each recipient reads the turn before any frame the host sends it after that response. The process that hosts from gets nothing on any of its connections: the turn is its own loop's, which already ran its callbacks, and a copy on a packed sibling's connection could arrive after the handler answered and end the wait that answer began. The Go, Rust and Python SDKs have nothing that waits for a turn.
+func (h *Host) forwardLoopTurned(from *Conn, raw json.RawMessage) {
+	var args LoopTurnArgs
+	// A turn without a readable number is answered as turn 0.
+	_ = json.Unmarshal(raw, &args)
+	h.mu.Lock()
+	var sender any
+	for _, me := range h.exts {
+		if me.connection() == from {
+			sender = processIdentity(me)
+			break
+		}
+	}
+	targets := make([]*Conn, 0, len(h.exts))
+	for _, me := range h.exts {
+		conn := me.connection()
+		if conn == nil || conn == from || !me.hostsNodeRuntime() {
+			continue
+		}
+		if sender != nil && processIdentity(me) == sender {
+			continue
+		}
+		targets = append(targets, conn)
+	}
+	h.mu.Unlock()
+	id, frame := h.loopTurns.forward(from, args.Turn, targets)
+	for _, conn := range targets {
+		if conn.sendEncoded(frame) != nil {
+			// A connection that can no longer be sent to never takes the turn.
+			h.loopTurns.settle(conn, id)
+		}
+	}
+}
+
 // SetUIBridge attaches a UI bridge for handling widget pushes and UI method
 // calls. Must be called before [Host.Load].
 func (h *Host) SetUIBridge(bridge *UIBridge) {
@@ -755,12 +917,22 @@ func (h *Host) SetUIBridge(bridge *UIBridge) {
 	if bridge != nil {
 		bridge.WatchSessionLog = h.watchSessionLog
 		bridge.OnStateChanged = h.BroadcastStateUpdate
+		bridge.onRuntimeStateMutated = h.runtimeStateMutated
 		bridge.OnRunSignalChanged = h.runSignalChanged
+		bridge.OnHostStateChanged = h.hostStateChanged
 		bridge.resolveFlag = h.resolveFlagValue
 		bridge.withSession = h.withSessionCallback
+		bridge.setup = h.setupCallback
 		bridge.mu.Lock()
-		bridge.mcpServers = h.providerRuntime.McpServers
+		bridge.mcpServers = h.providerRuntime.McpServers().List
 		bridge.mu.Unlock()
+		// Upstream's getMcpServers reads the registry live (loader.ts:495-497), and an extension with no mcp_servers_change handler gets no event when another extension registers a server, so the registry's own change reports the new list to every runtime.
+		h.mu.Lock()
+		if h.stopMcpServersObserver != nil {
+			h.stopMcpServersObserver()
+		}
+		h.stopMcpServersObserver = h.providerRuntime.McpServers().ObserveChange(h.hostStateChanged)
+		h.mu.Unlock()
 	}
 }
 
@@ -775,6 +947,10 @@ func (h *Host) watchSessionLog(extName string, cursor int, complete bool) ([]jso
 	h.sessionLogSubs[extName] = struct{}{}
 	h.mu.Unlock()
 
+	if me != nil {
+		// The runtime applies this page's entries and leaf to its replica outside a state_update, so the next push to it is a full snapshot.
+		me.runtimeStateGen.Add(1)
+	}
 	if me != nil && !complete {
 		me.sessionTransferActive = true
 	}
@@ -816,9 +992,19 @@ func (h *Host) subscribedToSessionLog(name string) bool {
 	return ok
 }
 
-// SetCrashHandler registers a callback for extension crash events.
+// SetCrashHandler registers a callback for extension crash events. The host
+// reads it from its connection and recovery goroutines, so a later call (a
+// reload binds the host again) replaces it atomically.
 func (h *Host) SetCrashHandler(fn func(name string, delay time.Duration, disabled bool, reason string)) {
-	h.onCrash = fn
+	h.onCrash.Store(&fn)
+}
+
+// crashHandler is the callback SetCrashHandler registered, nil when none is.
+func (h *Host) crashHandler() func(name string, delay time.Duration, disabled bool, reason string) {
+	if fn := h.onCrash.Load(); fn != nil {
+		return *fn
+	}
+	return nil
 }
 
 // withStderrLog appends an extension's captured stderr log path to a crash
@@ -862,13 +1048,97 @@ func (h *Host) SetMode(mode string) {
 	h.mode = mode
 }
 
+// HostInfo is the host's answer to Pi's getAgentDir(), CONFIG_DIR_NAME, VERSION, getPackageDir() and the default getShellConfig() (config.ts, utils/shell.ts). Every
+// extension process receives it in PIG_EXT_HOST_INFO, so an SDK returns the host's own values instead of rederiving them from an environment it may not share.
+type HostInfo struct {
+	AgentDir      string
+	ConfigDirName string
+	Version       string
+	// PackageDir is getPackageDir(): PI_PACKAGE_DIR when set, else the directory of the host executable (Pi's own answer for a compiled binary).
+	PackageDir string
+	// Shell resolves getShellConfig() with no custom shell path. It runs when an extension process starts, not when the host records it: finding a shell may start
+	// a process. A nil Shell sends none.
+	Shell func() *ShellInfo
+}
+
+func (i HostInfo) empty() bool {
+	return i.AgentDir == "" && i.ConfigDirName == "" && i.Version == "" && i.PackageDir == "" && i.Shell == nil
+}
+
+// ShellInfo is Pi's ShellConfig, or the error getShellConfig() throws when no shell is found.
+type ShellInfo struct {
+	Shell string `json:"shell,omitempty"`
+	//portlint:allow emptydrop Pi's ShellConfig.args is never empty: every shell Pi resolves carries its command flag
+	Args             []string `json:"args,omitempty"`
+	CommandTransport string   `json:"commandTransport,omitempty"`
+	Error            string   `json:"error,omitempty"`
+}
+
+// SetHostInfo records the configuration facts every extension process starts with.
+func (h *Host) SetHostInfo(info HostInfo) {
+	h.hostInfo = info
+}
+
+// hostInfoEnv is the PIG_EXT_HOST_INFO environment entry every extension process starts with: Pi's getAgentDir(), CONFIG_DIR_NAME, VERSION, getPackageDir() and
+// getShellConfig() are callable while an extension's factory runs, before the host's ready message, so the process needs them at start. An empty HostInfo sends no entry.
+func (h *Host) hostInfoEnv() []string {
+	value, ok := h.hostInfoValue()
+	if !ok {
+		return nil
+	}
+	return []string{hostInfoEnvName + "=" + value}
+}
+
+// hostInfoValue is the PIG_EXT_HOST_INFO value, or false for an empty HostInfo.
+func (h *Host) hostInfoValue() (string, bool) {
+	if h.hostInfo.empty() {
+		return "", false
+	}
+	wire := struct {
+		AgentDir      string     `json:"agentDir"`
+		ConfigDirName string     `json:"configDirName"`
+		PackageDir    string     `json:"packageDir,omitempty"`
+		Shell         *ShellInfo `json:"shell,omitempty"`
+		Version       string     `json:"version"`
+	}{AgentDir: h.hostInfo.AgentDir, ConfigDirName: h.hostInfo.ConfigDirName, PackageDir: h.hostInfo.PackageDir, Version: h.hostInfo.Version}
+	if h.hostInfo.Shell != nil {
+		wire.Shell = h.hostInfo.Shell()
+	}
+	data, err := json.Marshal(wire) //portlint:allow jsonescape PiG-only env entry; every SDK's JSON parser decodes \u003c and \u0026 to the same path text
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
+}
+
+// hostInfoEnvName is the environment variable that carries [HostInfo] to an extension process.
+const hostInfoEnvName = "PIG_EXT_HOST_INFO"
+
 // SetWidthFunc registers a callback that returns the current terminal
 // width. The host uses this to populate the ready payload with the real
 // terminal width (instead of a hardcoded default) and to broadcast
 // width_change notifications to all connected extensions. The host calls fn
-// while holding its lock, so fn must not call back into the Host.
+// while holding its lock, so fn must not call back into the Host. fn runs on
+// host goroutines, so it must read the width without the owner loop; later
+// calls replace it atomically.
 func (h *Host) SetWidthFunc(fn func() int) {
-	h.widthFunc = fn
+	h.widthFunc.Store(&fn)
+}
+
+// terminalWidth is the width widthFunc reports, 0 when none is registered.
+func (h *Host) terminalWidth() int {
+	if fn := h.widthFunc.Load(); fn != nil && *fn != nil {
+		return (*fn)()
+	}
+	return 0
+}
+
+// terminalHeight is the height heightFunc reports, 0 when none is registered.
+func (h *Host) terminalHeight() int {
+	if fn := h.heightFunc.Load(); fn != nil && *fn != nil {
+		return (*fn)()
+	}
+	return 0
 }
 
 // readyGeometry returns the terminal geometry to advertise in a ready payload.
@@ -879,14 +1149,10 @@ func (h *Host) SetWidthFunc(fn func() int) {
 // "not reported yet" and wait for the height_change notification.
 func (h *Host) readyGeometry() (width, height int) {
 	width = 120
-	if h.widthFunc != nil {
-		if w := h.widthFunc(); w > 0 {
-			width = w
-		}
+	if w := h.terminalWidth(); w > 0 {
+		width = w
 	}
-	if h.heightFunc != nil {
-		height = h.heightFunc()
-	}
+	height = h.terminalHeight()
 	return width, height
 }
 
@@ -918,13 +1184,7 @@ func (h *Host) syncGeometry(mes []*managedExt) {
 	h.geometryMu.Lock()
 	defer h.geometryMu.Unlock()
 	h.mu.Lock()
-	var width, height int
-	if h.widthFunc != nil {
-		width = h.widthFunc()
-	}
-	if h.heightFunc != nil {
-		height = h.heightFunc()
-	}
+	width, height := h.terminalWidth(), h.terminalHeight()
 	for _, me := range mes {
 		conn := me.connection()
 		if conn == nil || me.pendingReady != nil || h.exts[me.config.Name] != me {
@@ -972,10 +1232,12 @@ func geometryEnvelope(method, field string, value int) *Envelope {
 }
 
 // SetHeightFunc registers the current terminal height. The host calls fn while
-// holding its lock, so fn must not call back into the Host.
+// holding its lock, so fn must not call back into the Host. fn runs on host
+// goroutines, so it must read the height without the owner loop; later calls
+// replace it atomically.
 // pig additive (D52): expose height to extension SDKs.
 func (h *Host) SetHeightFunc(fn func() int) {
-	h.heightFunc = fn
+	h.heightFunc.Store(&fn)
 }
 
 // NotifyWidth sends a width_change notification to every connected
@@ -1032,13 +1294,26 @@ func (h *Host) notifyGeometry(env *Envelope, changed func(*managedExt) bool) {
 	}
 }
 
-// SetNativeProviderCallback binds connection-owned native provider registrations.
-func (h *Host) SetNativeProviderCallback(register func(context.Context, *extension.NativeProvider) error) {
-	h.onRegisterNativeProvider = register
+// SetNativeProviderCallback binds connection-owned native provider registrations to the registry, drains the ones queued while extensions loaded and returns their owning-path diagnostics. A registration made before this call is queued, as upstream queues it until bindCore.
+func (h *Host) SetNativeProviderCallback(register func(context.Context, *extension.NativeProvider) error) []*extension.ExtensionError {
+	var failures []*extension.ExtensionError
+	h.providerRuntime.BindProviderActions(extension.ProviderActions{RegisterNativeProviderCarrier: register}, func(err *extension.ExtensionError) {
+		failures = append(failures, err)
+	})
+	return failures
 }
 
 // Runtime returns the shared provider registration state for a Runner created from this Host's loaded extensions.
 func (h *Host) Runtime() *extension.ExtensionRuntime { return h.providerRuntime }
+
+// UseRuntime makes the Host register its extensions' provider, MCP server and virtual model state in runtime, so one runtime serves the file
+// extensions this Host loads and the in-process factory extensions that register against the same value (resource-loader.ts passes
+// preTrustExtensions.runtime to loadExtensionPaths). Call it before the first load; a nil runtime keeps the Host's own.
+func (h *Host) UseRuntime(runtime *extension.ExtensionRuntime) {
+	if runtime != nil {
+		h.providerRuntime = runtime
+	}
+}
 
 // SetProviderCallbacks binds the registry, drains pending registrations and returns their owning-path diagnostics. Configure callbacks before dispatching handlers. A Runner can instead bind Runtime through BindCore to deliver these diagnostics to its error listeners.
 func (h *Host) SetProviderCallbacks(register func(name string, config extension.ProviderConfig) error, unregister func(name string)) []*extension.ExtensionError {
@@ -1209,6 +1484,25 @@ func (h *Host) LoadAll(ctx context.Context, configs []ExtConfig) ([]extension.Ex
 			loaded = append(loaded, *ext)
 		}
 	}
+	h.recordLoadOrder(configs, false)
+	started, startErrs := h.startPlannedCells(ctx, cellConfigs)
+	loaded = append(loaded, started...)
+	errs = append(errs, startErrs...)
+	h.mu.Lock()
+	h.loadErrors = h.loadErrors[:0]
+	for _, e := range errs {
+		h.loadErrors = append(h.loadErrors, e.Error())
+	}
+	h.mu.Unlock()
+	h.sortExtensionsByLoadOrder(loaded)
+	return loaded, errs
+}
+
+// startPlannedCells plans configs into cells and starts them as an initial
+// load, isolating a failed packed cell's members as a reload does. It reports
+// each config's discovery and fills its source content hash first.
+func (h *Host) startPlannedCells(ctx context.Context, cellConfigs []ExtConfig) ([]extension.Extension, []error) {
+	var loaded []extension.Extension
 	// Populate ContentHash for source-based extensions so the cell planner
 	// can correctly invalidate packed-cell caches when source files change.
 	// Without this, cell keys depend only on static metadata (name, path,
@@ -1218,17 +1512,10 @@ func (h *Host) LoadAll(ctx context.Context, configs []ExtConfig) ([]extension.Ex
 			continue
 		}
 		h.markExtension(cellConfigs[i].Name, "discover-start")
-		if cellConfigs[i].Source != "" && cellConfigs[i].ContentHash == "" {
-			bt, err := detectBuildType(cellConfigs[i].Source)
-			if err == nil {
-				if hash, err := hashSourceDir(cellConfigs[i].Source, bt); err == nil {
-					cellConfigs[i].ContentHash = hash
-				}
-			}
-		}
+		fillContentHash(&cellConfigs[i])
 		h.markExtension(cellConfigs[i].Name, "discover-done")
 	}
-	h.recordLoadOrder(configs, false)
+	var errs []error
 	cells := h.planCells(cellConfigs)
 	h.planEventBus(ctx, cells)
 	h.stageCellsInOrder(ctx, cells, func(cell CellSpec, outcome stageOutcome, err error) {
@@ -1248,13 +1535,6 @@ func (h *Host) LoadAll(ctx context.Context, configs []ExtConfig) ([]extension.Ex
 			}
 		}
 	})
-	h.mu.Lock()
-	h.loadErrors = h.loadErrors[:0]
-	for _, e := range errs {
-		h.loadErrors = append(h.loadErrors, e.Error())
-	}
-	h.mu.Unlock()
-	h.sortExtensionsByLoadOrder(loaded)
 	return loaded, errs
 }
 
@@ -1323,7 +1603,7 @@ func (h *Host) recordLoadOrder(configs []ExtConfig, replace bool) {
 		if _, ranked := h.loadOrder[config.Name]; !ranked {
 			h.loadOrder[config.Name] = len(h.loadOrder)
 		}
-		if config.SourceInfo != nil {
+		if config.SourceInfo != (extension.SourceInfo{}) {
 			h.configSourceInfo[config.Name] = config.SourceInfo
 		}
 		if config.selectedPath != "" {
@@ -1341,12 +1621,21 @@ func (h *Host) configuredSelectedPath(name string) string {
 
 // extensionSourceInfo returns the SourceInfo configured for me's extension.
 func (h *Host) extensionSourceInfo(me *managedExt) extension.SourceInfo {
-	if me.config.SourceInfo != nil {
+	if me.config.SourceInfo != (extension.SourceInfo{}) {
 		return me.config.SourceInfo
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.configSourceInfo[me.config.Name]
+}
+
+// readySourceInfo is the SourceInfo the ready payload carries for me's extension, nil when the host holds none.
+func (h *Host) readySourceInfo(me *managedExt) *extension.SourceInfo {
+	info := h.extensionSourceInfo(me)
+	if info == (extension.SourceInfo{}) {
+		return nil
+	}
+	return &info
 }
 
 // ExtensionCount returns the number of loaded subprocess extensions.
@@ -1370,7 +1659,7 @@ func (h *Host) Builder() *Builder { return h.builder }
 // BroadcastStateUpdate sends a "state_update" notify to every connected
 // subprocess extension with a freshly-snapshotted [StatePayload]. Call this
 // after host-side transitions that mutate the synchronous getter surface
-// (active tools, thinking level, idle state, system prompt, context usage,
+// (thinking level, idle state, system prompt, context usage,
 // flag values, etc.) so extension caches stay accurate.
 //
 // Safe to call when no extensions are loaded or no UIBridge is wired -
@@ -1406,7 +1695,53 @@ func readableSessionFile(path string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
+// connStatePushCache tracks what one connection's runtime last received
+// in a state_update so pushStateTo can skip identical writes and omit
+// catalog fields the recipient already holds. Guarded by the owning
+// managedExt's entryCursorMu.
+type connStatePushCache struct {
+	// gen is me.runtimeStateGen when the push that built this cache began.
+	gen uint64
+	// lastPayload is the encoded args of the most recent state_update sent.
+	lastPayload []byte
+	// commands and promptOptions are the catalog encodings the
+	// recipient holds; nil means it has not been sent one yet.
+	commands      []byte
+	promptOptions []byte
+	// theme, keybindings and terminalCapabilities are the encodings of the
+	// host's presentation state the recipient holds, and systemPrompt is the
+	// prompt it holds.
+	theme                any
+	keybindings          any
+	terminalCapabilities *TerminalCapabilitiesPayload
+	systemPrompt         string
+	hasSystemPrompt      bool
+}
+
+// pushedState is the state_update body: the snapshot with a systemPrompt that can be omitted. A nil SystemPrompt leaves the key out, while a pointer to an empty prompt still sends it, and the shallower field shadows the snapshot's own.
+type pushedState struct {
+	StatePayload
+	SystemPrompt *string `json:"systemPrompt,omitempty"`
+}
+
+// stateUpdateBody is the args of a state_update notify.
+type stateUpdateBody struct {
+	State *pushedState `json:"state"`
+}
+
+// runtimeStateMutated records that extName's runtime changed its replicated state before the host did, so the next push to it is a full snapshot.
+func (h *Host) runtimeStateMutated(extName string) {
+	h.mu.Lock()
+	me := h.exts[extName]
+	h.mu.Unlock()
+	if me != nil {
+		me.runtimeStateGen.Add(1)
+	}
+}
+
 // pushStateTo sends me's state on conn, one of me's connections.
+//
+//pig:hotpath
 func (h *Host) pushStateTo(ctx context.Context, me *managedExt, conn *Conn) error {
 	if h.uiBridge == nil || me == nil || conn == nil {
 		return nil
@@ -1418,6 +1753,7 @@ func (h *Host) pushStateTo(ctx context.Context, me *managedExt, conn *Conn) erro
 	defer me.entryCursorMu.Unlock()
 
 	for {
+		gen := me.runtimeStateGen.Load()
 		subscribed := h.subscribedToSessionLog(me.config.Name)
 		includeEntries := subscribed && !me.sessionTransferActive
 		state := h.uiBridge.Snapshot(me.flagNames, me.entryCursor, includeEntries)
@@ -1438,19 +1774,86 @@ func (h *Host) pushStateTo(ctx context.Context, me *managedExt, conn *Conn) erro
 			includeEntries = true
 			state = h.uiBridge.Snapshot(me.flagNames, me.entryCursor, includeEntries)
 		}
-		args, err := json.Marshal(map[string]any{"state": state})
+		// Omit catalog and presentation fields the recipient already holds. The
+		// runtime's applyState retains keys a state_update leaves out, so the
+		// lighter payload is unobservable: every omitted field is identical
+		// to the copy the recipient would otherwise keep. A connection without a
+		// cache omits nothing, so its push is the full snapshot.
+		partial := pushedState{StatePayload: *state, SystemPrompt: &state.SystemPrompt}
+		cache := me.lastStatePush[conn]
+		if cache != nil && cache.gen != gen {
+			cache = nil
+		}
+		if cache != nil {
+			if bytes.Equal(state.Commands, cache.commands) {
+				partial.Commands = nil
+			}
+			if bytes.Equal(state.SystemPromptOptions, cache.promptOptions) {
+				partial.SystemPromptOptions = nil
+			}
+			if equalWireValue(state.Theme, cache.theme) {
+				partial.Theme = nil
+			}
+			if equalWireValue(state.Keybindings, cache.keybindings) {
+				partial.Keybindings = nil
+			}
+			if equalWireValue(state.TerminalCapabilities, cache.terminalCapabilities) {
+				partial.TerminalCapabilities = nil
+			}
+			if cache.systemPrompt == state.SystemPrompt && cache.hasSystemPrompt {
+				partial.SystemPrompt = nil
+			}
+		}
+		// lean is the body without every field that can be omitted. A push that
+		// sends none of them is the lean body itself, so the common push encodes
+		// the state once; the lean body is also the comparison baseline of the
+		// next push.
+		sendsHeavy := partial.Commands != nil || partial.SystemPromptOptions != nil || partial.Theme != nil || partial.Keybindings != nil || partial.TerminalCapabilities != nil || partial.SystemPrompt != nil
+		lean := partial
+		lean.Commands, lean.SystemPromptOptions = nil, nil
+		lean.Theme, lean.Keybindings, lean.TerminalCapabilities, lean.SystemPrompt = nil, nil, nil, nil
+		leanBody, err := json.Marshal(stateUpdateBody{State: &lean})
 		if err != nil {
 			return err
+		}
+		if cache != nil && !sendsHeavy && bytes.Equal(cache.lastPayload, leanBody) {
+			// The write would leave the recipient's copy unchanged. Cursor
+			// bookkeeping still applies so a large session log keeps paging.
+			if state.Session == nil || !includeEntries {
+				return nil
+			}
+			me.entryCursor = state.Session.EntryCount
+			if !state.Session.EntriesRemaining {
+				return nil
+			}
+			continue
+		}
+		out := leanBody
+		if sendsHeavy {
+			if out, err = json.Marshal(stateUpdateBody{State: &partial}); err != nil {
+				return err
+			}
 		}
 		if err := conn.sendAndWait(ctx, &Envelope{
 			Type: MsgNotify,
 			Notify: &NotifyPayload{
 				Method: "state_update",
-				Args:   args,
+				Args:   out,
 			},
 		}); err != nil {
 			return err
 		}
+		// An omitted field is identical to the cached copy by construction, so
+		// recording the fresh value keeps the recipient view exact.
+		if me.lastStatePush == nil {
+			me.lastStatePush = make(map[*Conn]*connStatePushCache)
+		}
+		for held := range me.lastStatePush {
+			if held.closed.Load() {
+				delete(me.lastStatePush, held)
+			}
+		}
+		me.lastStatePush[conn] = &connStatePushCache{gen: gen, lastPayload: leanBody, commands: state.Commands, promptOptions: state.SystemPromptOptions, theme: state.Theme, keybindings: state.Keybindings, terminalCapabilities: state.TerminalCapabilities, systemPrompt: state.SystemPrompt, hasSystemPrompt: true}
 		if state.Session == nil || !includeEntries {
 			return nil
 		}
@@ -1496,7 +1899,7 @@ func (h *Host) resolveFlagValue(extName, flagName string, override any) any {
 		if me == nil || me.ext == nil {
 			return nil
 		}
-		if _, registered := me.ext.Flags[flagName]; !registered {
+		if _, registered := me.ext.RegisteredFlag(flagName); !registered {
 			return nil
 		}
 	}
@@ -1580,14 +1983,15 @@ func (h *Host) runtimeCommandsDrained(conn *Conn, lanes *callLanes, report *Enve
 	return report.Notify.Method == notifyRuntimeCommandsDrained
 }
 
-// goDrainTask runs fn as a task Shutdown joins. Once Shutdown waits, nothing is left to act on a drain, so fn does not run.
-func (h *Host) goDrainTask(fn func()) {
+// goDrainTask runs fn as a task Shutdown joins: a drain finish or a crash-restart backoff, and reports whether it started. Once Shutdown waits, nothing is left to act on either, so fn does not run.
+func (h *Host) goDrainTask(fn func()) bool {
 	h.drainTasksMu.Lock()
 	defer h.drainTasksMu.Unlock()
 	if h.drainTasksClosed {
-		return
+		return false
 	}
 	h.drainTasks.Go(fn)
+	return true
 }
 
 // SetRuntimeDrainHandler installs the process-owner callback for a Node event-loop drain after input end. A drain is not handler completion; the callback must not resume pending extension work.
@@ -1980,11 +2384,58 @@ func (h *Host) SetSettleTailHandler(fn func(suspended int)) {
 	h.commandFlightMu.Unlock()
 }
 
+// SetBackgroundCallGate installs the embedder's hold on the UI calls that no request started. Pi runs a timer or I/O callback only when its event loop turns, so a toast an extension deferred with setTimeout(0) while the host runs one chain of awaited handlers (a replacement's session_start, then its command's response) reaches the output after the chain's end, whereas this runtime's timer fires while the host's next dispatch crosses the process boundary. gate returns nil when such a call may run now, or a channel that closes when it may. The gate runs on host goroutines and must not block.
+func (h *Host) SetBackgroundCallGate(gate func() <-chan struct{}) {
+	if gate == nil {
+		h.backgroundGate.Store(nil)
+		return
+	}
+	h.backgroundGate.Store(&gate)
+}
+
 // SetCommandWindowHandler installs the process-owner callback that receives how many in-flight extension commands Pi's process would have left unanswered when it reads stdin's end: those that count suspended, and those of a runtime with no microtask continuation that are still running (FlushCommands applies the same rule to the flights themselves later). A Node command is not counted until its runtime reports its window closed, which it does only after runtime_input_end. The callback runs on host goroutines, must not block, and must not resume or cancel the command.
 func (h *Host) SetCommandWindowHandler(fn func(suspended int)) {
 	h.commandFlightMu.Lock()
 	h.commandWindowHandler = fn
 	h.commandFlightMu.Unlock()
+}
+
+// SetTimerTurns gives the host the owner's model of Pi's event loop (D189). A host call that the runtime marks Timer runs when the loop would run the timer or immediate that made it: while the agent's run chains microtasks it waits (jsloop.Turns). Without it such a call runs on arrival.
+func (h *Host) SetTimerTurns(turns *jsloop.Turns) {
+	if previous := h.timerTurns.Swap(turns); previous != turns && turns != nil {
+		turns.ObserveDefer(h.sendTimerDefer, h.awaitTimerDefer)
+	}
+}
+
+// timerDeferConns returns the connections of every Node runtime of the host.
+func (h *Host) timerDeferConns() []*Conn {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	conns := make([]*Conn, 0, len(h.exts))
+	for _, me := range h.exts {
+		if conn := me.connection(); conn != nil && me.hostsNodeRuntime() {
+			conns = append(conns, conn)
+		}
+	}
+	return conns
+}
+
+// sendTimerDefer tells every Node runtime of the host whether it must hold its timer and immediate callbacks (NotifyTimerDefer). The frames of one host keep the order of the changes, and each precedes the requests the host sends after the change.
+func (h *Host) sendTimerDefer(deferring bool) {
+	for _, conn := range h.timerDeferConns() {
+		args, err := json.Marshal(TimerDeferArgs{On: deferring, Seq: conn.timerDefer.next()})
+		if err != nil {
+			continue
+		}
+		_ = conn.Send(&Envelope{Type: MsgNotify, Notify: &NotifyPayload{Method: NotifyTimerDefer, Args: args}})
+	}
+}
+
+// awaitTimerDefer returns once every Node runtime applied the frames sendTimerDefer sent (NotifyTimerDeferAck), or ended, or ctx ended.
+func (h *Host) awaitTimerDefer(ctx context.Context) {
+	for _, conn := range h.timerDeferConns() {
+		conn.timerDefer.await(ctx, conn.Done())
+	}
 }
 
 // FlushCommands is the stdout-flush checkpoint of an RPC shutdown. Pi's flush follows stdin's end within microtasks and one tick, so a runtime with no microtask continuation has nothing that can still settle: its command still running counts as suspended. A Node runtime reports its own commands as their windows close. A command that settled or answered before the checkpoint responds normally. It does not cancel requests or synthesize responses.
@@ -2000,7 +2451,7 @@ func (h *Host) FlushCommands() {
 	h.notifyCommandSuspended()
 }
 
-// EndInput tells hosted runtimes that no further terminal or RPC input can arrive. This does not cancel requests or synthesize responses.
+// EndInput records that no further terminal or RPC input can arrive and tells each hosted Node runtime with runtime_input_end, which releases its command-suspension and loop-drain reports. The host applies stdin's end to other runtimes' commands itself (FlushCommands). This does not cancel requests or synthesize responses.
 func (h *Host) EndInput() {
 	// pig additive (D19): the subprocess transport is not an upstream event-loop keepalive after stdin ends.
 	h.commandFlightMu.Lock()
@@ -2011,7 +2462,9 @@ func (h *Host) EndInput() {
 	h.mu.Lock()
 	var connections []*Conn
 	for _, me := range h.exts {
-		connections = append(connections, me.connection())
+		if me.nodeRealm {
+			connections = append(connections, me.connection())
+		}
 	}
 	h.mu.Unlock()
 	for _, conn := range connections {
@@ -2021,7 +2474,7 @@ func (h *Host) EndInput() {
 	}
 }
 
-// TerminateProcesses kills hosted processes without running extension callbacks or waiting for their handlers. It is only for a host process that is about to exit; ordinary owners use Shutdown to release all resources.
+// TerminateProcesses kills hosted processes without running extension callbacks or waiting for their handlers, and removes the Host's private socket directory: the host process that calls it is about to exit without Shutdown (RPC mode ends with os.Exit, as Pi's process.exit does), so nothing else would remove the directory. It is only for a host process that is about to exit; ordinary owners use Shutdown to release all resources.
 func (h *Host) TerminateProcesses() {
 	// pig additive (D19): subprocess runtimes must not outlive a forced host exit.
 	h.shuttingDown.Store(true)
@@ -2049,11 +2502,32 @@ func (h *Host) TerminateProcesses() {
 	for process := range processes {
 		_ = process.Kill()
 	}
+	h.removeSockRuntimeDir()
 }
 
-// Shutdown detaches all extension consumers before removing providers, then stops and reaps every managed process. Session owners emit and await session_shutdown before calling it.
+// errSockRuntimeRemoved is what a Host asks for a socket path after TerminateProcesses removed its directory.
+var errSockRuntimeRemoved = errors.New("the Host's socket directory was removed by TerminateProcesses")
+
+// removeSockRuntimeDir removes the Host's private socket directory and keeps the Host from making one afterwards: it is the transition to the removed state, under the lock every allocation takes. Calling it again does nothing more.
+func (h *Host) removeSockRuntimeDir() {
+	h.sockMu.Lock()
+	defer h.sockMu.Unlock()
+	h.sockRemoved = true
+	if h.sockRuntimeDir != "" {
+		_ = os.RemoveAll(h.sockRuntimeDir)
+	}
+}
+
+// Shutdown detaches all extension consumers before removing providers, then stops and reaps every managed process. When it returns, each extension it stopped has withdrawn its ownership of thinking runs and told the observers (D214). Session owners emit and await session_shutdown before calling it.
 func (h *Host) Shutdown(reason string) {
 	h.shuttingDown.Store(true)
+	h.mu.Lock()
+	stopMcpServersObserver := h.stopMcpServersObserver
+	h.stopMcpServersObserver = nil
+	h.mu.Unlock()
+	if stopMcpServersObserver != nil {
+		stopMcpServersObserver()
+	}
 	h.runSignals.release()
 	if h.recoveryCancel != nil {
 		h.recoveryCancel()
@@ -2092,10 +2566,22 @@ func (h *Host) Shutdown(reason string) {
 		process.stopAndReap()
 	}
 	h.transitionMu.Unlock()
+	// pig additive (D214): each stopped connection's read loop schedules the drop of its extension's ownership of thinking runs once it has seen the connection end. Wait for that, or the loop could reach it after the drain tasks closed, and the drop would run after Shutdown returned.
+	for _, me := range exts {
+		if conn := me.connection(); conn != nil {
+			conn.awaitIncomingEnded()
+		}
+	}
 	h.drainTasksMu.Lock()
 	h.drainTasksClosed = true
 	h.drainTasksMu.Unlock()
 	h.drainTasks.Wait()
+	// A child session outlives the extension's dispose of it, and the objects it was created over outlive the extension's handles. Pi's child AgentSession runs in the host's own process and ends with it; here its extension host is a process of its own, so Shutdown closes the sessions and releases the objects, and no process they started outlives it.
+	h.childSessions.closeAll()
+	h.sessionGraphObjects.closeAll()
+	if h.uiBridge != nil {
+		h.uiBridge.StopFrontendPushes()
+	}
 	for _, process := range watched {
 		// A process parked for the replacement Host keeps running past this Host; its watcher ends with it.
 		if process.watcherDone != nil && process.processReleased() {
@@ -2103,9 +2589,7 @@ func (h *Host) Shutdown(reason string) {
 		}
 	}
 
-	if h.sockRuntimeDir != "" {
-		_ = os.RemoveAll(h.sockRuntimeDir)
-	}
+	h.removeSockRuntimeDir()
 }
 
 // ensureSockRuntimeDir lazily creates this Host's private socket directory under
@@ -2114,48 +2598,62 @@ func (h *Host) Shutdown(reason string) {
 // (secureSocketRuntimeBase). os.MkdirTemp guarantees a unique name even across concurrent Hosts, so no two instances
 // share a socket path.
 func (h *Host) ensureSockRuntimeDir() (string, error) {
-	h.sockRuntimeOnce.Do(func() {
-		base := socketRuntimeBase(runtime.GOOS, h.socketDir, currentUserID(), os.Getenv("LOCALAPPDATA"))
-		if err := os.MkdirAll(base, 0o700); err != nil {
-			h.sockRuntimeErr = err
-			return
-		}
-		if err := secureSocketRuntimeBase(base); err != nil {
-			h.sockRuntimeErr = err
-			return
-		}
-		h.sockRuntimeDir, h.sockRuntimeErr = os.MkdirTemp(base, socketRuntimeDirPrefix+"*")
-	})
+	h.sockMu.Lock()
+	defer h.sockMu.Unlock()
+	return h.ensureSockRuntimeDirLocked()
+}
+
+// ensureSockRuntimeDirLocked is ensureSockRuntimeDir for a caller that holds sockMu. A directory that could not be made stays refused with the error it failed with; a removed one is refused with errSockRuntimeRemoved.
+func (h *Host) ensureSockRuntimeDirLocked() (string, error) {
+	if h.sockRemoved {
+		return "", errSockRuntimeRemoved
+	}
+	if h.sockRuntimeDir != "" || h.sockRuntimeErr != nil {
+		return h.sockRuntimeDir, h.sockRuntimeErr
+	}
+	base := socketRuntimeBase(runtime.GOOS, h.socketDir, currentUserID(), os.Getenv("LOCALAPPDATA"))
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		h.sockRuntimeErr = err
+		return "", err
+	}
+	if err := secureSocketRuntimeBase(base); err != nil {
+		h.sockRuntimeErr = err
+		return "", err
+	}
+	h.sockRuntimeDir, h.sockRuntimeErr = os.MkdirTemp(base, socketRuntimeDirPrefix+"*")
 	return h.sockRuntimeDir, h.sockRuntimeErr
 }
 
-// sockPathFor returns this Host's socket path for the named extension. Names are
-// short and stable per Host (e-0.sock, e-1.sock, ...) rather than derived from
-// the extension name: the runtime directory is private, so a counter is unique,
-// and a short leaf keeps the full path well under the platform sun_path limit
-// (104 bytes on macOS) that a long extension name plus a deep $TMPDIR could
-// otherwise exceed. The mapping is stable across reloads so a reload rebinds the
-// same path.
-func (h *Host) sockPathFor(name string) (string, error) {
-	dir, err := h.ensureSockRuntimeDir()
+// newSocketPath returns a socket path that no other generation of this Host holds, on every call: the next count in this
+// Host's private runtime directory (socketLeaf). Each generation of an extension listens on its own path from its start
+// to its stop, and its stop removes that file and no other. A generation that a running command keeps alive after the
+// reload that replaced it (retireGeneration) therefore cannot remove the socket of the generation the next reload
+// staged. The runtime directory is made fresh for this Host (os.MkdirTemp), so no path was ever bound before it, and a
+// count that starts again in the next process starts in a directory of its own. The leaf is short and not derived from
+// the extension name: a short leaf keeps the full path under the platform sun_path limit (104 bytes on macOS) that a
+// long extension name plus a deep $TMPDIR could otherwise exceed; worstRuntimeSocketSuffix budgets its longest form.
+//
+// The directory's state is held from the check to the return, so a path is returned only while its directory exists, or the call refuses (errSockRuntimeRemoved after the Host ended). Every caller treats the refusal as the end of its own work, never as a reason to ask again: a load or reload that began after shutdown fails with socket_dir_failed, a restart of a crashed extension fails the same way and stays down, and the park of a process for the replacement Host lets that process end with this Host.
+func (h *Host) newSocketPath() (string, error) {
+	h.sockMu.Lock()
+	defer h.sockMu.Unlock()
+	dir, err := h.ensureSockRuntimeDirLocked()
 	if err != nil {
 		return "", err
 	}
-	h.sockMu.Lock()
-	defer h.sockMu.Unlock()
-	if h.sockNames == nil {
-		h.sockNames = make(map[string]string)
+	for {
+		last := h.sockSeq.Load()
+		if last == lastSocketCount {
+			return "", fmt.Errorf("this Host has made all %d of its socket paths", uint64(lastSocketCount))
+		}
+		if h.sockSeq.CompareAndSwap(last, last+1) {
+			path := filepath.Join(dir, socketLeaf(last+1))
+			if err := validateUnixSocketPath(runtime.GOOS, path); err != nil {
+				return "", err
+			}
+			return path, nil
+		}
 	}
-	leaf, ok := h.sockNames[name]
-	if !ok {
-		leaf = fmt.Sprintf("e-%d.sock", len(h.sockNames))
-		h.sockNames[name] = leaf
-	}
-	path := filepath.Join(dir, leaf)
-	if err := validateUnixSocketPath(runtime.GOOS, path); err != nil {
-		return "", err
-	}
-	return path, nil
 }
 
 // IsShuttingDown returns true after Shutdown has been called.
@@ -2200,6 +2698,16 @@ func (me *managedExt) reap() {
 		<-exited
 	}
 	me.stderrLog.remove()
+}
+
+// processFileMutations is the file mutation queue registry the connections of me's process share: the process of a packed Go, Rust or Python cell, which several
+// extensions run in and whose helpers take and give back a turn over whichever extension's connection is running. Nil for an extension that has its process, or
+// whose runtime (Node) asks over its own connection, so its tickets stay with that connection.
+func (me *managedExt) processFileMutations() *fileMutationTurns {
+	if me.packedProcess == nil || me.packedProcess.share == nil || me.packedProcess.share.node {
+		return nil
+	}
+	return &me.packedProcess.share.turns
 }
 
 // releaseShare gives back the reference me holds on its process, once per process. The process ends with its last reference.
@@ -2315,6 +2823,7 @@ func (h *Host) Reload(ctx context.Context) ([]extension.Extension, error) {
 	ctx = context.WithValue(ctx, reloadingKey{}, reloadPasses.Add(1))
 	h.transitionMu.Lock()
 	defer h.transitionMu.Unlock()
+	h.notifyReloadStarted()
 	reloadStart := time.Now()
 	rep := &ReloadReport{StartedAt: reloadStart}
 	defer func() {
@@ -2334,6 +2843,14 @@ func (h *Host) Reload(ctx context.Context) ([]extension.Extension, error) {
 		rep.Error = err.Error()
 		return nil, fmt.Errorf("reload config: %w", err)
 	}
+	// pig additive (D18): a Piglet Binary's Node cells reload from their
+	// extracted sources the way Stock PiG reloads the same extensions.
+	h.mu.Lock()
+	allEmbedded := cloneEmbeddedCells(h.embeddedCells)
+	h.mu.Unlock()
+	nodeConfigs, embeddedCells := embeddedNodeConfigs(allEmbedded)
+	loaderConfigs := len(cfgs)
+	cfgs = append(cfgs, nodeConfigs...)
 	// Only once config loading has actually succeeded (CNC-003): invalidate
 	// every currently-known packed process's generation (CNC-002; see
 	// armPackedProcessGenerations), then give a crashed packed cell (from an
@@ -2365,7 +2882,6 @@ func (h *Host) Reload(ctx context.Context) ([]extension.Extension, error) {
 	h.mu.Lock()
 	oldByName := make(map[string]*managedExt, len(h.exts))
 	maps.Copy(oldByName, h.exts)
-	embeddedCells := cloneEmbeddedCells(h.embeddedCells)
 	h.mu.Unlock()
 	for _, cfg := range embeddedCellConfigs(embeddedCells) {
 		newByName[cfg.Name] = cfg
@@ -2396,17 +2912,10 @@ func (h *Host) Reload(ctx context.Context) ([]extension.Extension, error) {
 
 	// Populate ContentHash for source-based extensions (see LoadAll).
 	for i := range cfgs {
-		if cfgs[i].Source != "" && cfgs[i].ContentHash == "" {
-			bt, err := detectBuildType(cfgs[i].Source)
-			if err == nil {
-				if hash, err := hashSourceDir(cfgs[i].Source, bt); err == nil {
-					cfgs[i].ContentHash = hash
-				}
-			}
-		}
+		fillContentHash(&cfgs[i])
 	}
 
-	loadOrder := append(slices.Clone(cfgs), embeddedCellConfigs(embeddedCells)...)
+	loadOrder := append(slices.Clone(cfgs[:loaderConfigs]), embeddedLoadOrder(allEmbedded, cfgs[loaderConfigs:])...)
 	h.recordLoadOrder(loadOrder, true)
 	cellConfigs := make([]ExtConfig, 0, len(cfgs))
 	for _, cfg := range cfgs {
@@ -2559,7 +3068,17 @@ func (h *Host) commitStaged(staged []stagedManagedExt, removed []*managedExt, re
 
 // startExt spawns the binary, creates the socket listener, waits for connect,
 // performs the register handshake, and builds the extension.Extension struct.
-func (h *Host) startExt(ctx context.Context, me *managedExt, isRestart bool) (_ *extension.Extension, err error) {
+func (h *Host) startExt(ctx context.Context, me *managedExt, isRestart bool) (*extension.Extension, error) {
+	ext, err := h.startExtOnce(ctx, me, isRestart)
+	// pig additive (D19): a TypeScript extension that failed to start on a slot runtime starts again on the next runtime, ending on Node.
+	for h.retryOnNextRuntime(ctx, me.config.Name, err) {
+		ext, err = h.startExtOnce(ctx, me, isRestart)
+	}
+	h.rememberNodeOnly(me.config.Name, err)
+	return ext, err
+}
+
+func (h *Host) startExtOnce(ctx context.Context, me *managedExt, isRestart bool) (_ *extension.Extension, err error) {
 	me.stderrLog, me.stderrLogPath = nil, ""
 	me.setProcessHandle(nil, nil, nil, nil)
 	retainedFrom := me.retainedFrom
@@ -2627,7 +3146,14 @@ func (h *Host) ensureNodeRuntime(ctx context.Context) error {
 // socket, spawns the binary, and accepts the connection.
 func (h *Host) connectExt(ctx, extCtx context.Context, cancel context.CancelFunc, me *managedExt) (net.Conn, error) {
 	if me.inProcServe != nil {
-		hostConn, extConn := net.Pipe()
+		// A fused extension's factory runs in this process, so this process's environment is the extension process's: it gets
+		// PIG_EXT_HOST_INFO as a spawned extension process does, before the factory runs. Later children of this process inherit the entry.
+		if value, ok := h.hostInfoValue(); ok {
+			if err := os.Setenv(hostInfoEnvName, value); err != nil {
+				return nil, newLoadError(me.config.Name, "spawn", "host_info_failed", err)
+			}
+		}
+		hostConn, extConn := newFusedConn()
 		serve := me.inProcServe
 		go func() {
 			if err := serve(extConn); err != nil && extCtx.Err() == nil {
@@ -2648,8 +3174,16 @@ func (h *Host) connectExt(ctx, extCtx context.Context, cancel context.CancelFunc
 		binPath = filepath.Join(h.socketDir, "..", "extensions", binPath)
 	}
 	me.nodeRuntime = usesNodeRuntime(binPath, me.config.RuntimeLanguage)
+	tsSelection, tsSet := nodeSelection, tsruntime.Set{}
 	if me.nodeRuntime {
-		if err := h.ensureNodeRuntime(extCtx); err != nil {
+		var err error
+		if set, ok := nodeLauncherSet(binPath, me.config.Name); ok {
+			tsSet = set
+			tsSelection, err = h.selectTypeScriptRuntime(extCtx, me.config.Name, set)
+		} else {
+			err = h.ensureNodeRuntime(extCtx)
+		}
+		if err != nil {
 			cancel()
 			return nil, newLoadError(me.config.Name, "spawn", "node_runtime_unsupported", err)
 		}
@@ -2657,14 +3191,10 @@ func (h *Host) connectExt(ctx, extCtx context.Context, cancel context.CancelFunc
 
 	// Create the socket path inside this Host's private runtime directory, so a
 	// parallel Pig instance running the same extension cannot collide on it.
-	sockPath, err := h.sockPathFor(me.config.Name)
+	sockPath, err := h.newSocketPath()
 	if err != nil {
 		return nil, newLoadError(me.config.Name, "spawn", "socket_dir_failed", fmt.Errorf("create socket dir: %w", err))
 	}
-
-	// Clean up a stale socket from a prior load of this same Host (private dir,
-	// so this only ever removes our own file, never a peer's live socket).
-	_ = os.Remove(sockPath)
 
 	me.sockPath = sockPath
 
@@ -2690,12 +3220,21 @@ func (h *Host) connectExt(ctx, extCtx context.Context, cancel context.CancelFunc
 		cancel()
 		return nil, newLoadError(me.config.Name, "spawn", "socket_dir_failed", fmt.Errorf("write harness arguments: %w", err))
 	}
-	var cmd = buildExtCommand(extCtx, binPath, me.config.RuntimeLanguage)
+	cmd, err := h.lispCommand(ctx, extCtx, me.config.RuntimeLanguage, binPath)
+	if err != nil {
+		cancel()
+		return nil, newLoadError(me.config.Name, "spawn", "build_failed", err)
+	}
+	if cmd == nil {
+		cmd = buildExtCommandSelected(extCtx, binPath, me.config.RuntimeLanguage, runtime.GOOS, exec.LookPath, tsSelection)
+	}
 	nodeOutput := usesNodeRuntime(binPath, me.config.RuntimeLanguage)
 	cmd.Env = append(append(os.Environ(), harnessEnv...),
 		fmt.Sprintf("PIG_EXT_SOCKET=%s", address),
 		fmt.Sprintf("PIG_EXT_NAME=%s", me.config.Name),
 	)
+	cmd.Env = append(cmd.Env, h.hostInfoEnv()...)
+	cmd.Env = append(cmd.Env, typeScriptRuntimeEnv(tsSelection, tsSet)...)
 	if nodeOutput {
 		me.nodeRealm = true
 		busRouted := h.busRoutedForSpawn()
@@ -2706,10 +3245,12 @@ func (h *Host) connectExt(ctx, extCtx context.Context, cancel context.CancelFunc
 		cmd.Env = h.withNodeRuntimeEnv(cmd.Env)
 	}
 	if me.config.RuntimeLanguage == "python" || strings.HasSuffix(binPath, ".py") {
-		pythonSDK := filepath.Join(h.builder.configRoot, "state", "pigsdk", "sdk-py")
-		pythonPath := prependUniquePath(pythonSDK, os.Getenv("PYTHONPATH"))
-		cmd.Env = slices.DeleteFunc(cmd.Env, func(value string) bool { return envHasKey(value, "PYTHONPATH") })
-		cmd.Env = append(cmd.Env, "PYTHONPATH="+pythonPath)
+		// A binary that embeds no Python SDK stages none, so there is nothing to put first.
+		if pythonSDK, err := pigsdklock.StagedSDKDir(h.builder.configRoot, "python"); err == nil {
+			pythonPath := prependUniquePath(pythonSDK, os.Getenv("PYTHONPATH"))
+			cmd.Env = slices.DeleteFunc(cmd.Env, func(value string) bool { return envHasKey(value, "PYTHONPATH") })
+			cmd.Env = append(cmd.Env, "PYTHONPATH="+pythonPath)
+		}
 	}
 	cmd.Dir = h.cwd
 	cmd.Stdout = nil // Extensions shouldn't write to stdout
@@ -2740,17 +3281,19 @@ func (h *Host) connectExt(ctx, extCtx context.Context, cancel context.CancelFunc
 	}
 	// pig divergence (D56): retain stderr only when a subprocess failure diagnostic references it.
 	stderrFile, _ := os.CreateTemp("", fmt.Sprintf("pig-ext-%s-*.log", fileNameComponent(me.config.Name)))
+	var stderrSink io.Writer
 	if stderrFile != nil {
 		me.stderrLogPath = stderrFile.Name()
 		me.stderrLog = &processStderrLog{path: stderrFile.Name(), writer: stderrFile}
-		cmd.Stderr = stderrFile
+		cmd.Stderr = me.stderrLog
+		stderrSink = me.stderrLog
 	}
 	if nodeOutput {
-		cmd.Stdout, cmd.Stderr = h.nodeExtensionOutput(stderrFile)
+		cmd.Stdout, cmd.Stderr = h.nodeExtensionOutput(stderrSink)
 	}
 	processTree, err := startProcessTree(cmd)
-	if stderrFile != nil && (!nodeOutput || err != nil) {
-		// Direct child handles are inherited; Node's host-side copy owns its writer until Cmd.Wait drains it.
+	if err != nil {
+		// No Cmd.Wait runs to close the writer the host-side copy owns.
 		me.stderrLog.closeWriter()
 	}
 	if err != nil {
@@ -2795,6 +3338,7 @@ func (h *Host) connectExt(ctx, extCtx context.Context, cancel context.CancelFunc
 			}
 		})
 		me.share.node = true
+		me.share.tier = tierOf(tsSelection)
 		h.retention().register(me.share)
 	}
 
@@ -2828,29 +3372,19 @@ func (me *managedExt) exitErr() error {
 // acceptExtConn waits for the extension to connect. Upstream awaits the extension factory
 // with no deadline, and a Node factory runs before its runtime connects, so
 // the wait ends only when the extension connects, its process exits, or the
-// caller cancels.
+// caller cancels. A connection the process made before it exited is honored
+// first (awaitConnection), so a factory error the process reported before exiting is
+// the load error.
 func (h *Host) acceptExtConn(ctx context.Context, cancel context.CancelFunc, me *managedExt, listener net.Listener) (net.Conn, error) {
-	connCh := make(chan net.Conn, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		c, err := listener.Accept()
-		if err != nil {
-			errCh <- err
-			return
-		}
-		connCh <- c
-	}()
-
-	var rawConn net.Conn
-	select {
-	case rawConn = <-connCh:
-	case err := <-errCh:
+	rawConn, outcome, err := h.awaitConnection(ctx, listener, me.exited())
+	switch outcome {
+	case acceptFailed:
 		cancel()
 		loadErr := newLoadError(me.config.Name, "connect", "accept_failed", fmt.Errorf("accept: %w", err))
 		loadErr.StderrLog = me.stderrLogPath
 		loadErr.Hint = standaloneRebuildHint(me.config)
 		return nil, loadErr
-	case <-me.exited():
+	case acceptProcessExited:
 		cancel()
 		exitErr := errors.New("extension process exited before connecting")
 		if err := me.exitErr(); err != nil {
@@ -2865,22 +3399,12 @@ func (h *Host) acceptExtConn(ctx context.Context, cancel context.CancelFunc, me 
 		loadErr.StderrLog = me.stderrLogPath
 		loadErr.Hint = standaloneRebuildHint(me.config)
 		return nil, loadErr
-	case <-ctx.Done():
-		// Close listener to unblock the Accept goroutine, then drain
-		// the channel to close any late-arriving connection.
-		_ = listener.Close()
-		select {
-		case c := <-connCh:
-			_ = c.Close()
-		case <-errCh:
-			// Accept failed (expected from listener.Close): fine.
-		}
+	case acceptCancelled:
 		cancel()
-		loadErr := newLoadError(me.config.Name, "connect", "load_cancelled", fmt.Errorf("extension load cancelled before it connected: %w", ctx.Err()))
+		loadErr := newLoadError(me.config.Name, "connect", "load_cancelled", fmt.Errorf("extension load cancelled before it connected: %w", err))
 		loadErr.StderrLog = me.stderrLogPath
 		return nil, loadErr
 	}
-
 	return rawConn, nil
 }
 
@@ -2890,6 +3414,8 @@ func (h *Host) acceptExtConn(ctx context.Context, cancel context.CancelFunc, me 
 func (h *Host) adoptConn(ctx context.Context, me *managedExt, rawConn net.Conn, extCtx context.Context, cancel context.CancelFunc, isRestart bool) (*extension.Extension, error) {
 	// Wrap in managed connection.
 	conn := NewConn(me.config.Name, rawConn)
+	// The process's exit ends the connection's read when the socket does not (peer_exit.go); the share's exit channel for a process other extensions share.
+	conn.watchPeerExit(me.exited())
 	h.observeXref(conn)
 	// Adopt before Start so this connection's own close finds it as me's current connection.
 	h.mu.Lock()
@@ -2909,7 +3435,13 @@ func (h *Host) adoptConn(ctx context.Context, me *managedExt, rawConn net.Conn, 
 		if factoryErr, ok := errors.AsType[*FactoryLoadError](err); ok {
 			return nil, me.factoryLoadError(factoryErr)
 		}
-		loadErr := newLoadError(me.config.Name, "register", "register_failed", fmt.Errorf("register handshake: %w", err))
+		regErr := fmt.Errorf("register handshake: %w", err)
+		// A Go, Rust or Python extension that fails to load sends no error over the wire, so lead with the cause its process wrote to stderr, as the packed path does.
+		awaitStderrDrained(ctx, me.exited())
+		if cause := stderrCause(me.stderrLogPath, me.config.Name); cause != "" {
+			regErr = fmt.Errorf("%s (%w)", cause, regErr)
+		}
+		loadErr := newLoadError(me.config.Name, "register", "register_failed", regErr)
 		loadErr.StderrLog = me.stderrLogPath
 		loadErr.Hint = standaloneRebuildHint(me.config)
 		if loadErr.Hint == "" {
@@ -2921,16 +3453,14 @@ func (h *Host) adoptConn(ctx context.Context, me *managedExt, rawConn net.Conn, 
 	if !me.config.acceptsRegisteredName(reg.Name) {
 		_ = conn.Close("name mismatch")
 		cancel()
-		loadErr := newLoadError(me.config.Name, "register", "name_mismatch", fmt.Errorf(
-			"selected identity %q does not match registered identity %q for source %s; a direct directory must be renamed/reselected under %q, or selected through a Package/Piglet declaration with that exact member identity",
-			me.config.Name, reg.Name, extConfigOrigin(me.config), reg.Name,
-		))
+		loadErr := registeredIdentityMismatch(me.config, reg.Name)
 		loadErr.StderrLog = me.stderrLogPath
 		return nil, loadErr
 	}
 
 	me.flagNames = make([]string, 0, len(reg.Flags))
 	me.wantsSessionLog = reg.WantsSessionLog
+	me.wantsModelRegistry = reg.WantsModelRegistry
 	for _, f := range reg.Flags {
 		me.flagNames = append(me.flagNames, f.Name)
 	}
@@ -2948,8 +3478,9 @@ func (h *Host) adoptConn(ctx context.Context, me *managedExt, rawConn net.Conn, 
 
 	// Send ready. sendReady fills the geometry.
 	readyPayload := &ReadyPayload{
-		Cwd:  h.cwd,
-		Mode: h.mode,
+		Cwd:        h.cwd,
+		Mode:       h.mode,
+		SourceInfo: h.readySourceInfo(me),
 	}
 	if h.uiBridge != nil {
 		flagNames := make([]string, 0, len(reg.Flags))
@@ -2963,7 +3494,9 @@ func (h *Host) adoptConn(ctx context.Context, me *managedExt, rawConn net.Conn, 
 		me.entryCursorMu.Lock()
 		me.entryCursor = 0
 		readyPayload.State = h.uiBridge.Snapshot(flagNames, 0, false)
-		readyPayload.Models = h.uiBridge.ModelCatalog()
+		if reg.WantsModelRegistry {
+			readyPayload.Models = h.uiBridge.ModelCatalog()
+		}
 		if reg.WantsSessionLog && readyPayload.State.Session != nil && !readableSessionFile(readyPayload.State.Session.SessionFile) {
 			h.mu.Lock()
 			if h.sessionLogSubs == nil {
@@ -2997,13 +3530,13 @@ func (h *Host) adoptConn(ctx context.Context, me *managedExt, rawConn net.Conn, 
 	}
 
 	// Reverse provider callbacks may call the host while registering.
-	go h.handleIncoming(me, conn)
+	h.goHandleIncoming(me, conn)
 	// On a crash restart the providers are already registered and their
 	// handlers resolve the current connection at call time, so re-registering would duplicate
 	// them. Same binary → same providers, so skip.
 	for _, provider := range reg.Providers {
 		if provider.Native != nil {
-			if err := h.registerNativeProvider(ctx, me, conn, provider.Native); err != nil {
+			if err := h.registerNativeProvider(ctx, me, conn, provider.Native, !isRestart); err != nil {
 				return nil, err
 			}
 		}
@@ -3021,24 +3554,7 @@ func (h *Host) adoptConn(ctx context.Context, me *managedExt, rawConn net.Conn, 
 				loadErr.StderrLog = me.stderrLogPath
 				return nil, loadErr
 			}
-			// Model-provider registration and OAuth registration are
-			// independent concerns: an extension may contribute an OAuth login
-			// with no model-provider callback wired on the host, so gate only
-			// the model-provider hook, never the OAuth registration.
-			h.attachProviderOperations(me, provider, &cfg)
-			if err := h.providerRuntime.RegisterProvider(provider.Name, cfg, extConfigOrigin(me.config)); err != nil {
-				_ = conn.Close("provider registration failed")
-				cancel()
-				return nil, err
-			}
-			if h.uiBridge != nil {
-				h.uiBridge.RecordProviderRegistration(provider.Name, provider.Config)
-			}
-			h.mu.Lock()
-			notifySuperseded := h.transferProviderOwnershipLocked(me, conn, provider.Name)
-			h.mu.Unlock()
-			notifySuperseded()
-			if err := h.registerOAuthProvider(me, provider.Name, provider.Config); err != nil {
+			if err := h.queueLoadedProvider(me, conn, provider, cfg); err != nil {
 				_ = conn.Close("provider registration failed")
 				cancel()
 				loadErr := newLoadError(me.config.Name, "register", "provider_config_invalid", err)
@@ -3062,21 +3578,23 @@ func (h *Host) adoptConn(ctx context.Context, me *managedExt, rawConn net.Conn, 
 		me.releaseLiveness = conn.holdLiveness()
 	}
 	if h.uiBridge != nil {
-		h.uiBridge.RegisterExtConn(me.config.Name, conn)
+		h.uiBridge.RegisterExtConn(me.config.Name, conn, reg.WantsModelRegistry)
 	}
 
-	// Build extension.Extension from the register payload. A restarted
-	// extension keeps the Extension its runner already holds: its handlers
-	// become exactly the new registration, so subscriptions the new process
-	// makes reach dispatch and ones the old process made do not.
 	ext := h.buildExtension(me, reg)
 	me.resetToolRenderers(reg.ToolRenderers)
+	// A restarted extension is already in h.exts, where Extensions and the flag readers copy *me.ext under Host.mu, so adoption (which rewrites the held Extension's registries) and publication hold it too.
+	h.mu.Lock()
 	if isRestart && me.ext != nil {
-		me.ext.ReplaceEventHandlers(ext)
-		me.ext.ReplaceRegisteredTools(ext)
-		ext = me.ext
+		ext = adoptRestartedExtension(me.ext, ext)
 	}
 	me.ext = ext
+	early := me.earlyOwnsThinkingRuns
+	me.earlyOwnsThinkingRuns = nil
+	h.mu.Unlock()
+	if early != nil {
+		ext.SetOwnsThinkingRuns(*early) // pig additive (D214): a call that arrived before the registration was applied
+	}
 	me.supervisor.RecordSuccess()
 
 	return ext, nil
@@ -3096,6 +3614,10 @@ func (h *Host) waitForRegister(ctx context.Context, me *managedExt, conn *Conn) 
 					return nil, fmt.Errorf("connection closed before register: %w", failure)
 				}
 				return nil, errors.New("connection closed before register")
+			}
+			if env.barrier != nil {
+				env.barrier.release()
+				continue
 			}
 			if env.Type == MsgRegister && env.Register != nil {
 				return env.Register, nil
@@ -3201,9 +3723,6 @@ func validateRegisterPayload(expectedName string, reg *RegisterPayload) error {
 		return err
 	}
 	for _, tool := range reg.Tools {
-		if len(tool.ValidationParameters) > 0 && !json.Valid(tool.ValidationParameters) {
-			return fmt.Errorf("tool %q has invalid validation_parameters JSON", tool.Name)
-		}
 		if len(tool.ConstrainedSampling) > 0 && !json.Valid(tool.ConstrainedSampling) {
 			return fmt.Errorf("tool %q has invalid constrained_sampling JSON", tool.Name)
 		}
@@ -3243,7 +3762,7 @@ func lastRegistrationWins[T any](kind string, values []T, nameOf func(T) string)
 	index := make(map[string]int, len(values))
 	out := values[:0:0]
 	for _, value := range values {
-		name := strings.TrimSpace(nameOf(value))
+		name := nameOf(value)
 		if name == "" {
 			return nil, fmt.Errorf("%s name is required", kind)
 		}
@@ -3255,6 +3774,15 @@ func lastRegistrationWins[T any](kind string, values []T, nameOf func(T) string)
 		out = append(out, value)
 	}
 	return out, nil
+}
+
+// adoptRestartedExtension keeps the Extension a runner already holds for a restarted extension. Its handlers, tools, commands, flags, shortcuts and message and entry renderers become exactly the new registration, so what the new process registers reaches dispatch and what only the old process registered does not. An isolated restart and a packed cell's recovery adopt the same way.
+func adoptRestartedExtension(previous, built *extension.Extension) *extension.Extension {
+	previous.ReplaceEventHandlers(built)
+	previous.ReplaceRegisteredTools(built)
+	previous.ReplaceDeclarations(built)
+	previous.SetOwnsThinkingRuns(built.OwnsThinkingRuns()) // pig additive (D214): the new process's own value, not the old one's
+	return previous
 }
 
 // buildExtension translates a RegisterPayload into an extension.Extension struct
@@ -3284,38 +3812,41 @@ func (h *Host) buildExtension(me *managedExt, reg *RegisterPayload) *extension.E
 			source = me.config.Name // default: extension name (matches upstream sourceInfo stamping)
 		}
 		definition := extension.ToolDefinition{
-			Name:                 tool.Name,
-			Label:                tool.Label,
-			Description:          tool.Description,
-			Parameters:           tool.Parameters,
-			ValidationParameters: tool.ValidationParameters,
-			ConstrainedSampling:  tool.ConstrainedSampling,
-			PromptSnippet:        tool.PromptSnippet,
-			PromptGuidelines:     tool.PromptGuidelines,
-			ExecutionMode:        extension.ToolExecutionMode(tool.ExecutionMode),
-			RenderShell:          extension.ToolRenderShell(tool.RenderShell),
-			Execute:              h.makeToolExecuteFunc(me, tool.Name),
-			BuiltInRenderers:     tool.BuiltInRenderers,
-			OutputSchema:         tool.OutputSchema,
-			Exposure:             extension.ToolExposure(tool.Exposure),
-			Namespace:            tool.Namespace,
-			Annotations:          tool.Annotations,
-			DefaultActive:        tool.DefaultActive,
+			Name:                tool.Name,
+			Label:               tool.Label,
+			Description:         tool.Description,
+			Parameters:          tool.Parameters,
+			ConstrainedSampling: tool.ConstrainedSampling,
+			PromptSnippet:       tool.PromptSnippet,
+			PromptGuidelines:    tool.PromptGuidelines,
+			ExecutionMode:       extension.ToolExecutionMode(tool.ExecutionMode),
+			RenderShell:         extension.ToolRenderShell(tool.RenderShell),
+			Execute:             h.makeToolExecuteFunc(me, tool.Name),
+			BuiltInRenderers:    tool.BuiltInRenderers,
+			OutputSchema:        tool.OutputSchema,
+			Exposure:            extension.ToolExposure(tool.Exposure),
+			Namespace:           tool.Namespace,
+			Annotations:         tool.Annotations,
+			DefaultActive:       tool.DefaultActive,
 		}
 		if tool.PreparesLoadout {
 			definition.PrepareLoadout = h.makeToolPrepareLoadout(me, tool.Name)
+		}
+		if tool.ReachesTools {
+			definition.ReachesTools = h.makeToolReachesTools(me, tool.Name)
 		}
 		if tool.PreparesArguments {
 			definition.PrepareArguments = h.makeToolPrepareArguments(me, tool.Name)
 		}
 		definition.ReserveCallOrder = toolCallOrder(me)
+		definition.MayTakeFileMutationQueue = true
 		if tool.RendersCall {
 			definition.RenderCall = h.makeToolRenderCall(me, tool.Name)
 		}
 		if tool.RendersResult {
 			definition.RenderResult = h.makeToolRenderResult(me, tool.Name)
 		}
-		ext.Tools[td.Name] = extension.RegisteredTool{Definition: definition, SourceInfo: source}
+		ext.Tools[td.Name] = extension.RegisteredTool{Definition: definition, SourceInfo: h.extensionSourceInfo(me), Source: source}
 		ext.ToolOrder = append(ext.ToolOrder, td.Name)
 	}
 
@@ -3331,19 +3862,18 @@ func (h *Host) buildExtension(me *managedExt, reg *RegisterPayload) *extension.E
 		if cmd.ArgumentCompletions {
 			registered.GetArgumentCompletions = makeCommandArgumentCompletions(me, cmd.Name)
 		}
-		ext.Commands[cd.Name] = registered
-		ext.CommandOrder = append(ext.CommandOrder, cd.Name)
+		ext.SetRegisteredCommand(cd.Name, registered)
 	}
 
 	// Build shortcuts.
 	for _, sd := range reg.Shortcuts {
 		sc := sd // capture
-		ext.Shortcuts[extension.KeyID(sd.Key)] = extension.ExtensionShortcut{
+		ext.SetRegisteredShortcut(extension.KeyID(sd.Key), extension.ExtensionShortcut{
 			Shortcut:      extension.KeyID(sc.Key),
 			Description:   sc.Description,
 			Handler:       h.makeShortcutHandler(me, sc.Key),
 			ExtensionPath: path,
-		}
+		})
 	}
 
 	for _, fd := range reg.Flags {
@@ -3354,26 +3884,23 @@ func (h *Host) buildExtension(me *managedExt, reg *RegisterPayload) *extension.E
 				panic(fmt.Sprintf("validated flag default for %q: %v", fd.Name, err))
 			}
 		}
-		if _, registered := ext.Flags[fd.Name]; !registered {
-			ext.FlagOrder = append(ext.FlagOrder, fd.Name)
-		}
-		ext.Flags[fd.Name] = extension.ExtensionFlag{
+		ext.SetRegisteredFlag(fd.Name, extension.ExtensionFlag{
 			Name:          fd.Name,
 			Description:   fd.Description,
 			Type:          extension.FlagType(fd.Type),
 			Default:       defaultValue,
 			ExtensionPath: path,
-		}
+		})
 	}
 
 	for _, rd := range reg.MessageRenderers {
 		customType := rd.CustomType
-		ext.MessageRenderers[customType] = h.makeMessageRenderer(me, customType)
+		ext.SetMessageRenderer(customType, h.makeMessageRenderer(me, customType))
 	}
 
 	for _, rd := range reg.EntryRenderers {
 		customType := rd.CustomType
-		ext.EntryRenderers[customType] = h.makeEntryRenderer(me, customType)
+		ext.SetEntryRenderer(customType, h.makeEntryRenderer(me, customType))
 	}
 
 	ext.ToolRenderers = append(ext.ToolRenderers, h.makeToolRendererResolver(me))
@@ -3386,10 +3913,23 @@ func (h *Host) buildExtension(me *managedExt, reg *RegisterPayload) *extension.E
 	// Build event handlers.
 	for _, hd := range reg.Handlers {
 		h := hd // capture
-		ext.AddEventHandler(h.Event, h.HandlerID, me.makeEventHandler(h.Event, h.HandlerID))
+		ext.AddJSONEventHandler(h.Event, h.HandlerID, me.makeEventHandler(h.Event, h.HandlerID))
+	}
+	if me.hostsNodeRuntime() {
+		// pig additive (D19): Pi runs its tools on the extensions' event loop; a Node process takes one turn of its own before a tool's result reaches it.
+		ext.EventLoopTurn = func(ctx context.Context) error {
+			conn := me.connection()
+			if conn == nil {
+				return nil
+			}
+			return conn.awaitEventLoopTurn(ctx)
+		}
 	}
 
 	ext.InitializeToolRegistry()
+	ext.InitializeDeclarationRegistry()
+	ext.InitializeThinkingRuns()
+	ext.SetOwnsThinkingRuns(reg.OwnsThinkingRuns) // pig additive (D214): the register frame carries the extension's value at load
 	return ext
 }
 
@@ -3450,16 +3990,30 @@ func (h *Host) makeMessageRenderer(me *managedExt, customType string) extension.
 // discarding the answer the user was still typing. The caller-owned ctx
 // remains authoritative for cancellation.
 func (h *Host) makeToolExecuteFunc(me *managedExt, toolName string) extension.ToolExecuteFunc {
+	return h.toolExecuteFunc(toolName, toolTarget{
+		connection: func() *Conn { return me.current().connection() },
+		syncState:  func(ctx context.Context, conn *Conn) error { return h.pushStateTo(ctx, me.current(), conn) },
+	})
+}
+
+// toolTarget is where a tool's execute runs: the connection that serves it, the state the extension holds before it runs, and the child agent session whose customTools define it ("" for a registered tool).
+type toolTarget struct {
+	connection   func() *Conn
+	syncState    func(context.Context, *Conn) error
+	childSession string
+}
+
+// toolExecuteFunc returns the ToolExecuteFunc that dispatches tool calls over target's connection; see makeToolExecuteFunc.
+func (h *Host) toolExecuteFunc(toolName string, target toolTarget) extension.ToolExecuteFunc {
 	return func(
 		ctx context.Context,
 		toolCallID string,
 		params json.RawMessage,
 		onUpdate extension.AgentToolUpdateCallback,
 	) (extension.AgentToolResult, error) {
-		me := me.current()
-		conn := me.connection()
+		conn := target.connection()
 		if conn == nil {
-			return nil, errors.New("extension not connected")
+			return extension.AgentToolResult{}, errors.New("extension not connected")
 		}
 
 		// upstream: agent-loop.ts:619-647, 820-837 (executeToolCallsParallel, executePreparedToolCall): a batch's calls reach
@@ -3472,8 +4026,25 @@ func (h *Host) makeToolExecuteFunc(me *managedExt, toolName string) extension.To
 		}
 		reqCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
-		if err := h.pushStateTo(reqCtx, me, conn); err != nil {
-			return nil, fmt.Errorf("sync extension state for tool %s: %w", toolName, err)
+		// upstream: agent-loop.ts executeToolCallsParallel: a call's tool_execution_end follows its own execute promise, which settles in the order the extension's runtime answers. The read loop reads the answers in that order, so it records the call's place before the goroutine that waits for the answer runs.
+		// The calls the extension made before it answered are dispatched before the result continues: a held call is then in the hold when the agent moves on to tool_execution_end, as its position in Pi's chain requires (jsloop.Turns).
+		var dispatched <-chan struct{}
+		arrived := func() { dispatched = conn.dispatchBarrier(reqCtx) }
+		if slot := agent.ToolSettleFromContext(ctx, toolCallID); slot != nil {
+			arrived = func() { dispatched = conn.dispatchBarrier(reqCtx); slot.Settle() }
+		}
+		reqCtx = withRequestArrived(reqCtx, arrived)
+		// upstream: agent-loop.ts:619-647: the edit and write calls after this one in the batch register in the file mutation queue once this tool's synchronous
+		// prefix is over, which the extension may spend taking the queue itself (withFileMutationQueue). The host sees the end of the prefix when it applies the
+		// request's first host call that returns a Promise in Pi, or when the runtime reports the handler blocked on something else, and the call's end closes the window.
+		if window := agent.ToolStartWindowFromContext(ctx, toolCallID); window != nil {
+			defer window.Close()
+			reqCtx = withRequestWindow(reqCtx, window)
+		}
+		if target.syncState != nil {
+			if err := target.syncState(reqCtx, conn); err != nil {
+				return extension.AgentToolResult{}, fmt.Errorf("sync extension state for tool %s: %w", toolName, err)
+			}
 		}
 		// A nested call made by an extension on this same connection carries its executeTool id: executeIds are per connection, so no other caller's id may reach this runtime.
 		executeID := ""
@@ -3484,20 +4055,32 @@ func (h *Host) makeToolExecuteFunc(me *managedExt, toolName string) extension.To
 		resp, err := conn.requestWithUpdates(reqCtx, &Envelope{
 			Type: MsgRequest,
 			Request: &RequestPayload{
-				Method:     "tool_call",
-				Tool:       toolName,
-				ToolCallID: toolCallID,
-				Args:       params,
-				OwnSignal:  extension.OwnsSignal(ctx),
-				ExecuteID:  executeID,
+				Method:        MethodToolCall,
+				Tool:          toolName,
+				ToolCallID:    toolCallID,
+				Batch:         agent.ToolBatchFromContext(ctx, toolCallID),
+				ToolCallIndex: toolCallIndexOf(ctx, toolCallID),
+				Args:          params,
+				OwnSignal:     extension.OwnsSignal(ctx),
+				ExecuteID:     executeID,
+				ChildSession:  target.childSession,
 			},
 		}, toolUpdateSink(onUpdate))
+		if dispatched != nil {
+			select {
+			case <-dispatched:
+			case <-conn.Done():
+			}
+		}
+		if errors.Is(err, ErrToolAborted) {
+			return extension.AgentToolResult{}, err
+		}
 		if err != nil {
-			return nil, fmt.Errorf("tool %s: %w", toolName, err)
+			return extension.AgentToolResult{}, fmt.Errorf("tool %s: %w", toolName, err)
 		}
 
 		if resp.Response != nil && resp.Response.Error != nil {
-			return nil, resp.Response.Error.ToError()
+			return extension.AgentToolResult{}, resp.Response.Error.ToError()
 		}
 
 		// Convert subprocess ToolResult → agent.AgentToolResult so
@@ -3507,7 +4090,7 @@ func (h *Host) makeToolExecuteFunc(me *managedExt, toolName string) extension.To
 			var result ToolResult
 			if err := json.Unmarshal(raw, &result); err != nil {
 				if trimmed := bytes.TrimSpace(raw); len(trimmed) > 0 && trimmed[0] == '{' {
-					return nil, fmt.Errorf("tool %s: %w", toolName, err)
+					return extension.AgentToolResult{}, fmt.Errorf("tool %s: %w", toolName, err)
 				}
 				// Extension returned a plain value (string, number, etc.)
 				// instead of a {content, details, is_error} object.
@@ -3530,8 +4113,28 @@ func (h *Host) makeToolExecuteFunc(me *managedExt, toolName string) extension.To
 			}, nil
 		}
 
-		return nil, nil
+		return extension.AgentToolResult{}, nil
 	}
+}
+
+// toolCallIndexOf is the position of the call among the tool calls of the assistant message that issued it, which agent-loop.ts executes as one batch; nil when no assistant message issued the call.
+func toolCallIndexOf(ctx context.Context, toolCallID string) *int {
+	hook, ok := agent.ToolCallHookContextFrom(ctx)
+	if !ok || hook.AssistantMessage == nil {
+		return nil
+	}
+	index := 0
+	for _, block := range hook.AssistantMessage.Content {
+		call, isCall := block.(ai.ToolCall)
+		if !isCall {
+			continue
+		}
+		if call.ID == toolCallID {
+			return &index
+		}
+		index++
+	}
+	return nil
 }
 
 // toolCallOrder reserves a call's place in the order the tool_call requests of the extension's connection are written. A
@@ -3542,7 +4145,8 @@ func toolCallOrder(me *managedExt) func(json.RawMessage) *extension.CallOrder {
 		if conn == nil {
 			return nil
 		}
-		return conn.toolOrder.Reserve()
+		place := conn.toolOrder.Reserve()
+		return &extension.CallOrder{Wait: place.Wait, Release: place.Release}
 	}
 }
 
@@ -3575,26 +4179,53 @@ func (h *Host) makeToolPrepareArguments(me *managedExt, toolName string) extensi
 	}
 }
 
+// makeToolReachesTools returns a tool's reachesTools, which runs in the extension. A request the connection could not deliver reaches no tools. An error the extension answers is the hook's throw: it panics with that error, as the loadout hook does, and the caller (an extension's tool_call handler) reports it as its own failure. Like upstream's synchronous hook it has no call context, so the extension's load context bounds it.
+//
+// upstream: types.ts:621 (reachesTools)
+func (h *Host) makeToolReachesTools(me *managedExt, toolName string) extension.ToolReachesToolsFunc {
+	return func(input json.RawMessage) extension.ToolReach {
+		me := me.current()
+		conn := me.connection()
+		if conn == nil {
+			return extension.ToolReach{}
+		}
+		ctx := me.parentCtx
+		if ctx == nil {
+			//portlint:allow ctxbackground Pi's reachesTools is synchronous and takes no signal (types.ts:621); an extension with no load context has nothing to bound the call
+			ctx = context.Background()
+		}
+		resp, err := conn.Request(ctx, &Envelope{Type: MsgRequest, Request: &RequestPayload{Method: RequestReachesTools, Tool: toolName, Args: input}})
+		if err != nil || resp.Response == nil {
+			return extension.ToolReach{}
+		}
+		if resp.Response.Error != nil {
+			panic(resp.Response.Error.ToError())
+		}
+		var all string
+		if json.Unmarshal(resp.Response.Result, &all) == nil {
+			return extension.ToolReach{All: all == "all"}
+		}
+		var words []string
+		if json.Unmarshal(resp.Response.Result, &words) != nil {
+			return extension.ToolReach{}
+		}
+		return extension.ToolReach{Words: words}
+	}
+}
+
 // toolUpdateSink adapts the agent's update callback to wire partial results.
 // Upstream passes every tool an onUpdate; a nil or foreign callback drops
 // updates, as the agent has nowhere to show them.
 func toolUpdateSink(onUpdate extension.AgentToolUpdateCallback) func(json.RawMessage) {
-	var update func(agent.AgentToolResult)
-	switch cb := onUpdate.(type) {
-	case agent.ToolUpdateCallback:
-		update = cb
-	case func(agent.AgentToolResult):
-		update = cb
-	}
 	return func(raw json.RawMessage) {
-		if update == nil {
+		if onUpdate == nil {
 			return
 		}
 		var partial ToolResult
 		if err := json.Unmarshal(raw, &partial); err != nil {
 			return
 		}
-		update(agent.AgentToolResult{
+		onUpdate(agent.AgentToolResult{
 			MemberOrder:       partial.MemberOrder,
 			Content:           partial.Content,
 			Details:           orderedjson.Value(partial.Details),
@@ -3609,7 +4240,7 @@ func toolUpdateSink(onUpdate extension.AgentToolUpdateCallback) func(json.RawMes
 
 // invocationError keeps transport failure propagation separate from diagnostic ownership.
 func (h *Host) invocationError(err error) error {
-	if h.onCrash == nil {
+	if h.crashHandler() == nil {
 		return err
 	}
 	_, transport := errors.AsType[*TransportError](err)
@@ -3776,7 +4407,7 @@ func (h *Host) handleEventSubscription(me *managedExt, call *CallPayload) (*Call
 		return nil, errors.New("extension registration is no longer active")
 	}
 	if call.Method == "event.subscribe" {
-		me.ext.AddEventHandler(request.Event, request.HandlerID, me.makeEventHandler(request.Event, request.HandlerID))
+		me.ext.AddJSONEventHandler(request.Event, request.HandlerID, me.makeEventHandler(request.Event, request.HandlerID))
 	} else {
 		me.ext.RemoveEventHandler(request.Event, request.HandlerID)
 	}
@@ -3784,20 +4415,13 @@ func (h *Host) handleEventSubscription(me *managedExt, call *CallPayload) (*Call
 }
 
 // makeEventHandler returns a HandlerFn that dispatches events over the socket.
+//
+//pig:hotpath
 func (me *managedExt) makeEventHandler(event string, handlerID int) extension.HandlerFn {
 	return func(args ...any) (any, error) {
 		conn := me.connection()
 		if conn == nil {
 			return nil, errors.New("extension not connected")
-		}
-
-		var argsJSON json.RawMessage
-		if len(args) > 0 {
-			var err error
-			argsJSON, err = json.Marshal(wireEventPayload(args[0]))
-			if err != nil {
-				return nil, fmt.Errorf("marshal event args: %w", err)
-			}
 		}
 
 		parent := context.Background()
@@ -3806,20 +4430,62 @@ func (me *managedExt) makeEventHandler(event string, handlerID int) extension.Ha
 				parent = dispatchContext
 			}
 		}
-		if event == "before_agent_start" {
+		boundaryWire := boundarywire.FromContext(parent)
+		if boundaryWire != nil {
+			boundaryWire.HandlerStarted()
+		}
+
+		var argsJSON json.RawMessage
+		var update *extension.MessageUpdateEvent
+		var toolUpdate *extension.ToolExecutionUpdateEvent
+		if len(args) > 0 {
+			update = streamedMessageUpdate(event, args[0], boundaryWire)
+			toolUpdate = streamedToolUpdate(event, args[0], boundaryWire)
+		}
+		streamed := update != nil || toolUpdate != nil
+		// The dispatch's event, unchanged since an earlier handler encoded it, has that handler's encoding.
+		var eventWire *eventwire.Dispatch
+		if event == "before_agent_start" || event == "tool_call" || event == "context" || event == "context_with_system" {
+			eventWire = eventwire.FromContext(parent)
+		}
+		var encoded bool
+		if eventWire != nil && len(args) > 0 {
+			argsJSON, encoded = eventWire.Args()
+		}
+		if len(args) > 0 && !streamed && !encoded {
+			var err error
+			argsJSON, err = marshalEventWire(boundaryEventWire(wireEventPayload(args[0]), boundaryWire))
+			if err != nil {
+				return nil, fmt.Errorf("marshal event args: %w", err)
+			}
+		}
+		if event == "before_agent_start" && !encoded {
 			var err error
 			argsJSON, err = promptOptionsEventArgs(parent, argsJSON)
 			if err != nil {
 				return nil, err
 			}
 		}
+		if eventWire != nil && len(args) > 0 && !encoded {
+			eventWire.StoreArgs(argsJSON)
+		}
 		// The event and session state are read here, in the handler's synchronous prefix. Only the wait for the extension process is a suspension.
 		if event == "session_shutdown" {
+			dispatch := parent
 			parent = withRequestSuspension(parent, func(suspended bool) {
 				if suspended {
 					me.host.setQuitHandlerSuspended()
+					handleryield.Report(dispatch)
 				}
 			}, me.host.inputHasEnded)
+			if !me.hostsNodeRuntime() {
+				// A Go, Python or Rust handler reports no window. Its Promise-shaped host call (waitForIdle, exec, setModel, a dialog) is where Pi's handler awaits and its loop turns, so the call reports the yield, as a command flight counts it (commandFlight.calls). Without it a handler that waits on the held run never returns.
+				parent = withRequestHostCalls(parent, func(_ bool, delta int) {
+					if delta > 0 {
+						handleryield.Report(dispatch)
+					}
+				})
+			}
 		}
 		if event == "agent_before_settle" || event == "agent_settled" {
 			flight := me.host.beginTailFlight(me)
@@ -3831,6 +4497,9 @@ func (me *managedExt) makeEventHandler(event string, handlerID int) extension.Ha
 				}
 			}, func() bool { return false })
 		}
+		// The state push and the request are one stretch of outstanding work, so the heartbeat sees one idle/busy transition per dispatch rather than one per frame.
+		conn.beginWork()
+		defer conn.endWork()
 		if err := me.host.pushStateTo(parent, me, conn); err != nil {
 			return nil, me.dispatchError(fmt.Errorf("sync extension state for event %s: %w", event, me.host.invocationError(err)))
 		}
@@ -3838,15 +4507,27 @@ func (me *managedExt) makeEventHandler(event string, handlerID int) extension.Ha
 		var resp *Envelope
 		var err error
 		request := func() error {
-			resp, err = conn.Request(parent, &Envelope{
-				Type: MsgRequest,
-				Request: &RequestPayload{
-					Method:    "event",
-					Event:     event,
-					HandlerID: handlerID,
-					Args:      argsJSON,
-				},
-			})
+			payload := &RequestPayload{
+				Method:      "event",
+				Event:       event,
+				HandlerID:   handlerID,
+				Args:        argsJSON,
+				encodedArgs: !streamed,
+			}
+			envelope := &Envelope{Type: MsgRequest, Request: payload}
+			switch {
+			case update != nil:
+				resp, err = conn.requestOrdered(parent, envelope, me.messageUpdates.order(&me.host.messageUpdateShare, conn, *update, payload, args[0], boundaryWire))
+			case toolUpdate != nil:
+				resp, err = conn.requestOrdered(parent, envelope, me.toolUpdates.order(conn, *toolUpdate, payload, args[0], boundaryWire))
+			default:
+				requestCtx := parent
+				if started := extension.DispatchStartedFromContext(parent); started != nil {
+					// The request is the handler's start: the process runs requests in the order they arrive.
+					requestCtx = withRequestIssued(parent, started)
+				}
+				resp, err = conn.Request(requestCtx, envelope)
+			}
 			return nil
 		}
 		if observation := ai.StreamObservationFromContext(parent); observation != nil {
@@ -3855,27 +4536,44 @@ func (me *managedExt) makeEventHandler(event string, handlerID int) extension.Ha
 		} else {
 			_ = request()
 		}
+		if streamed && (err != nil || resp.Response == nil || resp.Response.Error != nil) {
+			// The runtime may not hold the payload this frame carried: the next one is a keyframe.
+			if update != nil {
+				me.messageUpdates.invalidate()
+			} else {
+				me.toolUpdates.invalidate()
+			}
+		}
 		if err != nil {
 			return nil, me.dispatchError(fmt.Errorf("event %s: %w", event, me.host.invocationError(err)))
 		}
 
 		if resp.Response != nil {
 			if event == "before_agent_start" && len(args) > 0 && len(resp.Response.Result) > 0 && strings.TrimSpace(string(resp.Response.Result)) != "null" {
-				var mutation BeforeAgentStartResponsePayload
-				if err := json.Unmarshal(resp.Response.Result, &mutation); err != nil {
-					return nil, fmt.Errorf("decode prompt section response: %w", err)
-				}
-				// runner.ts:1339 hands every handler the same options object; write the handler's values back into the per-run options the next handler receives.
-				if target := extension.BeforeAgentStartOptions(parent); target != nil {
-					if target.Sections != nil {
-						*target.Sections = mutation.Sections
+				reply := resp.Response.Result
+				if result, repeated := eventWire.Repeated(reply); repeated {
+					// The options already hold every value this reply assigns.
+					resp.Response.Result = result
+				} else {
+					var mutation BeforeAgentStartResponsePayload
+					//portlint:allow hotpathjson runs for before_agent_start only (once per prompt, not per event), and only when the reply is not a repeat of the options
+					if err := json.Unmarshal(reply, &mutation); err != nil {
+						return nil, fmt.Errorf("decode prompt section response: %w", err)
 					}
-					extension.SetBeforeAgentStartSelectedTools(parent, mutation.SelectedTools)
-					if err := applyPromptOptionEdits(target, mutation.Options); err != nil {
-						return nil, fmt.Errorf("decode prompt options response: %w", err)
+					// runner.ts:1339 hands every handler the same options object; write the handler's values back into the per-run options the next handler receives.
+					if target := extension.BeforeAgentStartOptions(parent); target != nil {
+						if target.Sections != nil {
+							*target.Sections = mutation.Sections
+						}
+						extension.SetBeforeAgentStartSelectedTools(parent, mutation.SelectedTools)
+						if err := applyPromptOptionEdits(target, mutation.Options); err != nil {
+							eventWire.Changed()
+							return nil, fmt.Errorf("decode prompt options response: %w", err)
+						}
+						eventWire.Applied(reply, mutation.Result)
 					}
+					resp.Response.Result = mutation.Result
 				}
-				resp.Response.Result = mutation.Result
 			}
 			// upstream: runner.ts emitToolCall hands every handler the one event object and the agent loop runs the tool with its input, so a handler's in-place edit of event.input reaches the call and the next handler. An extension process cannot share the object: its reply carries the input it left when that differs from the one it received, even when the handler fails.
 			if event == "tool_call" && len(args) > 0 && len(resp.Response.Result) > 0 && strings.TrimSpace(string(resp.Response.Result)) != "null" {
@@ -3887,6 +4585,7 @@ func (me *managedExt) makeEventHandler(event string, handlerID int) extension.Ha
 					return nil, fmt.Errorf("decode tool_call response: %w", err)
 				}
 				if len(reply.Input) > 0 {
+					eventWire.Changed()
 					if err := applyToolCallInput(args[0], reply.Input); err != nil {
 						return nil, fmt.Errorf("decode tool_call input: %w", err)
 					}
@@ -3915,6 +4614,12 @@ func (me *managedExt) makeEventHandler(event string, handlerID int) extension.Ha
 			if resp.Response.Error != nil {
 				return nil, resp.Response.Error.ToError()
 			}
+			// A user_bash reply that names a BashOperations object the extension holds becomes the object Pi's runner holds.
+			if event == "user_bash" && len(resp.Response.Result) > 0 {
+				if typed, ok := userBashOperationsResult(conn, resp.Response.Result); ok {
+					return typed, nil
+				}
+			}
 			// A handler that returns undefined (Node), None (Python) or no
 			// value sends JSON null. Upstream treats undefined as "no result",
 			// so null never reaches the Runner as a result value.
@@ -3926,6 +4631,16 @@ func (me *managedExt) makeEventHandler(event string, handlerID int) extension.Ha
 
 		return nil, nil
 	}
+}
+
+// goHandleIncoming starts handleIncoming for conn on its own goroutine and records the loop on the connection before it runs, so Shutdown can wait for it (Conn.awaitIncomingEnded).
+func (h *Host) goHandleIncoming(me *managedExt, conn *Conn) {
+	conn.incoming.Store(&incomingLoop{ended: make(chan struct{})})
+	//portlint:allow golifetime the loop ends with its connection, which the host closes before it stops the extension, and Shutdown waits for the loop through Conn.awaitIncomingEnded
+	go func() {
+		defer conn.endIncoming()
+		h.handleIncoming(me, conn)
+	}()
 }
 
 // handleIncoming processes extension→host messages (calls, widget pushes) from conn, one connection of me.
@@ -3943,7 +4658,16 @@ func (h *Host) handleIncoming(me *managedExt, conn *Conn) {
 		}
 	}()
 	lanes := newCallLanes()
+	if !me.hostsNodeRuntime() {
+		// A request's handler in a Go, Rust or Python extension may await a call the host holds for the loop's turn; it runs before the request does (Turns.Release).
+		release := func() { h.timerTurns.Load().Release(conn) }
+		conn.onRequestStart.Store(&release)
+	}
 	for env := range conn.Incoming() {
+		if env.barrier != nil {
+			env.barrier.release()
+			continue
+		}
 		if !h.acceptsNodeGeneration(me) {
 			// A reload's replaced generation still runs its command; runCall answers each of its calls with Pi's stale error instead of leaving a synchronous call blocked.
 			if env.Type == MsgCall && env.Call != nil && me.replaced.Load() {
@@ -3973,10 +4697,21 @@ func (h *Host) handleIncoming(me *managedExt, conn *Conn) {
 			// pig additive (D19): Pi applies a command's calls, such as writing a dialog request, before the process can exit, so the command counts as suspended only after the calls received before its report applied their synchronous parts. The wait runs off the read loop because those calls can need later frames.
 			if env.RequestState != nil {
 				state := *env.RequestState
+				// A report that ends a tool's start window waits for the calls the extension sent before it, not for the call its handler sends after it: the calls
+				// are marked now, in the order the frames were read.
+				applied := lanes.barrier
+				if state.State != "suspended" {
+					applied = lanes.barrierMark()
+				}
 				go func() {
-					lanes.barrier()
+					applied()
 					conn.deliverRequestState(state)
-					conn.settleSuspension(state.RequestID)
+					if state.State == "suspended" {
+						conn.settleSuspension(state.RequestID)
+					} else {
+						// The handler of a tool_call request awaited something that is not a host call: Pi's next call starts (conn.endsStartWindow).
+						conn.endRequestWindowByReport(state.RequestID)
+					}
 				}()
 			}
 
@@ -3994,6 +4729,25 @@ func (h *Host) handleIncoming(me *managedExt, conn *Conn) {
 			// Calls apply in arrival order per lane off the read loop, so the
 			// host keeps receiving notifications, widget pushes, and nested
 			// calls the same extension sends while an earlier call runs.
+			if call.Timer {
+				if turns := h.timerTurns.Load(); turns != nil {
+					// A Go, Rust or Python extension marks every call made through a context whose request returned, whoever makes it. A request of the connection that is still in flight may be awaiting this very call (a handler that keeps an earlier request's context), and the loop turn the hold waits for waits for that handler, so such a call runs on arrival: while a handler is pending, Pi's loop is turning. Only a Node runtime knows a callback from a handler's own call (timer-origin.mjs).
+					native := !me.hostsNodeRuntime()
+					if holdsForLoopTurn(call.Method) && (!native || !conn.requestsInFlight()) {
+						switch {
+						case call.Tick:
+							turns.Tick(call.OriginToolCallID, func(done func()) { h.queueCallDone(me, conn, lanes, env.ID, call, done) })
+						case native:
+							turns.MacrotaskDoneFor(conn, func(done func()) { h.queueCallDone(me, conn, lanes, env.ID, call, done) })
+						default:
+							turns.MacrotaskDone(func(done func()) { h.queueCallDone(me, conn, lanes, env.ID, call, done) })
+						}
+						continue
+					}
+					// The caller waits for the answer, so the call cannot wait; it runs behind the calls held before it.
+					turns.Turn()
+				}
+			}
 			h.queueCall(me, conn, lanes, env.ID, call)
 
 		case MsgWidgetPush:
@@ -4014,7 +4768,7 @@ func (h *Host) handleIncoming(me *managedExt, conn *Conn) {
 						fmt.Fprintf(os.Stderr, "panic in HandleWidgetPush for %s: %v\n", me.config.Name, r)
 					}
 				}()
-				h.uiBridge.HandleWidgetPush(me.config.Name, env.WidgetPush)
+				h.uiBridge.HandleWidgetPush(me.config.Name, conn, env.WidgetPush)
 			})
 			// A separate lane lets width-handler pushes run while a host call waits.
 			lanes.push(MsgWidgetPush, func() { h.runSlotCall("widgets", pending) })
@@ -4038,6 +4792,19 @@ func (h *Host) handleIncoming(me *managedExt, conn *Conn) {
 				if h.noteRuntimeDrain(me, conn, env.Notify.Method, true) {
 					h.applyRuntimeDrain(me, env.Notify.Method)
 				}
+				continue
+			}
+			if env.Notify.Method == NotifyHandlerYielded {
+				h.endSyncRunHoldOf(conn, env.Notify.Args)
+				continue
+			}
+			if env.Notify.Method == NotifyEventLoopTurned {
+				// pig additive (D19): a turn counts once the calls the runtime sent before it applied their synchronous parts, as for a request_state report. The wait runs off the read loop because those calls can need later frames.
+				args := env.Notify.Args
+				h.goDrainTask(func() {
+					lanes.barrier()
+					conn.settleEventLoopTurn(args)
+				})
 				continue
 			}
 			if env.Notify.Method == notifyOAuthSignalRelease {
@@ -4065,6 +4832,16 @@ func (h *Host) handleIncoming(me *managedExt, conn *Conn) {
 			h.uiBridge.HandleNotifyFrom(me.config.Name, conn, env.Notify)
 		}
 	}
+
+	// pig additive (D214): the extension no longer draws anything, so it owns no thinking runs. Its earlier calls apply first, or a late
+	// ownThinkingRuns(true) would restore what the exit withdrew; once Shutdown has joined this loop and waits for the drain tasks no call is left to apply.
+	if !h.goDrainTask(func() {
+		lanes.barrier()
+		h.dropOwnedThinkingRuns(me, conn)
+	}) {
+		h.dropOwnedThinkingRuns(me, conn)
+	}
+	conn.endIncoming()
 
 	if completed := h.noteRuntimeConnClosed(me, conn); len(completed) > 0 {
 		// The connection's earlier calls apply before the drain acts, as on the report path; a call's handler can wait, so this does not delay the close handling below. The connection owns the wait: its close cancels the host calls it applies, and Shutdown joins the task.
@@ -4110,8 +4887,8 @@ func (h *Host) handleIncoming(me *managedExt, conn *Conn) {
 			if h.uiBridge != nil {
 				h.uiBridge.ClearExtensionConn(me.config.Name, conn)
 			}
-			if h.onCrash != nil {
-				h.onCrash(me.config.Name, 0, true, "the extension process exited with status 0; its tools and commands are unavailable until /reload")
+			if report := h.crashHandler(); report != nil {
+				report(me.config.Name, 0, true, "the extension process exited with status 0; its tools and commands are unavailable until /reload")
 			}
 			return
 		}
@@ -4127,7 +4904,8 @@ func (h *Host) handleIncoming(me *managedExt, conn *Conn) {
 			// against this handler. Don't assert a liveness state we have
 			// not verified either way; the process is only withdrawn from
 			// retention claims above.
-			h.disablePackedMember(me, "packed member connection closed")
+			// A native packed member is not restarted automatically, and the quarantine notice that names /reload is lost when this handler detaches the member first, so this notice names the recovery too.
+			h.disablePackedMember(me, "packed member connection closed; /reload restarts it")
 			return
 		}
 		h.quarantinePackedCell(me.packedCellKey, fmt.Sprintf("extension %s connection closed", me.config.Name))
@@ -4146,17 +4924,17 @@ func (h *Host) handleIncoming(me *managedExt, conn *Conn) {
 			if h.uiBridge != nil {
 				h.uiBridge.ClearExtensionConn(me.config.Name, conn)
 			}
-			if h.onCrash != nil {
+			if report := h.crashHandler(); report != nil {
 				reason := me.supervisor.DisableReason()
 				if hint != "" {
 					reason += "; " + hint
 				}
-				h.onCrash(me.config.Name, 0, true, withStderrLog(reason, me.retainStderrLog()))
+				report(me.config.Name, 0, true, withStderrLog(reason, me.retainStderrLog()))
 			}
 			return
 		}
-		if h.onCrash != nil {
-			h.onCrash(me.config.Name, delay, false, withStderrLog(hint, me.retainStderrLog()))
+		if report := h.crashHandler(); report != nil {
+			report(me.config.Name, delay, false, withStderrLog(hint, me.retainStderrLog()))
 		}
 		// Relaunch after the supervisor's backoff. The "restart in %s" notice
 		// above is only truthful because of this call.
@@ -4199,7 +4977,7 @@ func (h *Host) disablePackedMember(me *managedExt, reason string) {
 	}
 	// Reserve the diagnostic before detaching the member so process cleanup cannot remove its log first.
 	logPath := ""
-	if h.onCrash != nil {
+	if h.crashHandler() != nil {
 		logPath = me.retainStderrLog()
 	}
 	delete(h.exts, me.config.Name)
@@ -4225,8 +5003,8 @@ func (h *Host) disablePackedMember(me *managedExt, reason string) {
 	if h.providerRuntime != nil {
 		h.releaseExtensionAPI(me, nil)
 	}
-	if h.onCrash != nil {
-		h.onCrash(me.config.Name, 0, true, withStderrLog(reason, logPath))
+	if report := h.crashHandler(); report != nil {
+		report(me.config.Name, 0, true, withStderrLog(reason, logPath))
 	}
 }
 
@@ -4245,13 +5023,13 @@ func (h *Host) handleUnresponsiveExtension(me *managedExt, failure *ExtensionUnr
 	}
 	delay, err := me.supervisor.RecordCrash()
 	if err != nil {
-		if h.onCrash != nil {
-			h.onCrash(me.config.Name, 0, true, withStderrLog(me.supervisor.DisableReason()+"; "+reason, me.retainStderrLog()))
+		if report := h.crashHandler(); report != nil {
+			report(me.config.Name, 0, true, withStderrLog(me.supervisor.DisableReason()+"; "+reason, me.retainStderrLog()))
 		}
 		return
 	}
-	if h.onCrash != nil {
-		h.onCrash(me.config.Name, delay, false, withStderrLog(reason, me.retainStderrLog()))
+	if report := h.crashHandler(); report != nil {
+		report(me.config.Name, delay, false, withStderrLog(reason, me.retainStderrLog()))
 	}
 	h.scheduleRestart(me, delay)
 }
@@ -4261,16 +5039,25 @@ func (h *Host) handleUnresponsiveExtension(me *managedExt, failure *ExtensionUnr
 // restarting in place (same managedExt, fresh connection) restores the
 // extension's capabilities without re-registering anything with the agent.
 // Packed cells are excluded upstream of this call: they are quarantined.
+//
+// The wait is a task Shutdown joins: Shutdown cancels the recovery context first, which ends the wait, so no backoff
+// goroutine outlives the Host. A restart scheduled once Shutdown waits does not run.
 func (h *Host) scheduleRestart(me *managedExt, delay time.Duration) {
-	go func() {
+	h.goDrainTask(func() {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
-		<-timer.C
-		h.attemptRestart(me)
-	}()
+		select {
+		case <-timer.C:
+			h.attemptRestart(me)
+		case <-h.recoveryContext.Done():
+		}
+	})
 }
 
 func (h *Host) attemptRestart(me *managedExt) {
+	// A restart starts a process and admits this slot's generation to it, as Load and Reload do. Serialized with them, a /reload never claims or replaces a process whose restart is still registering: the replaced generation's failed start would kill the process the successor runs in.
+	h.transitionMu.Lock()
+	defer h.transitionMu.Unlock()
 	if h.shuttingDown.Load() || me.shuttingDown.Load() {
 		return
 	}
@@ -4292,7 +5079,8 @@ func (h *Host) attemptRestart(me *managedExt) {
 		me.cancel = nil
 	}
 
-	if _, err := h.startExt(context.Background(), me, true); err != nil {
+	// Shutdown waits for transitionMu after it cancels the recovery context, so a start waiting on a process that never connects ends; the restarted process runs under the same context and ends with the Host.
+	if _, err := h.startExt(h.recoveryContext, me, true); err != nil {
 		// The relaunch itself failed: the fresh handleIncoming never started,
 		// so nothing else will retry unless we drive it here. Count it against
 		// the same circuit breaker and back off or give up.
@@ -4304,13 +5092,13 @@ func (h *Host) attemptRestart(me *managedExt) {
 			if h.uiBridge != nil {
 				h.uiBridge.ClearExtensionConn(me.config.Name, me.connection())
 			}
-			if h.onCrash != nil {
-				h.onCrash(me.config.Name, 0, true, withStderrLog(me.supervisor.DisableReason(), me.retainStderrLog()))
+			if report := h.crashHandler(); report != nil {
+				report(me.config.Name, 0, true, withStderrLog(me.supervisor.DisableReason(), me.retainStderrLog()))
 			}
 			return
 		}
-		if h.onCrash != nil {
-			h.onCrash(me.config.Name, nextDelay, false, "restart failed: "+err.Error())
+		if report := h.crashHandler(); report != nil {
+			report(me.config.Name, nextDelay, false, "restart failed: "+err.Error())
 		}
 		h.scheduleRestart(me, nextDelay)
 		return
@@ -4341,7 +5129,7 @@ func resolveSocketDir() string {
 // Both are writers rather than PiG's own files, so the process gets pipes
 // the host copies from: Node makes its stdio pipes non-blocking, which on a
 // descriptor shared with PiG would turn PiG's own writes into EAGAIN errors.
-func (h *Host) nodeExtensionOutput(log *os.File) (stdout, stderr io.Writer) {
+func (h *Host) nodeExtensionOutput(log io.Writer) (stdout, stderr io.Writer) {
 	terminal := os.Stderr
 	if h.mode == "tui" {
 		terminal = os.Stdout
@@ -4383,7 +5171,7 @@ func (c extensionConsole) Write(p []byte) (int, error) {
 // Go and Rust extensions are
 // compiled binaries and run directly.
 func buildExtCommand(ctx context.Context, binPath, runtimeLanguage string) *exec.Cmd {
-	return buildExtCommandForGOOS(ctx, binPath, runtimeLanguage, runtime.GOOS, exec.LookPath)
+	return buildExtCommandSelected(ctx, binPath, runtimeLanguage, runtime.GOOS, exec.LookPath, nodeSelection)
 }
 
 func buildExtCommandForGOOS(
@@ -4391,13 +5179,23 @@ func buildExtCommandForGOOS(
 	binPath, runtimeLanguage, goos string,
 	lookPath func(string) (string, error),
 ) *exec.Cmd {
+	return buildExtCommandSelected(ctx, binPath, runtimeLanguage, goos, lookPath, nodeSelection)
+}
+
+// buildExtCommandSelected is buildExtCommandForGOOS for a Node launcher that runs on the selected TypeScript runtime.
+func buildExtCommandSelected(
+	ctx context.Context,
+	binPath, runtimeLanguage, goos string,
+	lookPath func(string) (string, error),
+	sel tsruntime.Selection,
+) *exec.Cmd {
 	if runtimeLanguage == "python" || strings.HasSuffix(strings.ToLower(binPath), ".py") {
 		if uvPath, err := lookPath("uv"); err == nil {
 			return linkerexec.CommandContext(ctx, uvPath, "run", binPath)
 		}
 		return linkerexec.CommandContext(ctx, toolchain.PythonExecutable(goos, lookPath), binPath)
 	}
-	if cmd, ok := nodeLauncherCommand(ctx, binPath); ok {
+	if cmd, ok := nodeLauncherCommand(ctx, binPath, sel); ok {
 		return cmd
 	}
 	// Windows cannot execute a script, so a Node script standalone runs through

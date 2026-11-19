@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHarness, fauxAssistantMessage, createAssistantMessageEventStream } from "./pi-session-harness.mjs";
+import { createHarness, createSdkHarness, fauxAssistantMessage, createAssistantMessageEventStream } from "./pi-session-harness.mjs";
 function seed(h) {
  h.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
  const model = h.getModel(), now = Date.now();
@@ -39,11 +39,15 @@ for (const name of ["no-model", "no-auth"]) {
   });
  } finally { if(previousPackageDir===undefined)delete process.env.PI_PACKAGE_DIR;else process.env.PI_PACKAGE_DIR=previousPackageDir;h.cleanup(); }
 }
-const bearer = await createHarness({ withConfiguredAuth: false });
+// The bearer boundary counts how often one summary request resolves its auth, which depends on the stream function. The session createAgentSession builds
+// (sdk.ts streamFn into modelRuntime.streamSimple) is marked with markRuntimeStreamFunction since Pi 6fed3cfb (#11520), so _getSummarizationRequestAuth
+// (agent-session.ts:603-608) skips pre-resolution and the runtime resolves once: resolved=1 (resolved=2 through Pi 1.4.0). Upstream's harness hands its Agent
+// `streamFn: streamSimple`, a different path; the SDK harness is what a Pi user's session is. The other boundaries here do not depend on it.
+const bearer = await createSdkHarness({ withConfiguredAuth: false });
 try {
  let resolved = 0;
  const model = bearer.getModel();
- bearer.session.modelRuntime.registerNativeProvider({ id: model.provider, name: "Faux bearer provider", auth: { apiKey: { name: "Faux bearer token", resolve: async () => { resolved++; return { auth: { headers: { Authorization: "Bearer ambient-token" } }, source: "ambient bearer token" }; } } }, getModels: () => bearer.models, stream: () => createAssistantMessageEventStream(), streamSimple: () => createAssistantMessageEventStream() });
+ bearer.session.modelRuntime.registerNativeProvider({ id: model.provider, name: "Faux bearer provider", auth: { apiKey: { name: "Faux bearer token", resolve: async () => { resolved++; return { auth: { headers: { Authorization: "Bearer ambient-token" } }, source: "ambient bearer token" }; } } }, getModels: () => bearer.models, stream: (m, c, o) => bearer.fauxStreamSimple(m, c, o), streamSimple: (m, c, o) => bearer.fauxStreamSimple(m, c, o) });
  seed(bearer);
  bearer.setResponses([(_context, options) => {
   assert.equal(options?.apiKey, undefined);

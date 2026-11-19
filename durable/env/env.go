@@ -104,8 +104,12 @@ type FileError struct {
 
 // NewFileError returns a FileError; path and cause may be empty.
 func NewFileError(code FileErrorCode, message, path string, cause error) *FileError {
-	return &FileError{Code: code, Message: message, Path: path, Cause: cause}
+	e := &FileError{Code: code, Message: message, Path: path, Cause: cause}
+	return e
 }
+
+// Name is the `name` property, "FileError".
+func (*FileError) Name() string { return "FileError" }
 
 func (e *FileError) Error() string { return e.Message }
 
@@ -136,8 +140,12 @@ type ExecutionError struct {
 
 // NewExecutionError returns an ExecutionError; cause may be nil.
 func NewExecutionError(code ExecutionErrorCode, message string, cause error) *ExecutionError {
-	return &ExecutionError{Code: code, Message: message, Cause: cause}
+	e := &ExecutionError{Code: code, Message: message, Cause: cause}
+	return e
 }
+
+// Name is the error class name, Pi's `name` property.
+func (*ExecutionError) Name() string { return "ExecutionError" }
 
 func (e *ExecutionError) Error() string { return e.Message }
 
@@ -241,24 +249,24 @@ type WatchTarget struct {
 	Exclude   *WatchExclude
 }
 
-// WatchChange is what changed. It is WatchChangePaths, WatchChangeOverflow, or WatchChangeError.
-type WatchChange interface{ watchChange() }
+// FileChange is what changed, tagged by its type (Pi's `kind`). It is FileChangePaths, FileChangeOverflow, or FileChangeFailed.
+type FileChange interface{ fileChange() }
 
-// WatchChangePaths reports that something at or below each path may have changed (a directory path covers its whole
+// FileChangePaths reports that something at or below each path may have changed (a directory path covers its whole
 // subtree). Calls may be spurious; a change is never missed while the watcher is healthy.
-type WatchChangePaths struct{ Paths []string }
+type FileChangePaths struct{ Paths []string }
 
-// WatchChangeOverflow reports that coverage was uncertain for a while (lost events, reconnect): rescan everything that
+// FileChangeOverflow reports that coverage was uncertain for a while (lost events, reconnect): rescan everything that
 // is watched.
-type WatchChangeOverflow struct{}
+type FileChangeOverflow struct{}
 
-// WatchChangeError reports that the watcher stopped, for example because the watched tree grew past the environment's
-// limit; no calls follow.
-type WatchChangeError struct{ Error *FileError }
+// FileChangeFailed reports that the watcher stopped with Error, for example because the watched tree grew past the
+// environment's limit; no calls follow.
+type FileChangeFailed struct{ Error *FileError }
 
-func (WatchChangePaths) watchChange()    {}
-func (WatchChangeOverflow) watchChange() {}
-func (WatchChangeError) watchChange()    {}
+func (FileChangePaths) fileChange()    {}
+func (FileChangeOverflow) fileChange() {}
+func (FileChangeFailed) fileChange()   {}
 
 // WatchMode is how a FileWatcher learns of changes.
 type WatchMode string
@@ -274,8 +282,8 @@ const (
 // FileWatcher is a running watch.
 type FileWatcher interface {
 	Mode() WatchMode
-	// Close stops watching; no onChange call starts after it returns. It is idempotent.
-	Close(ctx context.Context) error
+	// Stop stops watching; no onChange call starts after it returns. It is idempotent.
+	Stop(ctx context.Context) error
 }
 
 // ReadTextLinesOptions bounds FileSystem.ReadTextLines; nil MaxLines reads every line.
@@ -328,11 +336,17 @@ type FileSystem interface {
 	RenameFile(ctx context.Context, sourcePath, destinationPath string) error
 	FileInfo(ctx context.Context, path string) (FileInfo, error)
 	ListDir(ctx context.Context, path string) ([]FileInfo, error)
+	// ListFiles is upstream's optional `listFiles?`: the files, directories and symbolic links below a directory, at any
+	// depth, for indexes such as file completion. Symbolic links are not followed; other kinds of files are not listed;
+	// entries that cannot be read are skipped. It fails with a not_supported FileError when the environment cannot list
+	// right now (an older remote daemon, or an environment without a lister, where upstream leaves the method undefined),
+	// so callers fall back to their own walk. options may be nil.
+	ListFiles(ctx context.Context, path string, options *ListFilesOptions) (FileListing, error)
 	OpenDirReader(ctx context.Context, path string) (DirReader, error)
 	// Watch reports changes to files and directories, for hosts that load resources from the environment. When it
 	// returns a watcher, coverage is established: a host that watches before it loads cannot miss a change made during
-	// the load. See WatchChange for what is reported and FileWatcher.Mode for how reliably.
-	Watch(ctx context.Context, targets []WatchTarget, onChange func(WatchChange)) (FileWatcher, error)
+	// the load. See FileChange for what is reported and FileWatcher.Mode for how reliably.
+	Watch(ctx context.Context, targets []WatchTarget, onChange func(FileChange)) (FileWatcher, error)
 	CanonicalPath(ctx context.Context, path string) (string, error)
 	Exists(ctx context.Context, path string) (bool, error)
 	CreateDir(ctx context.Context, path string, options *CreateDirOptions) error
@@ -340,6 +354,42 @@ type FileSystem interface {
 	CreateTempDir(ctx context.Context, prefix *string) (string, error)
 	CreateTempFile(ctx context.Context, options *CreateTempFileOptions) (string, error)
 	Cleanup(ctx context.Context) error
+}
+
+// ListFilesOptions configure FileSystem.ListFiles; a nil field takes its default.
+type ListFilesOptions struct {
+	// Hidden includes names starting with `.` (on Windows also files with the hidden attribute); nil means true.
+	// Entries named `.git` are never listed.
+	Hidden *bool
+	// Gitignore skips, inside a git work tree, what git ignores: the `.gitignore` files of the directory, its
+	// subdirectories and its parents, `.git/info/exclude`, and the global excludes file; nil means true. Unlike
+	// `git ls-files`, a tracked file that matches an ignore rule is skipped too. Outside work trees, `.gitignore` files
+	// have no effect.
+	Gitignore *bool
+	// Exclude names entries to skip with everything below them, such as `node_modules`.
+	Exclude []string
+	// MaxEntries is the most entries to list; nil means 50 000.
+	MaxEntries *float64
+	// MaxBytes is the most bytes of the listing, each entry's UTF-8 path plus two; nil means 4 MiB, at most 15.9 MiB.
+	MaxBytes *float64
+	// TimeoutMs is the time after which the listing stops; nil means 10 000 ms.
+	TimeoutMs *float64
+}
+
+// FileListEntry is one entry of a FileListing.
+type FileListEntry struct {
+	// Path is relative to the listed directory, with `/` separators on every system.
+	Path string
+	// Kind is symlink for a symbolic link, which is listed as such and not followed.
+	Kind FileKind
+}
+
+// FileListing is the result of FileSystem.ListFiles.
+type FileListing struct {
+	// Entries run depth first, parents before their entries, siblings in byte order of their names.
+	Entries []FileListEntry
+	// Truncated is whether a bound in ListFilesOptions ended the listing early.
+	Truncated bool
 }
 
 // ShellSpillOptions spills the complete output to a temporary file once it exceeds either threshold.
@@ -380,6 +430,7 @@ type ShellOutputWindow struct {
 
 // ShellOutputSkip is output an environment omitted, measured on the decoded text OnOutput would have received: every
 // U+FFFD counts as three bytes, and no sanitizing is applied.
+// It has the shape of output.OutputSkip from chord/output, which OutputBuffer.PushStringSkipping accepts.
 type ShellOutputSkip struct {
 	// Bytes is the UTF-8 byte length of the omitted text.
 	Bytes int

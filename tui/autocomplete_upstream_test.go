@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -50,9 +51,9 @@ func autocompleteValues(result *AutocompleteSuggestions) []string {
 // cursor is translated to the same text boundary; expected cursors use bytes too.
 func upstreamSuggestions(p *CombinedProvider, line string, col int, force bool) *AutocompleteSuggestions {
 	if force {
-		return p.GetSuggestionsForce([]string{line}, 0, col)
+		return p.GetSuggestions(context.Background(), []string{line}, 0, col, AutocompleteSuggestionOptions{Force: true})
 	}
-	return p.GetSuggestions([]string{line}, 0, col)
+	return p.GetSuggestions(context.Background(), []string{line}, 0, col, AutocompleteSuggestionOptions{})
 }
 func requireAutocomplete(t *testing.T, p *CombinedProvider, line string, col int, force bool) *AutocompleteSuggestions {
 	t.Helper()
@@ -100,6 +101,10 @@ func newAutocompleteFixture(t *testing.T, withFD bool) (root, base, outside stri
 	fd := ""
 	if withFD {
 		fd = requireFDForTest(t)
+		// fd reads the user's git ignore rules from these.
+		t.Setenv("HOME", t.TempDir())
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
 	}
 	return root, base, outside, NewCombinedProvider(nil, base, fd)
 }
@@ -190,6 +195,12 @@ func TestUpstreamAutocompleteFD(t *testing.T) {
 		{name: "returns all files and folders for empty @ query", tree: autocompleteTree{dirs: []string{"src"}, files: map[string]string{"README.md": "readme"}}, line: "@", equal: []string{"@README.md", "@src/"}},
 		// .upstream/v0.87.1/packages/tui/test/autocomplete.test.ts:223
 		{name: "matches file with extension in query", tree: autocompleteTree{files: map[string]string{"file.txt": "content"}}, line: "@file.txt", include: []string{"@file.txt"}},
+		// packages/tui/test/autocomplete.test.ts "matches regex metacharacters in queries literally" (#10972, Pi 612a172e6e)
+		{name: "matches regex metacharacters after a path separator literally (bracket)", tree: autocompleteTree{files: map[string]string{"pages/[id].tsx": "x", "pages/index.tsx": "x", "pages/(group).ts": "x"}}, line: "@pages/[", equal: []string{"@pages/[id].tsx"}},
+		// packages/tui/test/autocomplete.test.ts "matches regex metacharacters in queries literally" (#10972, Pi 612a172e6e)
+		{name: "matches regex metacharacters after a path separator literally (parenthesis)", tree: autocompleteTree{files: map[string]string{"pages/[id].tsx": "x", "pages/index.tsx": "x", "pages/(group).ts": "x"}}, line: "@pages/(", equal: []string{"@pages/(group).ts"}},
+		// packages/tui/test/autocomplete.test.ts "matches regex metacharacters in queries literally" (#10972, Pi 612a172e6e)
+		{name: "matches regex metacharacters in a single-segment query literally", tree: autocompleteTree{files: map[string]string{"pages/[id].tsx": "x", "pages/index.tsx": "x", "pages/(group).ts": "x"}}, line: "@[id", equal: []string{"@pages/[id].tsx"}},
 		// .upstream/v0.87.1/packages/tui/test/autocomplete.test.ts:238
 		{name: "filters are case insensitive", tree: autocompleteTree{dirs: []string{"src"}, files: map[string]string{"README.md": "readme"}}, line: "@re", equal: []string{"@README.md"}},
 		// .upstream/v0.87.1/packages/tui/test/autocomplete.test.ts:254

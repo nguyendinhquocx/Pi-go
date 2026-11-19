@@ -22,7 +22,7 @@ func newAsyncEditorProbe(t *testing.T, provider *AsyncAutocompleteProvider) *asy
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
 	var workers sync.WaitGroup
-	p := &asyncEditorProbe{editor: NewEditor(), tasks: make(chan func())}
+	p := &asyncEditorProbe{editor: NewEditor(), tasks: make(chan func(), 64)}
 	schedule := func(fn func()) {
 		select {
 		case p.tasks <- fn:
@@ -107,7 +107,8 @@ func TestForcedAutocompleteQueryDoesNotHoldInput(t *testing.T) {
 		p := newAsyncEditorProbe(t, provider)
 		p.editor.HandleInput("x")
 		p.editor.HandleInput("\t")
-		synctest.Wait()
+		// The forced request starts at the end of the read (Pi's Promise job), which the probe's task queue stands in for.
+		p.drain()
 		select {
 		case <-entered:
 		default:
@@ -173,4 +174,38 @@ func TestAsyncAutocompleteProviderErrorIsVisible(t *testing.T) {
 			t.Fatalf("errors=%v", p.errors)
 		}
 	})
+}
+
+// Pi editor.ts:2289-2299 asks the provider's optional shouldTriggerFileCompletion before a forced (Tab) request, with the editor lines and cursor, and starts no request when it returns false.
+func TestForcedAutocompleteAsksShouldTriggerFileCompletion(t *testing.T) {
+	for _, allow := range []bool{false, true} {
+		synctest.Test(t, func(t *testing.T) {
+			var queried []bool
+			var asked [][3]any
+			provider := &AsyncAutocompleteProvider{
+				GetSuggestions: func(_ context.Context, _ []string, _, _ int, force bool) (*AutocompleteSuggestions, error) {
+					queried = append(queried, force)
+					return nil, nil
+				},
+				ShouldTriggerFileCompletion: func(_ context.Context, lines []string, line, col int) (bool, error) {
+					asked = append(asked, [3]any{strings.Join(lines, "\n"), line, col})
+					return allow, nil
+				},
+			}
+			p := newAsyncEditorProbe(t, provider)
+			p.editor.HandleInput("src")
+			p.drain()
+			p.editor.HandleInput("\t")
+			p.drain()
+			if len(asked) != 1 || asked[0] != [3]any{"src", 0, 3} {
+				t.Fatalf("allow=%t: shouldTriggerFileCompletion calls=%v, want one with (src, 0, 3)", allow, asked)
+			}
+			if allow && (len(queried) != 1 || !queried[0]) {
+				t.Fatalf("allowed forced request queried=%v, want one forced query", queried)
+			}
+			if !allow && len(queried) != 0 {
+				t.Fatalf("rejected forced request still queried the provider: %v", queried)
+			}
+		})
+	}
 }

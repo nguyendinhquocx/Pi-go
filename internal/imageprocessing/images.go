@@ -6,8 +6,8 @@
 // Go standard library plus golang.org/x/image in place of Photon:
 //  1. Decode + apply EXIF orientation once.
 //  2. If needed, resize to fit within 2000x2000.
-//  3. Try PNG first, then JPEG quality steps until the base64 payload fits
-//     under 4.5 MB.
+//  3. Try the smaller of PNG and JPEG at the configured quality, then lower
+//     JPEG quality steps, until the base64 payload fits under 4.5 MB.
 //  4. If still too large, shrink dimensions by 25% and retry.
 package imageprocessing
 
@@ -19,20 +19,17 @@ import (
 	"fmt"
 	"image"
 	"image/draw"
-	_ "image/gif" // decoder for the GIF entry of the supported-format allowlist
-	"image/jpeg"  // decoder for JPEG plus the JPEG re-encoder
-	"image/png"   // decoder for PNG plus the PNG re-encoder
+	"io"
 	"math"
 	"os"
 	"slices"
 	"strings"
 
-	_ "golang.org/x/image/bmp" // decoder for the BMP entry of the supported-format allowlist
-	xdraw "golang.org/x/image/draw"
-	_ "golang.org/x/image/webp" // decoder for the WebP entry of the supported-format allowlist
-
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/nodebase64"
+	"github.com/MichaelKinsy/PiG/internal/photonimage"
 )
 
 const (
@@ -47,9 +44,11 @@ var ErrImageTooLarge = errors.New("image: could not be resized below inline imag
 // is unsupported and convertImageBytesToPng could not re-encode it.
 var errPNGConversionFailed = errors.New("image: could not convert to png")
 
-type preparedImageResult struct {
-	Data           []byte
-	MIME           string
+// ResizedImage is upstream's ResizedImage (image-resize-core.ts:9). Data is the image's base64 text, as upstream's `data`;
+// Bytes returns the decoded image.
+type ResizedImage struct {
+	Data           string
+	MimeType       string
 	OriginalWidth  int
 	OriginalHeight int
 	Width          int
@@ -75,7 +74,7 @@ func NormalizeToolResultImagesWithOptions(result agent.AgentToolResult, autoResi
 			}
 			continue
 		}
-		processed, mime, hint, err := ProcessImage(DecodeNodeBase64(image.Data), image.MimeType, autoResize, options)
+		processed, mime, hint, err := ProcessImage(nodebase64.Decode(image.Data), image.MimeType, autoResize, options)
 		data := base64.StdEncoding.EncodeToString(processed)
 		if err != nil || (data == image.Data && mime == image.MimeType && hint == "") {
 			if normalized != nil {
@@ -114,14 +113,23 @@ func convertToolResultImageOnly(decoded []byte, declaredMIME string) ([]byte, st
 	return png, "image/png", imageConversionHint(declaredMIME, "image/png"), nil
 }
 
+// Bytes returns the image Data encodes. Data is always the base64 text this package produced, so it decodes.
+func (r ResizedImage) Bytes() []byte {
+	decoded, err := base64.StdEncoding.DecodeString(r.Data)
+	if err != nil {
+		return nil
+	}
+	return decoded
+}
+
 // ResizeImageForLLM applies the upstream CLI image policy and returns the
 // processed bytes plus the resulting MIME type.
 func ResizeImageForLLM(in []byte) ([]byte, string, error) {
-	result, err := prepareImageForLLM(in, nil)
+	result, data, err := fitImage(in, mimeForFormat(detectFormat(in)), nil)
 	if err != nil {
 		return nil, "", err
 	}
-	return result.Data, result.MIME, nil
+	return data, result.MimeType, nil
 }
 
 // PrepareCLIImageAttachment processes one CLI image file into the attached
@@ -144,14 +152,11 @@ func ProcessImage(in []byte, inputMIME string, autoResize bool, options *ai.Mode
 	if !autoResize {
 		return normalized, mime, conversionHint, nil
 	}
-	result, err := prepareImageForLLM(normalized, options)
+	result, data, err := fitImage(normalized, mime, options)
 	if err != nil {
 		return nil, "", "", errors.New("[Image omitted: could not be resized below the inline image size limit.]")
 	}
-	if !result.WasResized {
-		result.MIME = mime
-	}
-	return result.Data, result.MIME, joinImageHints(imageConversionHint(inputMIME, result.MIME), formatDimensionNote(result)), nil
+	return data, result.MimeType, joinImageHints(imageConversionHint(inputMIME, result.MimeType), formatDimensionNote(result)), nil
 }
 
 // imageConversionHint mirrors upstream image-process.ts conversionHint: it
@@ -173,7 +178,7 @@ func imageConversionHint(inputMIME, outputMIME string) string {
 // baseMimeType.
 func baseImageMIME(mime string) string {
 	base, _, _ := strings.Cut(mime, ";")
-	return strings.ToLower(strings.TrimSpace(base))
+	return jsstring.ToLower(jsstring.Trim(base))
 }
 
 // normalizeSupportedImageMIME mirrors upstream normalizeSupportedImageMimeType:
@@ -291,24 +296,37 @@ func readUint32LE(buffer []byte, offset int) int {
 // looks only at a file's first 4100 bytes.
 const ImageTypeSniffBytes = 4100
 
-// DetectSupportedImageMimeTypeFromFile reads the upstream sniff window from a
-// file and returns the supported still-image MIME type, or "" when unsupported.
-func DetectSupportedImageMimeTypeFromFile(filePath string) string {
+// DetectSupportedImageMimeTypeFromFile is upstream detectSupportedImageMimeTypeFromFile (utils/mime.ts:25): it reads the sniff window from the start of a file and returns the supported still-image MIME type, or "" when unsupported or empty. A file that cannot be opened or read is the error.
+func DetectSupportedImageMimeTypeFromFile(filePath string) (string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	defer func() { _ = f.Close() }()
 
 	buf := make([]byte, ImageTypeSniffBytes)
-	n, err := f.Read(buf)
-	if err != nil || n == 0 {
-		return ""
+	n, err := io.ReadFull(f, buf)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return "", err
 	}
-	return DetectSupportedImageMimeType(buf[:n])
+	return DetectSupportedImageMimeType(buf[:n]), nil
 }
 
-func prepareImageForLLM(in []byte, options *ai.ModelImageResizeOptions) (preparedImageResult, error) {
+// ResizeImage fits an image within the option limits and the encoded size limit, as upstream resizeImage
+// (image-resize.ts:85) does. It reports an error where upstream returns null. An image already within every limit
+// returns the input bytes under the declared mimeType, or image/png when none is declared (image-resize-core.ts:80).
+func ResizeImage(in []byte, mimeType string, options *ai.ModelImageResizeOptions) (ResizedImage, error) {
+	result, data, err := fitImage(in, mimeType, options)
+	if err != nil {
+		return ResizedImage{}, err
+	}
+	result.Data = base64.StdEncoding.EncodeToString(data)
+	return result, nil
+}
+
+// fitImage is ResizeImage without the base64 encoding: it returns the image bytes beside a ResizedImage whose Data is
+// empty, so the byte-level callers do not encode and decode the whole image once more.
+func fitImage(in []byte, mimeType string, options *ai.ModelImageResizeOptions) (ResizedImage, []byte, error) {
 	limits := ai.ModelImageResizeOptions{MaxWidth: MaxLongestSide, MaxHeight: MaxLongestSide, MaxBytes: MaxEncodedBytes, JPEGQuality: JPEGQuality}
 	if options != nil {
 		if options.MaxWidth != 0 {
@@ -325,32 +343,36 @@ func prepareImageForLLM(in []byte, options *ai.ModelImageResizeOptions) (prepare
 		}
 	}
 	if len(in) == 0 {
-		return preparedImageResult{}, errors.New("image: empty input")
+		return ResizedImage{}, nil, errors.New("image: empty input")
 	}
 
 	src, err := decodeAutoOriented(in)
 	if err != nil {
-		return preparedImageResult{}, fmt.Errorf("image: decode: %w", err)
+		return ResizedImage{}, nil, fmt.Errorf("image: decode: %w", err)
 	}
 	bounds := src.Bounds()
 	originalWidth, originalHeight := bounds.Dx(), bounds.Dy()
-	srcFormat := detectFormat(in)
-	srcMime := mimeForFormat(srcFormat)
+	if mimeType == "" {
+		mimeType = "image/png"
+	}
 	inputBase64Size := encodedSizeBase64(in)
 
-	if originalWidth <= limits.MaxWidth && originalHeight <= limits.MaxHeight && inputBase64Size < limits.MaxBytes && srcFormat != "bmp" {
-		return preparedImageResult{
-			Data:           in,
-			MIME:           srcMime,
+	if originalWidth <= limits.MaxWidth && originalHeight <= limits.MaxHeight && inputBase64Size < limits.MaxBytes {
+		return ResizedImage{
+			MimeType:       mimeType,
 			OriginalWidth:  originalWidth,
 			OriginalHeight: originalHeight,
 			Width:          originalWidth,
 			Height:         originalHeight,
 			WasResized:     false,
-		}, nil
+		}, in, nil
 	}
 
 	currentWidth, currentHeight := fitWithinBounds(originalWidth, originalHeight, limits.MaxWidth, limits.MaxHeight)
+	// A side that rounds to zero (a very wide or tall image) reaches Photon's resize as 0, which throws, and resizeImageInProcess returns null (image-resize-core.ts:107-125, :156).
+	if currentWidth < 1 || currentHeight < 1 {
+		return ResizedImage{}, nil, ErrImageTooLarge
+	}
 	qualitySteps := []int{limits.JPEGQuality}
 	for _, quality := range []int{85, 70, 55, 40} {
 		if quality != limits.JPEGQuality {
@@ -360,32 +382,31 @@ func prepareImageForLLM(in []byte, options *ai.ModelImageResizeOptions) (prepare
 
 	for {
 		resized := resizeImage(src, currentWidth, currentHeight)
-		candidates, err := encodeCandidates(resized, qualitySteps)
+		candidate, fits, err := firstFittingCandidate(resized, qualitySteps, limits.MaxBytes)
 		if err != nil {
-			return preparedImageResult{}, err
+			return ResizedImage{}, nil, err
 		}
-		for _, candidate := range candidates {
-			if candidate.EncodedSize < limits.MaxBytes {
-				return preparedImageResult{
-					Data:           candidate.Data,
-					MIME:           candidate.MIME,
-					OriginalWidth:  originalWidth,
-					OriginalHeight: originalHeight,
-					Width:          currentWidth,
-					Height:         currentHeight,
-					WasResized:     true,
-				}, nil
-			}
+		if fits {
+			return ResizedImage{
+				MimeType:       candidate.MIME,
+				OriginalWidth:  originalWidth,
+				OriginalHeight: originalHeight,
+				Width:          currentWidth,
+				Height:         currentHeight,
+				WasResized:     true,
+			}, candidate.Data, nil
 		}
 		if currentWidth == 1 && currentHeight == 1 {
 			break
 		}
 		nextWidth := currentWidth
 		if nextWidth > 1 {
+			//portlint:allow numbers currentWidth > 1, so the product is positive and finite and int() truncation is Math.floor (image-resize-core.ts:156)
 			nextWidth = max(1, int(float64(currentWidth)*0.75))
 		}
 		nextHeight := currentHeight
 		if nextHeight > 1 {
+			//portlint:allow numbers currentHeight > 1, so the product is positive and finite and int() truncation is Math.floor (image-resize-core.ts:157)
 			nextHeight = max(1, int(float64(currentHeight)*0.75))
 		}
 		if nextWidth == currentWidth && nextHeight == currentHeight {
@@ -394,7 +415,7 @@ func prepareImageForLLM(in []byte, options *ai.ModelImageResizeOptions) (prepare
 		currentWidth, currentHeight = nextWidth, nextHeight
 	}
 
-	return preparedImageResult{}, ErrImageTooLarge
+	return ResizedImage{}, nil, ErrImageTooLarge
 }
 
 // exifOrientation is the EXIF orientation tag value, 1..8. Upstream
@@ -414,9 +435,8 @@ const (
 )
 
 // decodeAutoOriented decodes an image with DecodeImage and applies its EXIF orientation tag,
-// mirroring upstream Photon decode plus applyExifOrientation. Only the formats
-// whose decoders this package links are decodable; see
-// DetectSupportedImageMimeType.
+// mirroring upstream Photon decode plus applyExifOrientation. What decodes is
+// what photonimage.Decode decodes: PNG, JPEG, GIF, WebP, BMP and TIFF.
 func decodeAutoOriented(data []byte) (image.Image, error) {
 	img, err := DecodeImage(data)
 	if err != nil {
@@ -581,8 +601,8 @@ func fixOrientation(img image.Image, o exifOrientation) image.Image {
 
 // remapPixels builds a dstW×dstH NRGBA image whose pixel (x,y) is the source
 // pixel named by src, expressed in source coordinates relative to the source
-// bounds origin. NRGBA output keeps alpha non-premultiplied so imageHasAlpha
-// reads the same channel the encoders write.
+// bounds origin. NRGBA output keeps alpha non-premultiplied, the channel
+// the encoders write.
 func remapPixels(img image.Image, dstW, dstH int, src func(x, y int) (int, int)) *image.NRGBA {
 	srcNRGBA := toNRGBA(img)
 	dst := image.NewNRGBA(image.Rect(0, 0, dstW, dstH))
@@ -609,12 +629,10 @@ func toNRGBA(img image.Image) *image.NRGBA {
 	return out
 }
 
-// resizeImage scales img to width×height with the CatmullRom kernel, the
-// highest-quality resampler in golang.org/x/image/draw.
+// resizeImage scales img to width×height as Photon's resize does with SamplingFilter.Lanczos3 (image-resize-core.ts tryEncodings), with
+// Photon's own pixels (photonimage.ResizeLanczos3).
 func resizeImage(img image.Image, width, height int) *image.NRGBA {
-	dst := image.NewNRGBA(image.Rect(0, 0, width, height))
-	xdraw.CatmullRom.Scale(dst, dst.Bounds(), img, img.Bounds(), xdraw.Src, nil)
-	return dst
+	return photonimage.ResizeLanczos3(toNRGBA(img), width, height)
 }
 
 type encodedCandidate struct {
@@ -625,61 +643,47 @@ type encodedCandidate struct {
 
 var pngSignature = []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}
 
-func imageHasAlpha(img image.Image) bool {
-	switch m := img.(type) {
-	case *image.RGBA:
-		for i := 3; i < len(m.Pix); i += 4 {
-			if m.Pix[i] != 0xff {
-				return true
-			}
-		}
-		return false
-	case *image.NRGBA:
-		for i := 3; i < len(m.Pix); i += 4 {
-			if m.Pix[i] != 0xff {
-				return true
-			}
-		}
-		return false
-	case *image.RGBA64, *image.NRGBA64:
-		return true
-	}
-	bounds := img.Bounds()
-	for y := bounds.Min.Y; y < bounds.Max.Y; y += 16 {
-		for x := bounds.Min.X; x < bounds.Max.X; x += 16 {
-			_, _, _, a := img.At(x, y).RGBA()
-			if a < 0xffff {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func encodeCandidates(img image.Image, jpegQualities []int) ([]encodedCandidate, error) {
+// firstFittingCandidate encodes img as PNG and as JPEG at the configured quality (jpegQualities[0]) and returns the first of these two
+// whose base64 size is below maxBytes, the smaller of the two first; only when neither fits does it try the lower JPEG qualities, in
+// order (image-resize-core.ts tryEncodings, e7a0df27, #11551). Later encodings are never made once one fits, because the rest only
+// cost time (a JPEG encode of a large image is the most expensive step of a resize). A failed JPEG encode is skipped; a failed PNG
+// encode is an error.
+func firstFittingCandidate(img image.Image, jpegQualities []int, maxBytes int) (encodedCandidate, bool, error) {
 	pngBytes, err := encodePNG(img)
 	if err != nil {
-		return nil, fmt.Errorf("image: encode png: %w", err)
+		return encodedCandidate{}, false, fmt.Errorf("image: encode png: %w", err)
 	}
-	candidates := []encodedCandidate{{
-		Data:        pngBytes,
-		EncodedSize: encodedSizeBase64(pngBytes),
-		MIME:        "image/png",
-	}}
-	for _, quality := range jpegQualities {
+	pngCandidate := encodedCandidate{Data: pngBytes, EncodedSize: encodedSizeBase64(pngBytes), MIME: "image/png"}
+	preferred := []encodedCandidate{pngCandidate}
+	if len(jpegQualities) > 0 {
+		if jpegBytes, err := encodeJPEG(img, jpegQualities[0]); err == nil {
+			jpegCandidate := encodedCandidate{Data: jpegBytes, EncodedSize: encodedSizeBase64(jpegBytes), MIME: "image/jpeg"}
+			if jpegCandidate.EncodedSize < pngCandidate.EncodedSize {
+				preferred = []encodedCandidate{jpegCandidate, pngCandidate}
+			} else {
+				preferred = append(preferred, jpegCandidate)
+			}
+		}
+	}
+	for _, candidate := range preferred {
+		if candidate.EncodedSize < maxBytes {
+			return candidate, true, nil
+		}
+	}
+	for _, quality := range jpegQualities[min(1, len(jpegQualities)):] {
 		jpegBytes, err := encodeJPEG(img, quality)
 		if err != nil {
 			continue
 		}
-		candidates = append(candidates, encodedCandidate{
-			Data:        jpegBytes,
-			EncodedSize: encodedSizeBase64(jpegBytes),
-			MIME:        "image/jpeg",
-		})
+		candidate := encodedCandidate{Data: jpegBytes, EncodedSize: encodedSizeBase64(jpegBytes), MIME: "image/jpeg"}
+		if candidate.EncodedSize < maxBytes {
+			return candidate, true, nil
+		}
 	}
-	return candidates, nil
+	return encodedCandidate{}, false, nil
 }
 
+// fitWithinBounds is the initial target size of image-resize-core.ts:105-116; a side may round to zero.
 func fitWithinBounds(width, height, maxWidth, maxHeight int) (int, int) {
 	targetWidth, targetHeight := width, height
 	if targetWidth > maxWidth {
@@ -690,37 +694,32 @@ func fitWithinBounds(width, height, maxWidth, maxHeight int) (int, int) {
 		targetWidth = int(math.Round(float64(targetWidth) * float64(maxHeight) / float64(targetHeight)))
 		targetHeight = maxHeight
 	}
-	return max(1, targetWidth), max(1, targetHeight)
+	return targetWidth, targetHeight
 }
 
-func formatDimensionNote(result preparedImageResult) string {
+func formatDimensionNote(result ResizedImage) string {
 	if !result.WasResized {
 		return ""
 	}
 	scale := float64(result.OriginalWidth) / float64(result.Width)
-	return fmt.Sprintf("[Image: original %dx%d, displayed at %dx%d. Multiply coordinates by %.2f to map to original image.]",
-		result.OriginalWidth, result.OriginalHeight, result.Width, result.Height, scale)
+	return fmt.Sprintf("[Image: original %dx%d, displayed at %dx%d. Multiply coordinates by %s to map to original image.]",
+		result.OriginalWidth, result.OriginalHeight, result.Width, result.Height, jsstring.ToFixed(scale, 2))
 }
 
 func encodedSizeBase64(data []byte) int {
 	return base64.StdEncoding.EncodedLen(len(data))
 }
 
+// encodePNG is the PNG Photon's `get_bytes()` writes for img (see photonimage.EncodePNG): its size decides whether the PNG or the JPEG
+// candidate of a resize is the smaller one, so it must be Photon's.
 func encodePNG(img image.Image) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := png.Encoder{CompressionLevel: png.DefaultCompression}
-	if err := enc.Encode(&buf, img); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return photonimage.EncodePNG(toNRGBA(img))
 }
 
+// encodeJPEG is the JPEG Photon's `get_bytes_jpeg(quality)` writes for img, alpha channel dropped (see photonimage.EncodeJPEG): its size
+// decides whether the PNG or the JPEG candidate of a resize is the smaller one, so it must be Photon's. quality is Photon's `u8`.
 func encodeJPEG(img image.Image, quality int) ([]byte, error) {
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return photonimage.EncodeJPEG(toNRGBA(img), uint8(quality))
 }
 
 // detectFormat sniffs the source format from magic bytes. Returns

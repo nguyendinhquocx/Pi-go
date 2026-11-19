@@ -111,10 +111,10 @@ func fakeModel() *ai.Model {
 }
 
 // newTestServicesWithSettings is newTestServices over in-memory settings, as the upstream tests build with SettingsManager.inMemory(settings). Settings applied to Services with ApplyOverrides do not survive the reload createAgentSession runs.
-func newTestServicesWithSettings(t *testing.T, settings icodingagent.Settings) *Services {
+func newTestServicesWithSettings(t *testing.T, settings icodingagent.Settings) *AgentSessionServices {
 	t.Helper()
 	t.Setenv("PIG_HOME", t.TempDir())
-	srv, err := NewServices(ServicesOptions{CWD: t.TempDir(), SettingsManager: NewInMemorySettingsManager(settings)})
+	srv, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: t.TempDir(), SettingsManager: NewInMemorySettingsManager(settings)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,11 +122,11 @@ func newTestServicesWithSettings(t *testing.T, settings icodingagent.Settings) *
 	return srv
 }
 
-func newTestServices(t *testing.T) *Services {
+func newTestServices(t *testing.T) *AgentSessionServices {
 	t.Helper()
 	tmp := t.TempDir()
 	t.Setenv("PIG_HOME", tmp)
-	srv, err := NewServices(ServicesOptions{CWD: t.TempDir()})
+	srv, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func newTestServices(t *testing.T) *Services {
 	return srv
 }
 
-func sessionManagerFixture(t *testing.T) (*Services, *ai.Model, string, string) {
+func sessionManagerFixture(t *testing.T) (*AgentSessionServices, *ai.Model, string, string) {
 	t.Helper()
 	root := t.TempDir()
 	cwd, agentDir := filepath.Join(root, "project"), filepath.Join(root, "agent")
@@ -147,7 +147,7 @@ func sessionManagerFixture(t *testing.T) (*Services, *ai.Model, string, string) 
 	t.Setenv("PIG_HOME", filepath.Join(root, "ambient"))
 	t.Setenv("PIG_CODING_AGENT_DIR", "")
 	t.Setenv("PI_CODING_AGENT_DIR", "")
-	services, err := NewServices(ServicesOptions{CWD: cwd, AgentDir: agentDir})
+	services, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: cwd, AgentDir: agentDir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,9 +159,9 @@ func sessionManagerFixture(t *testing.T) (*Services, *ai.Model, string, string) 
 	return services, model, cwd, agentDir
 }
 
-func createSessionWithServicesOptions(t *testing.T, serviceOptions ServicesOptions, options SessionOptions) *Session {
+func createSessionWithServicesOptions(t *testing.T, serviceOptions CreateAgentSessionServicesOptions, options SessionOptions) *Session {
 	t.Helper()
-	services, err := NewServices(serviceOptions)
+	services, err := CreateAgentSessionServices(serviceOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func executeSessionBash(t *testing.T, session *Session, command string) string {
 // summarize. Without it, the 0.79.10 empty-compaction guard (PrepareCompaction
 // returns nil when nothing is left to summarize) refuses to compact these
 // sessions and the compaction never runs.
-func newTestServicesSmallKeep(t *testing.T) *Services {
+func newTestServicesSmallKeep(t *testing.T) *AgentSessionServices {
 	t.Helper()
 	tmp := t.TempDir()
 	t.Setenv("PIG_HOME", tmp)
@@ -229,7 +229,7 @@ func newTestServicesSmallKeep(t *testing.T) *Services {
 		[]byte(`{"compaction":{"keepRecentTokens":1}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := NewServices(ServicesOptions{CWD: t.TempDir(), AgentDir: agentDir})
+	srv, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: t.TempDir(), AgentDir: agentDir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,20 +402,18 @@ func TestNewSessionAllowedToolsFiltersDefaultsAndExtras(t *testing.T) {
 	}
 }
 
-func TestNewSessionActiveBuiltinToolsLimitsBuiltinsKeepsExtras(t *testing.T) {
+func TestNewSessionInitialActiveToolNamesLimitsBuiltinsKeepsExtras(t *testing.T) {
 	svcs := newTestServices(t)
 	extra := &fakeTool{name: "test-tool-ext"}
 
 	// Mirrors upstream defaultActiveToolNames (sdk.ts:244): only
 	// read/bash/edit/write are active built-ins by default; grep/find/ls
 	// are registered but inactive. Extension/caller tools are NOT gated by
-	// ActiveBuiltinTools (only AllowedTools gates those).
+	// InitialActiveToolNames (only AllowedTools gates those).
 	sess, err := NewSession(svcs, SessionOptions{
-		Model: fakeModel(),
-		Tools: []agent.AgentTool{extra},
-		ActiveBuiltinTools: map[string]struct{}{
-			"read": {}, "bash": {}, "edit": {}, "write": {},
-		},
+		Model:                  fakeModel(),
+		Tools:                  []agent.AgentTool{extra},
+		InitialActiveToolNames: []string{"read", "bash", "edit", "write"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -448,10 +446,10 @@ func TestNewSessionPowerShellIsOptIn(t *testing.T) {
 	}{
 		// .upstream/v0.87.1/packages/coding-agent/src/core/sdk.ts:258 defines the SDK default, not all registered builtins.
 		{"default", SessionOptions{}, []string{"read", "bash", "edit", "write"}},
-		{"cli default active set", SessionOptions{ActiveBuiltinTools: map[string]struct{}{"read": {}, "bash": {}, "edit": {}, "write": {}}},
+		{"cli default active set", SessionOptions{InitialActiveToolNames: []string{"read", "bash", "edit", "write"}},
 			[]string{"read", "bash", "edit", "write"}},
 		{"allowlist", SessionOptions{AllowedTools: map[string]struct{}{"powershell": {}, "bash": {}}}, []string{"bash", "powershell"}},
-		{"active set", SessionOptions{ActiveBuiltinTools: map[string]struct{}{"powershell": {}, "read": {}}}, []string{"read", "powershell"}},
+		{"active set", SessionOptions{InitialActiveToolNames: []string{"powershell", "read"}}, []string{"powershell", "read"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.opts.Model = fakeModel()
@@ -592,6 +590,7 @@ func TestSessionAgentEndEventIncludesWillRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_ = sess.Events()
 	defer func() { _ = sess.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -652,27 +651,18 @@ func fakeModelWithProvider(prov ai.Provider) *ai.Model {
 	}
 }
 
-// TestSendDeadlocksWithoutEventDrainThenUnblocks reproduces the print-mode
-// deadlock: a turn that emits more events than the rawEvents+events buffers hold
-// (2×64) fills forwardAgentEvents' outbound channel; with no Events() consumer it
-// blocks, the agent's emit() blocks, and Send() never returns. Print mode hit this
-// on long findings output. Draining Events() (as print mode now does) unblocks it.
-func TestSendDeadlocksWithoutEventDrainThenUnblocks(t *testing.T) {
-	partial := sessionTestMessage("fake", "", ai.StopReasonPending, "")
-	evs := []ai.AssistantMessageEvent{ai.StartEvent{Partial: partial}}
-	for index := range 300 {
-		partial = sessionTestMessage("fake", strings.Repeat("x", index+1), ai.StopReasonPending, "")
-		evs = append(evs, ai.TextDeltaEvent{ContentIndex: 0, Delta: "x", Partial: partial})
-	}
-	final := sessionTestMessage("fake", strings.Repeat("x", 300), ai.StopReasonStop, "")
-	evs = append(evs, ai.DoneEvent{Reason: ai.StopReasonStop, Message: final})
-	prov := staticProviderForSessionTests{events: evs}
+// TestSendBlocksWhenEventsConsumerStopsReadingThenUnblocks pins the backpressure a subscribed consumer keeps: once Events was called, a turn that emits
+// more events than the rawEvents+events buffers hold (2×64) blocks Send until the consumer reads, as a slow synchronous Pi listener does. A Session whose
+// Events was never called does not block (TestRuntimeSessionWithoutEventsReaderSendReturns).
+func TestSendBlocksWhenEventsConsumerStopsReadingThenUnblocks(t *testing.T) {
+	prov := longTurnProvider(300)
 	svcs := newTestServices(t)
 	sess, err := NewSession(svcs, SessionOptions{Model: fakeModelWithProvider(prov)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = sess.Close() }()
+	events := sess.Events()
 
 	ctx := t.Context()
 
@@ -682,16 +672,16 @@ func TestSendDeadlocksWithoutEventDrainThenUnblocks(t *testing.T) {
 		done <- e
 	}()
 
-	// Without a drainer, Send must block: this is the deadlock condition.
+	// A subscribed consumer that reads nothing makes Send wait.
 	select {
 	case <-done:
-		t.Fatal("Send completed without draining events; the deadlock scenario was not reproduced")
+		t.Fatal("Send completed although the Events consumer read nothing")
 	case <-time.After(500 * time.Millisecond):
 	}
 
-	// Draining Events() must unblock Send and let the turn finish.
+	// Reading Events must unblock Send and let the turn finish.
 	go func() {
-		for range sess.Events() { //nolint:revive // intentional drain
+		for range events { //nolint:revive // intentional drain
 		}
 	}()
 	select {
@@ -851,7 +841,7 @@ func TestPersistenceFollowsReplaceInner(t *testing.T) {
 	defer func() { _ = sess.Close() }()
 
 	oldInner := sess.Inner()
-	oldEntriesBefore := len(oldInner.Entries())
+	oldEntriesBefore := len(oldInner.GetEntries())
 
 	// Swap in a fresh empty session, exactly as /new, /clone, and /resume do.
 	sm := newSessionManagerForDir(svcs, "")
@@ -866,12 +856,12 @@ func TestPersistenceFollowsReplaceInner(t *testing.T) {
 	_, _ = sess.Send(context.Background(), "after-swap-prompt")
 
 	newMsgs := 0
-	for _, e := range newInner.Entries() {
-		if e.Base.Type == "message" {
+	for _, e := range newInner.GetEntries() {
+		if e.Base().Type == "message" {
 			newMsgs++
 		}
 	}
-	oldEntriesAfter := len(oldInner.Entries())
+	oldEntriesAfter := len(oldInner.GetEntries())
 	if newMsgs == 0 {
 		t.Fatal("persistence did not follow ReplaceInner: post-swap turn was orphaned to the old session (new session has 0 message entries)")
 	}
@@ -942,7 +932,7 @@ func (c *blockingCompactionCompleter) CompleteSimple(ctx context.Context, _ *ai.
 
 // buildSessionWithMessages creates a session and injects n plain user/assistant
 // message pairs directly into the inner JSONL (no LLM call).
-func buildSessionWithMessages(t *testing.T, svcs *Services, n int) *Session {
+func buildSessionWithMessages(t *testing.T, svcs *AgentSessionServices, n int) *Session {
 	t.Helper()
 	sess, err := NewSession(svcs, SessionOptions{Model: fakeModel()})
 	if err != nil {
@@ -998,24 +988,25 @@ func drainEvents(t *testing.T, sess *Session) []agent.AgentEvent {
 func TestCompact_Smoke(t *testing.T) {
 	svcs := newTestServicesSmallKeep(t)
 	sess := buildSessionWithMessages(t, svcs, 3)
+	_ = sess.Events()
 	defer func() { _ = sess.Close() }()
 
 	sess.completer = &fakeCompleter{summary: "summary text"}
 
-	if err := sess.Compact(context.Background(), ""); err != nil {
+	if _, err := sess.Compact(context.Background(), ""); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 
 	// Tree should contain a compaction entry.
-	leafID := sess.inner.LeafID()
+	leafID := sess.inner.GetLeafID()
 	if leafID == nil {
 		t.Fatal("leaf is nil after Compact")
 		return
 	}
-	entries := sess.inner.Branch(*leafID)
+	entries := sess.inner.GetBranch(*leafID)
 	haveCompaction := false
 	for _, e := range entries {
-		if e.Base.Type == "compaction" {
+		if e.Base().Type == "compaction" {
 			haveCompaction = true
 		}
 	}
@@ -1057,6 +1048,7 @@ func TestCompact_Smoke(t *testing.T) {
 	}
 }
 
+// Pi: packages/coding-agent/src/core/compaction/compaction.ts:113 (CompactionResult.details); packages/coding-agent/src/core/extensions/types.ts:767 (SessionBeforeCompactEvent.branchEntries); packages/coding-agent/src/core/extensions/types.ts:768 (SessionBeforeCompactEvent.customInstructions); packages/coding-agent/src/core/extensions/types.ts:779 (SessionCompactEvent.compactionEntry).
 func TestCompact_ExtensionOverrideAndLifecycle(t *testing.T) {
 	sess := buildSessionWithMessages(t, newTestServicesSmallKeep(t), 3)
 	defer func() { _ = sess.Close() }()
@@ -1070,7 +1062,7 @@ func TestCompact_ExtensionOverrideAndLifecycle(t *testing.T) {
 			if !ok {
 				t.Fatalf("session_before_compact event = %T", args[0])
 			}
-			prep, ok := event.Preparation.(*codingcompaction.CompactionPreparation)
+			prep, ok := event.Preparation, true
 			if !ok || prep.FirstKeptEntryID == "" {
 				t.Fatalf("compaction preparation = %#v", event.Preparation)
 			}
@@ -1080,11 +1072,11 @@ func TestCompact_ExtensionOverrideAndLifecycle(t *testing.T) {
 			if len(event.BranchEntries) == 0 || event.Signal == nil {
 				t.Fatalf("session_before_compact omitted branch or signal: %#v", event)
 			}
-			return extension.SessionBeforeCompactResult{Compaction: map[string]any{
-				"summary":          "extension summary",
-				"firstKeptEntryId": prep.FirstKeptEntryID,
-				"tokensBefore":     prep.TokensBefore,
-				"details":          map[string]any{"source": "extension"},
+			return extension.SessionBeforeCompactResult{Compaction: &extension.CompactionResult{
+				Summary:          "extension summary",
+				FirstKeptEntryID: prep.FirstKeptEntryID,
+				TokensBefore:     prep.TokensBefore,
+				Details:          map[string]any{"source": "extension"},
 			}}, nil
 		}},
 		"session_compact": {func(args ...any) (any, error) {
@@ -1096,7 +1088,7 @@ func TestCompact_ExtensionOverrideAndLifecycle(t *testing.T) {
 			if !event.FromExtension || event.Reason != "manual" || event.WillRetry {
 				t.Fatalf("session_compact metadata = %#v", event)
 			}
-			if event.CompactionEntry == nil {
+			if event.CompactionEntry.ID == "" {
 				t.Fatal("session_compact omitted persisted entry")
 			}
 			return nil, nil
@@ -1104,7 +1096,7 @@ func TestCompact_ExtensionOverrideAndLifecycle(t *testing.T) {
 	}}
 	sess.ReplaceRunner(inproc.NewRunner([]extension.Extension{ext}, t.TempDir()))
 
-	result, err := sess.CompactResult(context.Background(), "keep decisions")
+	result, err := sess.Compact(context.Background(), "keep decisions")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1125,6 +1117,7 @@ func TestCompact_ExtensionOverrideAndLifecycle(t *testing.T) {
 
 func TestCompact_ExtensionCancellationIsAborted(t *testing.T) {
 	sess := buildSessionWithMessages(t, newTestServicesSmallKeep(t), 3)
+	_ = sess.Events()
 	defer func() { _ = sess.Close() }()
 	fallback := &fakeCompleter{summary: "fallback must not run"}
 	sess.completer = fallback
@@ -1141,7 +1134,7 @@ func TestCompact_ExtensionCancellationIsAborted(t *testing.T) {
 	}}
 	sess.ReplaceRunner(inproc.NewRunner([]extension.Extension{ext}, t.TempDir()))
 
-	_, err := sess.CompactResult(context.Background(), "")
+	_, err := sess.Compact(context.Background(), "")
 	if err == nil || err.Error() != "Compaction cancelled" {
 		t.Fatalf("CompactResult error = %v", err)
 	}
@@ -1170,10 +1163,10 @@ func TestAutoCompaction_ExtensionLifecycleMetadata(t *testing.T) {
 		"session_before_compact": {func(args ...any) (any, error) {
 			event := args[0].(extension.SessionBeforeCompactEvent)
 			beforeReason = event.Reason
-			prep := event.Preparation.(*codingcompaction.CompactionPreparation)
-			return extension.SessionBeforeCompactResult{Compaction: map[string]any{
-				"summary": "auto extension summary", "firstKeptEntryId": prep.FirstKeptEntryID,
-				"tokensBefore": prep.TokensBefore,
+			prep := event.Preparation
+			return extension.SessionBeforeCompactResult{Compaction: &extension.CompactionResult{
+				Summary: "auto extension summary", FirstKeptEntryID: prep.FirstKeptEntryID,
+				TokensBefore: prep.TokensBefore,
 			}}, nil
 		}},
 		"session_compact": {func(args ...any) (any, error) {
@@ -1233,6 +1226,7 @@ func TestSessionNotifyListenersDoesNotAllocate(t *testing.T) {
 
 func TestCompactCancelsSynchronouslyFromStartEvent(t *testing.T) {
 	sess := buildSessionWithMessages(t, newTestServicesSmallKeep(t), 3)
+	_ = sess.Events()
 	defer func() { _ = sess.Close() }()
 	completer := &fakeCompleter{summary: "must not run"}
 	sess.completer = completer
@@ -1244,9 +1238,10 @@ func TestCompactCancelsSynchronouslyFromStartEvent(t *testing.T) {
 	})
 	defer unsubscribe()
 
-	_, err := sess.CompactResult(t.Context(), "")
-	if !errors.Is(err, errCompactionCancelled) {
-		t.Fatalf("CompactResult error = %v, want %v", err, errCompactionCancelled)
+	// The abort arrives before the summary request: Pi's getAuth rejects with the signal's reason, "This operation was aborted".
+	_, err := sess.Compact(t.Context(), "")
+	if !errors.Is(err, errOperationAborted) {
+		t.Fatalf("CompactResult error = %v, want %v", err, errOperationAborted)
 	}
 	if completer.called.Load() {
 		t.Fatal("summarization provider was called, want 0 calls")
@@ -1264,6 +1259,7 @@ func TestCompactCancelsSynchronouslyFromStartEvent(t *testing.T) {
 
 func TestAutoCompactionCancelsSynchronouslyFromStartEvent(t *testing.T) {
 	sess := buildSessionWithMessages(t, newTestServicesSmallKeep(t), 3)
+	_ = sess.Events()
 	defer func() { _ = sess.Close() }()
 	completer := &fakeCompleter{summary: "must not run"}
 	sess.completer = completer
@@ -1320,6 +1316,7 @@ func TestAutoCompactionProviderErrorsAreNotCancellation(t *testing.T) {
 	for _, message := range []string{"Compaction cancelled", "auth failed"} {
 		t.Run(message, func(t *testing.T) {
 			sess := buildSessionWithMessages(t, newTestServicesSmallKeep(t), 3)
+			_ = sess.Events()
 			defer func() { _ = sess.Close() }()
 			sess.completer = &fakeCompleter{err: errors.New(message)}
 
@@ -1367,6 +1364,7 @@ func TestAutoCompactionFailureAlwaysReportsWillRetryFalse(t *testing.T) {
 func TestAutoCompaction_NothingToCompactIsSilent(t *testing.T) {
 	svcs := newTestServices(t)
 	sess := buildSessionWithMessages(t, svcs, 3)
+	_ = sess.Events()
 	defer func() { _ = sess.Close() }()
 
 	fakeComp := &fakeCompleter{summary: "must not be called"}
@@ -1387,6 +1385,7 @@ func TestAutoCompaction_NothingToCompactIsSilent(t *testing.T) {
 func TestAutoCompaction_SuccessEmitsEstimatedTokensAfter(t *testing.T) {
 	svcs := newTestServicesSmallKeep(t)
 	sess := buildSessionWithMessages(t, svcs, 3)
+	_ = sess.Events()
 	defer func() { _ = sess.Close() }()
 
 	sess.completer = &fakeCompleter{summary: "auto summary"}
@@ -1425,7 +1424,7 @@ func TestCompact_ForwardsStreamFn(t *testing.T) {
 		return "streamed summary", nil, nil
 	}
 
-	if err := sess.Compact(context.Background(), ""); err != nil {
+	if _, err := sess.Compact(context.Background(), ""); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 	if streamCalls.Load() == 0 {
@@ -1443,6 +1442,7 @@ func TestCompact_NothingToCompact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_ = sess.Events()
 	defer func() { _ = sess.Close() }()
 	sess.completer = &fakeCompleter{summary: "should not be called"}
 	var failed *extension.SessionCompactFailedEvent
@@ -1454,8 +1454,9 @@ func TestCompact_NothingToCompact(t *testing.T) {
 		}},
 	}}}, t.TempDir()))
 
-	if err := sess.Compact(context.Background(), ""); err != nil {
-		t.Fatalf("Compact: unexpected error: %v", err)
+	// agent-session.ts compact() rejects with "Nothing to compact (session too small)" after emitting compaction_end.
+	if _, err := sess.Compact(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "Nothing to compact") {
+		t.Fatalf("Compact error = %v, want Nothing to compact", err)
 	}
 	if failed == nil || failed.Reason != "manual" || failed.Aborted || !strings.Contains(failed.ErrorMessage, "Nothing to compact") || failed.WillRetry || failed.FromExtension {
 		t.Fatalf("session_compact_failed = %#v", failed)
@@ -1496,7 +1497,7 @@ func TestNavigateTree_NoSummary(t *testing.T) {
 	if _, err := sess.inner.AppendMessage(userMsg); err != nil {
 		t.Fatal(err)
 	}
-	firstLeaf := sess.inner.LeafID()
+	firstLeaf := sess.inner.GetLeafID()
 	if firstLeaf == nil {
 		t.Fatal("leaf is nil after first message")
 		return
@@ -1526,13 +1527,13 @@ func TestNavigateTree_NoSummary(t *testing.T) {
 	// branchPoint is a user-role message entry. Upstream navigateTree sets leaf
 	// to the parent entry, which in a fresh session is the bootstrap
 	// thinking-level audit entry.
-	newLeaf := sess.inner.LeafID()
+	newLeaf := sess.inner.GetLeafID()
 	if newLeaf == nil {
 		t.Fatal("leaf should point at bootstrap audit entry")
 	}
-	entry, ok := sess.inner.EntryByID(*newLeaf)
-	if !ok || entry.Base.Type != "thinking_level_change" {
-		t.Fatalf("leaf entry = %v, want bootstrap thinking-level audit", entry.Base.Type)
+	entry, ok := sess.inner.GetEntry(*newLeaf)
+	if !ok || entry.Base().Type != "thinking_level_change" {
+		t.Fatalf("leaf entry = %v, want bootstrap thinking-level audit", entry.Base().Type)
 	}
 	if res.EditorText != "first" {
 		t.Errorf("EditorText = %q, want %q", res.EditorText, "first")
@@ -1558,7 +1559,7 @@ func TestNavigateTree_WithSummary(t *testing.T) {
 	if _, err := sess.inner.AppendMessage(userMsg); err != nil {
 		t.Fatal(err)
 	}
-	branchPoint := *sess.inner.LeafID()
+	branchPoint := *sess.inner.GetLeafID()
 
 	// Extend the branch.
 	userMsg2 := agent.AgentMessage{
@@ -1582,14 +1583,14 @@ func TestNavigateTree_WithSummary(t *testing.T) {
 	// A branch_summary entry should exist on the CURRENT LEAF'S branch
 	// (root → ... → branch_summary → leaf). Before the 3.2l fix, the entry
 	// was written to the abandoned branch and was invisible after navigation.
-	leaf := sess.inner.LeafID()
+	leaf := sess.inner.GetLeafID()
 	if leaf == nil {
 		t.Fatal("expected non-nil leaf after NavigateTree with Summarize=true")
 	}
-	branch := sess.inner.Branch(*leaf)
+	branch := sess.inner.GetBranch(*leaf)
 	foundOnBranch := false
 	for _, e := range branch {
-		if e.Base.Type == "branch_summary" {
+		if e.Base().Type == "branch_summary" {
 			foundOnBranch = true
 			break
 		}
@@ -1619,7 +1620,7 @@ func TestNavigateTreeRejectsStreamingSession(t *testing.T) {
 	}()
 	<-provider.started
 
-	_, navigateErr := sess.NavigateTree(t.Context(), *sess.inner.LeafID(), NavigateTreeOptions{})
+	_, navigateErr := sess.NavigateTree(t.Context(), *sess.inner.GetLeafID(), NavigateTreeOptions{})
 	if navigateErr == nil || navigateErr.Error() != "Wait for the current response to finish before navigating the session tree." {
 		t.Fatalf("NavigateTree error = %v", navigateErr)
 	}
@@ -1634,15 +1635,16 @@ func TestNavigateTreeRejectsStreamingSession(t *testing.T) {
 func TestCompactAbortsInFlightManualCompactionAndRestarts(t *testing.T) {
 	sess := buildSessionWithMessages(t, newTestServicesSmallKeep(t), 3)
 	defer func() { _ = sess.Close() }()
+	_ = sess.Events()
 	completer := newBlockingCompactionCompleter()
 	sess.completer = completer
-	originalLeafID := *sess.inner.LeafID()
+	originalLeafID := *sess.inner.GetLeafID()
 
 	firstDone := make(chan error, 1)
-	go func() { firstDone <- sess.Compact(t.Context(), "first") }()
+	go func() { _, err := sess.Compact(t.Context(), "first"); firstDone <- err }()
 	<-completer.started
 	secondDone := make(chan error, 1)
-	go func() { secondDone <- sess.Compact(t.Context(), "second") }()
+	go func() { _, err := sess.Compact(t.Context(), "second"); secondDone <- err }()
 
 	if err := <-firstDone; !errors.Is(err, errCompactionCancelled) {
 		close(completer.release)
@@ -1658,9 +1660,10 @@ func TestCompactAbortsInFlightManualCompactionAndRestarts(t *testing.T) {
 func TestCompactAbortsInFlightAutoCompactionAndRestarts(t *testing.T) {
 	sess := buildSessionWithMessages(t, newTestServicesSmallKeep(t), 3)
 	defer func() { _ = sess.Close() }()
+	_ = sess.Events()
 	completer := newBlockingCompactionCompleter()
 	sess.completer = completer
-	originalLeafID := *sess.inner.LeafID()
+	originalLeafID := *sess.inner.GetLeafID()
 
 	autoDone := make(chan bool, 1)
 	go func() {
@@ -1672,7 +1675,7 @@ func TestCompactAbortsInFlightAutoCompactionAndRestarts(t *testing.T) {
 	}()
 	<-completer.started
 	manualDone := make(chan error, 1)
-	go func() { manualDone <- sess.Compact(t.Context(), "manual") }()
+	go func() { _, err := sess.Compact(t.Context(), "manual"); manualDone <- err }()
 
 	if compacted := <-autoDone; compacted {
 		close(completer.release)
@@ -1687,10 +1690,10 @@ func TestCompactAbortsInFlightAutoCompactionAndRestarts(t *testing.T) {
 
 func assertRestartedCompaction(t *testing.T, sess *Session, originalLeafID string) {
 	t.Helper()
-	entries := sess.inner.Entries()
+	entries := sess.inner.GetEntries()
 	compactionEntry := entries[len(entries)-1]
-	if compactionEntry.Base.Type != "compaction" || compactionEntry.Base.ParentID == nil || *compactionEntry.Base.ParentID != originalLeafID {
-		t.Fatalf("compaction entry = %#v, want parent %q", compactionEntry.Base, originalLeafID)
+	if compactionEntry.Base().Type != "compaction" || compactionEntry.Base().ParentID == nil || *compactionEntry.Base().ParentID != originalLeafID {
+		t.Fatalf("compaction entry = %#v, want parent %q", compactionEntry.Base(), originalLeafID)
 	}
 	var aborted bool
 	for _, event := range drainEvents(t, sess) {
@@ -1703,6 +1706,7 @@ func assertRestartedCompaction(t *testing.T, sess *Session, originalLeafID strin
 	}
 }
 
+// Pi: packages/coding-agent/src/core/agent-session.ts:1383 (Session.abortBranchSummary).
 func TestCompactAbortsTreeNavigationThenCompactsOriginalLeaf(t *testing.T) {
 	sess := buildSessionWithMessages(t, newTestServicesSmallKeep(t), 3)
 	defer func() { _ = sess.Close() }()
@@ -1710,13 +1714,13 @@ func TestCompactAbortsTreeNavigationThenCompactsOriginalLeaf(t *testing.T) {
 	sess.completer = completer
 
 	var targetID string
-	for _, entry := range sess.inner.Entries() {
-		if message, ok := entry.AsMessage(); ok && message.Message.Assistant != nil {
-			targetID = entry.Base.ID
+	for _, entry := range sess.inner.GetEntries() {
+		if message, ok := entry.(icodingagent.MessageEntry); ok && message.Message.Assistant != nil {
+			targetID = entry.Base().ID
 			break
 		}
 	}
-	originalLeafID := *sess.inner.LeafID()
+	originalLeafID := *sess.inner.GetLeafID()
 	navigationDone := make(chan NavigateTreeResult, 1)
 	navigationErr := make(chan error, 1)
 	go func() {
@@ -1727,7 +1731,7 @@ func TestCompactAbortsTreeNavigationThenCompactsOriginalLeaf(t *testing.T) {
 	<-completer.started
 
 	compactDone := make(chan error, 1)
-	go func() { compactDone <- sess.Compact(t.Context(), "") }()
+	go func() { _, err := sess.Compact(t.Context(), ""); compactDone <- err }()
 	var navigation NavigateTreeResult
 	select {
 	case navigation = <-navigationDone:
@@ -1752,10 +1756,10 @@ func TestCompactAbortsTreeNavigationThenCompactsOriginalLeaf(t *testing.T) {
 	if err := <-compactDone; err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
-	entries := sess.inner.Entries()
+	entries := sess.inner.GetEntries()
 	compactionEntry := entries[len(entries)-1]
-	if compactionEntry.Base.Type != "compaction" || compactionEntry.Base.ParentID == nil || *compactionEntry.Base.ParentID != originalLeafID {
-		t.Fatalf("compaction entry = %#v, want parent %q", compactionEntry.Base, originalLeafID)
+	if compactionEntry.Base().Type != "compaction" || compactionEntry.Base().ParentID == nil || *compactionEntry.Base().ParentID != originalLeafID {
+		t.Fatalf("compaction entry = %#v, want parent %q", compactionEntry.Base(), originalLeafID)
 	}
 }
 
@@ -1766,18 +1770,18 @@ func TestNavigateTreeRejectsManualCompactionBeforeLeafChanges(t *testing.T) {
 	sess.completer = completer
 
 	var targetID string
-	for _, entry := range sess.inner.Entries() {
-		if message, ok := entry.AsMessage(); ok && message.Message.Assistant != nil {
-			targetID = entry.Base.ID
+	for _, entry := range sess.inner.GetEntries() {
+		if message, ok := entry.(icodingagent.MessageEntry); ok && message.Message.Assistant != nil {
+			targetID = entry.Base().ID
 			break
 		}
 	}
 	if targetID == "" {
 		t.Fatal("missing assistant navigation target")
 	}
-	originalLeafID := *sess.inner.LeafID()
+	originalLeafID := *sess.inner.GetLeafID()
 	compactDone := make(chan error, 1)
-	go func() { compactDone <- sess.Compact(t.Context(), "") }()
+	go func() { _, err := sess.Compact(t.Context(), ""); compactDone <- err }()
 	<-completer.started
 
 	if !sess.IsCompacting() {
@@ -1787,7 +1791,7 @@ func TestNavigateTreeRejectsManualCompactionBeforeLeafChanges(t *testing.T) {
 	if navigateErr == nil || navigateErr.Error() != "Wait for the current compaction or tree navigation to finish before navigating the session tree." {
 		t.Fatalf("NavigateTree error = %v", navigateErr)
 	}
-	if leaf := sess.inner.LeafID(); leaf == nil || *leaf != originalLeafID {
+	if leaf := sess.inner.GetLeafID(); leaf == nil || *leaf != originalLeafID {
 		t.Fatalf("leaf = %v, want original leaf %q", leaf, originalLeafID)
 	}
 
@@ -1795,10 +1799,10 @@ func TestNavigateTreeRejectsManualCompactionBeforeLeafChanges(t *testing.T) {
 	if err := <-compactDone; err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
-	entries := sess.inner.Entries()
+	entries := sess.inner.GetEntries()
 	compactionEntry := entries[len(entries)-1]
-	if compactionEntry.Base.Type != "compaction" || compactionEntry.Base.ParentID == nil || *compactionEntry.Base.ParentID != originalLeafID {
-		t.Fatalf("compaction entry = %#v, want parent %q", compactionEntry.Base, originalLeafID)
+	if compactionEntry.Base().Type != "compaction" || compactionEntry.Base().ParentID == nil || *compactionEntry.Base().ParentID != originalLeafID {
+		t.Fatalf("compaction entry = %#v, want parent %q", compactionEntry.Base(), originalLeafID)
 	}
 	if got := assistantMessageTexts(sess.Messages()); !slices.Contains(got, "a2") {
 		t.Fatalf("assistant texts = %v, want original leaf message a2", got)
@@ -1811,24 +1815,24 @@ func TestNavigateTreeRejectsSecondNavigationWhileFirstWaits(t *testing.T) {
 	completer := newBlockingCompactionCompleter()
 	sess.completer = completer
 
-	entries := sess.inner.Entries()
+	entries := sess.inner.GetEntries()
 	var firstTargetID, secondTargetID string
 	for _, entry := range entries {
-		message, ok := entry.AsMessage()
+		message, ok := entry.(icodingagent.MessageEntry)
 		if !ok {
 			continue
 		}
 		if secondTargetID == "" && message.Message.User != nil {
-			secondTargetID = entry.Base.ID
+			secondTargetID = entry.Base().ID
 		}
 		if firstTargetID == "" && message.Message.Assistant != nil {
-			firstTargetID = entry.Base.ID
+			firstTargetID = entry.Base().ID
 		}
 	}
 	if firstTargetID == "" || secondTargetID == "" {
 		t.Fatal("missing navigation targets")
 	}
-	originalLeafID := *sess.inner.LeafID()
+	originalLeafID := *sess.inner.GetLeafID()
 	firstDone := make(chan error, 1)
 	go func() {
 		_, err := sess.NavigateTree(t.Context(), firstTargetID, NavigateTreeOptions{Summarize: true})
@@ -1843,7 +1847,7 @@ func TestNavigateTreeRejectsSecondNavigationWhileFirstWaits(t *testing.T) {
 	if secondErr == nil || secondErr.Error() != "Wait for the current compaction or tree navigation to finish before navigating the session tree." {
 		t.Fatalf("second NavigateTree error = %v", secondErr)
 	}
-	if leaf := sess.inner.LeafID(); leaf == nil || *leaf != originalLeafID {
+	if leaf := sess.inner.GetLeafID(); leaf == nil || *leaf != originalLeafID {
 		t.Fatalf("leaf = %v while first navigation waits, want %q", leaf, originalLeafID)
 	}
 
@@ -1851,13 +1855,13 @@ func TestNavigateTreeRejectsSecondNavigationWhileFirstWaits(t *testing.T) {
 	if err := <-firstDone; err != nil {
 		t.Fatalf("first NavigateTree: %v", err)
 	}
-	leaf := sess.inner.LeafID()
+	leaf := sess.inner.GetLeafID()
 	if leaf == nil {
 		t.Fatal("first navigation left a nil leaf")
 	}
-	summary, ok := sess.inner.EntryByID(*leaf)
-	if !ok || summary.Base.Type != "branch_summary" || summary.Base.ParentID == nil || *summary.Base.ParentID != firstTargetID {
-		t.Fatalf("first navigation leaf = %#v, want branch summary under %q", summary.Base, firstTargetID)
+	summary, ok := sess.inner.GetEntry(*leaf)
+	if !ok || summary.Base().Type != "branch_summary" || summary.Base().ParentID == nil || *summary.Base().ParentID != firstTargetID {
+		t.Fatalf("first navigation leaf = %#v, want branch summary under %q", summary.Base(), firstTargetID)
 	}
 }
 
@@ -1883,6 +1887,7 @@ func assistantMessageTexts(messages []agent.AgentMessage) []string {
 func TestCheckCompactionThreshold(t *testing.T) {
 	svcs := newTestServicesSmallKeep(t)
 	sess := buildSessionWithMessages(t, svcs, 5)
+	_ = sess.Events()
 	defer func() { _ = sess.Close() }()
 	sess.completer = &fakeCompleter{summary: "compact summary"}
 
@@ -1905,7 +1910,7 @@ func TestCheckCompactionThreshold(t *testing.T) {
 		},
 	}
 
-	if _, err := sess.checkCompaction(context.Background(), msg, true, nil); err != nil {
+	if _, err := sess.checkCompaction(context.Background(), msg, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1940,9 +1945,11 @@ func TestCheckCompactionThreshold(t *testing.T) {
 // TestCheckCompactionOverflow verifies that an overflow error persistently
 // omits the failed attempt with a context_edit, compacts, and asks the post-run
 // loop to retry (agent-session.ts _checkCompaction case 1).
+// Pi: packages/coding-agent/src/core/session-manager.ts:177 (ContextEditEntry.targetId).
 func TestCheckCompactionOverflow(t *testing.T) {
 	svcs := newTestServicesSmallKeep(t)
 	sess := buildSessionWithMessages(t, svcs, 3)
+	_ = sess.Events()
 	defer func() { _ = sess.Close() }()
 	sess.completer = &fakeCompleter{summary: "overflow summary"}
 
@@ -1965,7 +1972,7 @@ func TestCheckCompactionOverflow(t *testing.T) {
 	sess.refreshContext()
 	retryMsg := lastAssistantMessage(sess.agent.Messages())
 
-	continueRun, err := sess.checkCompaction(context.Background(), retryMsg, true, nil)
+	continueRun, err := sess.checkCompaction(context.Background(), retryMsg, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1973,9 +1980,9 @@ func TestCheckCompactionOverflow(t *testing.T) {
 		t.Fatal("overflow recovery did not request a retry")
 	}
 	omitted := false
-	for _, entry := range sess.inner.Entries() {
+	for _, entry := range sess.inner.GetEntries() {
 		var edit icodingagent.ContextEditEntry
-		if entry.Base.Type == "context_edit" && json.Unmarshal(entry.Raw(), &edit) == nil && edit.TargetID == overflowID && edit.Replacement == nil {
+		if entry.Base().Type == "context_edit" && json.Unmarshal(entry.Raw(), &edit) == nil && edit.TargetID == overflowID && edit.Replacement == nil {
 			omitted = true
 		}
 	}
@@ -2011,6 +2018,7 @@ func TestCheckCompactionOverflow(t *testing.T) {
 func TestOverflowNoDoubleRetry(t *testing.T) {
 	svcs := newTestServices(t)
 	sess := buildSessionWithMessages(t, svcs, 3)
+	_ = sess.Events()
 	defer func() { _ = sess.Close() }()
 	sess.completer = &fakeCompleter{summary: "should not be called"}
 	var failed *extension.SessionCompactFailedEvent
@@ -2037,7 +2045,7 @@ func TestOverflowNoDoubleRetry(t *testing.T) {
 		ModelID:      "fake-1",
 	}
 
-	if _, err := sess.checkCompaction(context.Background(), overflowMsg, true, nil); err != nil {
+	if _, err := sess.checkCompaction(context.Background(), overflowMsg, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2166,7 +2174,7 @@ func TestPreSendCompactionCheck(t *testing.T) {
 		t.Error("pre-send compaction check should trigger compaction for aborted overflow, but completer was not called")
 	}
 	foundFollowUp := false
-	for _, entry := range sess.inner.Entries() {
+	for _, entry := range sess.inner.GetEntries() {
 		if strings.Contains(string(entry.Raw()), "follow up") {
 			foundFollowUp = true
 		}
@@ -2203,18 +2211,19 @@ func TestPreSendCompactionSkipsAborted(t *testing.T) {
 	}
 
 	// Post-send check (skipAbortedCheck=true) should skip.
-	_, _ = sess.checkCompaction(context.Background(), abortedHighUsage, true, nil)
+	_, _ = sess.checkCompaction(context.Background(), abortedHighUsage, true)
 	if fakeComp.called.Load() {
 		t.Error("post-send check (skipAbortedCheck=true) should skip aborted messages")
 	}
 
 	// Pre-send check (skipAbortedCheck=false) should NOT skip.
-	_, _ = sess.checkCompaction(context.Background(), abortedHighUsage, false, nil)
+	_, _ = sess.checkCompaction(context.Background(), abortedHighUsage, false)
 	if !fakeComp.called.Load() {
 		t.Error("pre-send check (skipAbortedCheck=false) should process aborted messages and trigger threshold compaction")
 	}
 }
 
+// Pi: packages/coding-agent/src/core/session-manager.ts:108 (BranchSummaryEntry.fromId).
 func TestNavigateTree_SummaryJoinsDestinationFromAbandonedLeaf(t *testing.T) {
 	// A summary must join the destination branch, not the abandoned branch.
 	svcs := newTestServices(t)
@@ -2235,7 +2244,7 @@ func TestNavigateTree_SummaryJoinsDestinationFromAbandonedLeaf(t *testing.T) {
 	if _, err := sess.inner.AppendMessage(firstMsg); err != nil {
 		t.Fatal(err)
 	}
-	firstID := *sess.inner.LeafID() // ID of "first question"
+	firstID := *sess.inner.GetLeafID() // ID of "first question"
 
 	// Append a second user message to build out the "old branch".
 	secondMsg := agent.AgentMessage{
@@ -2248,7 +2257,7 @@ func TestNavigateTree_SummaryJoinsDestinationFromAbandonedLeaf(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Session now: [firstID → secondID]; leaf = secondID.
-	abandonedLeafID := *sess.inner.LeafID()
+	abandonedLeafID := *sess.inner.GetLeafID()
 
 	// Navigate to firstID (user message) with summarize=true. The bootstrap entries precede firstID, so its parent is the destination leaf.
 	res, err := sess.NavigateTree(context.Background(), firstID, NavigateTreeOptions{Summarize: true})
@@ -2264,19 +2273,19 @@ func TestNavigateTree_SummaryJoinsDestinationFromAbandonedLeaf(t *testing.T) {
 
 	// The current leaf's branch must contain the bootstrap audit entries and the
 	// new branch_summary entry, but not the abandoned user-message path.
-	leaf := sess.inner.LeafID()
+	leaf := sess.inner.GetLeafID()
 	if leaf == nil {
 		t.Fatal("leaf must not be nil after summarize navigation")
 	}
-	branch := sess.inner.Branch(*leaf)
+	branch := sess.inner.GetBranch(*leaf)
 	if len(branch) != 3 {
 		types := make([]string, len(branch))
 		for i, e := range branch {
-			types[i] = e.Base.Type
+			types[i] = e.Base().Type
 		}
 		t.Fatalf("branch len = %d, want 3 (bootstrap audit and branch_summary); types: %v", len(branch), types)
 	}
-	gotTypes := []string{branch[0].Base.Type, branch[1].Base.Type, branch[2].Base.Type}
+	gotTypes := []string{branch[0].Base().Type, branch[1].Base().Type, branch[2].Base().Type}
 	if want := []string{"model_change", "thinking_level_change", "branch_summary"}; !slices.Equal(gotTypes, want) {
 		t.Errorf("branch types = %v, want %v", gotTypes, want)
 	}
@@ -2680,7 +2689,7 @@ func TestGetSessionStatsUpstream(t *testing.T) {
 			var err error
 			switch kind {
 			case "branch summary":
-				_, err = session.inner.AppendBranchSummary(nil, "summary", nil, false, billed)
+				_, err = session.inner.BranchWithSummary(nil, "summary", nil, false, billed)
 			case "compaction":
 				kept := appendMessage(t, session, user("hello", 1))
 				_, err = session.inner.AppendCompaction("summary", kept, 100, nil, false, billed)
@@ -2703,7 +2712,7 @@ func TestGetSessionStatsUpstream(t *testing.T) {
 		if _, err := session.inner.AppendUsage("cache_warm", "anthropic", session.Model().ID, billed, "extension override"); err != nil {
 			t.Fatal(err)
 		}
-		entries := session.inner.Entries()
+		entries := session.inner.GetEntries()
 		var entry icodingagent.UsageEntry
 		if len(entries) != 1 {
 			t.Fatalf("entries = %d, want the single usage append", len(entries))
@@ -2739,7 +2748,7 @@ func TestGetSessionStatsUpstream(t *testing.T) {
 		}
 		branchUsage := usage(100)
 		branchUsage.Cost.Total = 3
-		if _, err := session.inner.AppendBranchSummary(nil, "branch summary", nil, false, branchUsage); err != nil {
+		if _, err := session.inner.BranchWithSummary(nil, "branch summary", nil, false, branchUsage); err != nil {
 			t.Fatal(err)
 		}
 		want := []icodingagent.SessionUsageBreakdown{{Key: "Tools/summaries", Cost: 6, Tokens: 300}, {Key: "anthropic/claude-sonnet-4-5", Cost: 0.5, Tokens: 100}}
@@ -2783,7 +2792,7 @@ func TestRecordBashResultPreservesTruncationProvenance(t *testing.T) {
 
 	if err := sess.recordBashResult("large output", BashResult{
 		Output: "tail", ExitCode: new(0), Truncated: true, FullOutputPath: "/tmp/original-output",
-	}, false); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 	messages := sess.Inner().BuildSessionProjection().Messages
@@ -2792,10 +2801,11 @@ func TestRecordBashResultPreservesTruncationProvenance(t *testing.T) {
 	}
 }
 
-func TestAppendBashFailureRetainsEntryProvenanceWithoutRefreshingAgent(t *testing.T) {
+func TestAppendBashFailureKeepsNoEntryAndDoesNotRefreshAgent(t *testing.T) {
 	sess := buildSessionWithMessages(t, newTestServices(t), 1)
 	defer func() { _ = sess.Close() }()
 	before := len(sess.Messages())
+	projected := len(sess.Inner().BuildSessionProjection().Messages)
 	sess.Inner().SetPath(t.TempDir())
 
 	sess.mu.Lock()
@@ -2809,11 +2819,9 @@ func TestAppendBashFailureRetainsEntryProvenanceWithoutRefreshingAgent(t *testin
 	if len(sess.Messages()) != before {
 		t.Fatal("failed append refreshed Agent context")
 	}
-	// Pi appends to the Session entry list before attempting persistence.
-	messages := sess.Inner().BuildSessionProjection().Messages
-	last := messages[len(messages)-1]
-	if last.Custom["truncated"] != true || last.Custom["fullOutputPath"] != "/tmp/original-output" {
-		t.Fatalf("failed Bash entry = %#v", last.Custom)
+	// Pi's _appendEntry undoes the in-memory append when persistence fails (807a5c05): the failed Bash entry is not kept.
+	if got := len(sess.Inner().BuildSessionProjection().Messages); got != projected {
+		t.Fatalf("failed Bash entry was kept: %d projected messages, want %d", got, projected)
 	}
 }
 
@@ -2826,7 +2834,7 @@ func TestExecuteBashBasic(t *testing.T) {
 	defer func() { _ = sess.Close() }()
 
 	ctx := context.Background()
-	result, err := sess.ExecuteBash(ctx, "echo hello_from_bash", false)
+	result, err := sess.ExecuteBash(ctx, "echo hello_from_bash", nil, nil)
 	if err != nil {
 		t.Fatalf("ExecuteBash: %v", err)
 	}
@@ -2852,7 +2860,7 @@ func TestExecuteBashRecordsResultInContext(t *testing.T) {
 
 	// excludeFromContext=false: result is recorded into live agent state and
 	// persisted as a message with role bashExecution (idle path: no turn streaming).
-	if _, err := sess.ExecuteBash(ctx, "echo recorded_output", false); err != nil {
+	if _, err := sess.ExecuteBash(ctx, "echo recorded_output", nil, nil); err != nil {
 		t.Fatalf("ExecuteBash: %v", err)
 	}
 	msgs := sess.Agent().Messages()
@@ -2881,7 +2889,7 @@ func TestExecuteBashRecordsResultInContext(t *testing.T) {
 
 	// excludeFromContext=true: still recorded (so reload/transcript shows it)
 	// but flagged so bashExecutionToText drops it from LLM context.
-	if _, err := sess.ExecuteBash(ctx, "echo hidden_output", true); err != nil {
+	if _, err := sess.ExecuteBash(ctx, "echo hidden_output", nil, &ExecuteBashOptions{ExcludeFromContext: new(true)}); err != nil {
 		t.Fatalf("ExecuteBash (excluded): %v", err)
 	}
 	msgs = sess.Agent().Messages()
@@ -2892,8 +2900,8 @@ func TestExecuteBashRecordsResultInContext(t *testing.T) {
 }
 
 func hasBashEntry(sess *Session) bool {
-	for _, e := range sess.Inner().Entries() {
-		if message, ok := e.AsMessage(); ok && message.Message.Role() == agent.RoleBashExecution {
+	for _, e := range sess.Inner().GetEntries() {
+		if message, ok := e.(icodingagent.MessageEntry); ok && message.Message.Role() == agent.RoleBashExecution {
 			return true
 		}
 	}
@@ -2920,7 +2928,7 @@ func TestRecordBashResultDeferredWhileStreaming(t *testing.T) {
 	go func() {
 		if err := sess.recordBashResult("echo deferred", BashResult{
 			Output: "deferred_out", ExitCode: new(0), Truncated: true, FullOutputPath: "/tmp/deferred-output",
-		}, false); err != nil {
+		}, nil); err != nil {
 			t.Error(err)
 		}
 		close(done)
@@ -2969,7 +2977,7 @@ func TestExecuteBashNonZeroExit(t *testing.T) {
 	defer func() { _ = sess.Close() }()
 
 	ctx := context.Background()
-	result, err := sess.ExecuteBash(ctx, "exit 42", false)
+	result, err := sess.ExecuteBash(ctx, "exit 42", nil, nil)
 	if err != nil {
 		t.Fatalf("ExecuteBash: %v", err)
 	}
@@ -2989,7 +2997,7 @@ func TestAbortBashCancels(t *testing.T) {
 	done := make(chan BashResult, 1)
 	go func() {
 		ctx := context.Background()
-		result, _ := sess.ExecuteBash(ctx, "sleep 30", false)
+		result, _ := sess.ExecuteBash(ctx, "sleep 30", nil, nil)
 		done <- result
 	}()
 
@@ -3066,6 +3074,7 @@ func TestReplaceInnerAbortsOutgoingControllers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
+	t.Cleanup(func() { _ = sess.Close() })
 
 	compactCtx, compactCancel := context.WithCancel(context.Background())
 	branchCtx, branchCancel := context.WithCancel(context.Background())
@@ -3123,7 +3132,11 @@ func TestSession_EmitSessionStart_FiresHandler(t *testing.T) {
 	}
 	defer func() { _ = sess.Close() }()
 
-	sess.EmitSessionStart("startup")
+	if err := sess.EmitSessionStart("startup"); err != nil {
+
+		t.Fatal(err)
+
+	}
 
 	if calls != 1 {
 		t.Fatalf("session_start handler fired %d times, want 1", calls)
@@ -3174,33 +3187,10 @@ func TestSession_EmitSessionShutdown_FiresHandler(t *testing.T) {
 // no-ops (not panics) when no extension runner is present.
 func TestSession_EmitSessionStart_NilRunnerSafe(t *testing.T) {
 	s := &Session{}
-	s.EmitSessionStart("startup") // must not panic
+	if err := s.EmitSessionStart("startup"); err != nil { // must not panic
+		t.Fatal(err)
+	}
 	s.EmitSessionShutdown("quit") // must not panic
-}
-
-// TestIsRetryableCompactionError verifies the summarization retry classifier:
-// transient stream errors are retryable, quota/billing errors are not, and the
-// empty string is not. Mirrors upstream isRetryableAssistantError applied to
-// compaction (regression #6647).
-func TestIsRetryableCompactionError(t *testing.T) {
-	cases := []struct {
-		msg  string
-		want bool
-	}{
-		{"", false},
-		{"terminated", true},
-		{"socket connection was closed", true},
-		{"stream ended before a terminal response event", true},
-		{"insufficient_quota", false},
-		{"Monthly usage limit reached", false},
-		{"available balance is too low", false},
-		{"some unrelated validation error", false},
-	}
-	for _, tc := range cases {
-		if got := isRetryableCompactionError(tc.msg); got != tc.want {
-			t.Errorf("isRetryableCompactionError(%q) = %v, want %v", tc.msg, got, tc.want)
-		}
-	}
 }
 
 // Abort must surface the manual-operation cancellation, not the summarizer's
@@ -3213,14 +3203,15 @@ func (c abortingCompactionCompleter) CompleteSimple(ctx context.Context, _ *ai.M
 }
 func TestCompactAbortReturnsOperationCancellation(t *testing.T) {
 	sess := buildSessionWithMessages(t, newTestServicesSmallKeep(t), 3)
+	_ = sess.Events()
 	defer func() { _ = sess.Close() }()
 	sess.completer = abortingCompactionCompleter{abort: sess.AbortCompaction}
-	before := len(sess.Inner().Entries())
-	_, err := sess.CompactResult(context.Background(), "")
+	before := len(sess.Inner().GetEntries())
+	_, err := sess.Compact(context.Background(), "")
 	if err == nil || err.Error() != "Compaction cancelled" {
 		t.Fatalf("error = %v", err)
 	}
-	if len(sess.Inner().Entries()) != before {
+	if len(sess.Inner().GetEntries()) != before {
 		t.Fatal("cancelled summary was persisted")
 	}
 	var end *agent.CompactionEndEvent

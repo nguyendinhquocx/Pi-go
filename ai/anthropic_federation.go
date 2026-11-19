@@ -1,6 +1,6 @@
 package ai
 
-// Ports the workload identity federation of packages/ai/src/api/anthropic-messages.ts (getAnthropicFederation, the
+// Ports packages/ai/src/api/anthropic-messages.ts (the workload identity federation: getAnthropicFederation and the
 // federation client of createClient) together with the parts of @anthropic-ai/sdk@0.129.0 it relies on:
 // lib/credentials/oidc-federation.mjs (the jwt-bearer token exchange), types.mjs (endpoint check, response parsing,
 // redaction), identity-token.mjs (the identity token file) and token-cache.mjs (proactive refresh).
@@ -20,10 +20,12 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf16"
 	"unicode/utf8"
 
+	"github.com/MichaelKinsy/PiG/internal/jsnumber"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/nodeerrno"
+	"github.com/MichaelKinsy/PiG/internal/nodeurl"
 )
 
 const (
@@ -405,6 +407,7 @@ func exchangeAnthropicFederationToken(ctx context.Context, client *http.Client, 
 		return anthropicAccessToken{}, err
 	}
 	if length := utf16Length(jwt); length > anthropicMaxIdentityTokenChars {
+		//portlint:allow numbers Math.ceil(jwt.length / 1024) of oidc-federation.ts:63: length is a positive UTF-16 code-unit count above 16384, so (length+1023)/1024 is exact integer ceiling division
 		return anthropicAccessToken{}, fmt.Errorf("Identity token is %d KiB, exceeds the 16 KiB assertion limit", (length+1023)/1024)
 	}
 	body, err := json.Marshal(struct {
@@ -513,17 +516,19 @@ func requireSecureAnthropicTokenEndpoint(baseURL string) error {
 	if baseURL == "" {
 		return nil
 	}
-	parsed, err := url.Parse(baseURL)
-	if err != nil || parsed.Scheme == "" || (parsed.Host == "" && parsed.Opaque == "") {
-		return fmt.Errorf("Invalid token endpoint base URL %q: TypeError: Invalid URL", baseURL)
+	parsed, err := nodeurl.ParseURL(baseURL)
+	if err != nil {
+		return fmt.Errorf("Invalid token endpoint base URL \"%s\": TypeError: Invalid URL", baseURL)
 	}
-	if parsed.Scheme == "https" {
+	if parsed.Protocol == "https:" {
 		return nil
 	}
-	if host := strings.ToLower(parsed.Hostname()); parsed.Scheme == "http" && (host == "localhost" || host == "127.0.0.1" || host == "::1") {
+	// WHATWG URL.hostname returns a bracketed IPv6 address.
+	host := strings.TrimSuffix(strings.TrimPrefix(strings.ToLower(parsed.Hostname), "["), "]")
+	if parsed.Protocol == "http:" && (host == "localhost" || host == "127.0.0.1" || host == "::1") {
 		return nil
 	}
-	return fmt.Errorf("Refusing to send credential over non-https token endpoint %q", baseURL)
+	return fmt.Errorf("Refusing to send credential over non-https token endpoint \"%s\"", baseURL)
 }
 
 // readAnthropicIdentityToken reads the JWT from its file on every exchange, so a rotated token is picked up.
@@ -534,7 +539,7 @@ func readAnthropicIdentityToken(path string) (string, error) {
 		// Node reports the read failure as "Error: <CODE>: <description>, <syscall> ['<path>']".
 		return "", fmt.Errorf("Failed to read identity token file at %s: Error: %w", path, nodeerrno.FromPathError(err))
 	}
-	token := trimJSWhitespace(strings.ToValidUTF8(string(content), "\uFFFD"))
+	token := trimJSWhitespace(jsstring.FromUTF8(content))
 	if token == "" {
 		return "", fmt.Errorf("Identity token file at %s is empty", path)
 	}
@@ -557,11 +562,11 @@ func parseAnthropicTokenResponse(status int, text string) (anthropicAccessToken,
 		return anthropicAccessToken{}, fmt.Errorf("Token endpoint response missing access_token: %s", redactAnthropicTokenJSON(raw))
 	}
 	if tokenType := members["token_type"]; jsonValueTruthy(tokenType) {
-		if name, ok := jsonStringOf(tokenType); !ok || strings.ToLower(name) != "bearer" {
+		if name, ok := jsonStringOf(tokenType); !ok || strings.ToLower(name) != "bearer" { //nolint:gocritic // equalFold: Pi compares token_type.toLowerCase() to "bearer"; EqualFold is not JS case mapping.
 			return anthropicAccessToken{}, fmt.Errorf("Token endpoint response: unsupported token_type \"%s\" (want Bearer)", jsonAsJSString(tokenType))
 		}
 	}
-	expiresIn := jsNumberFromJSON(members["expires_in"])
+	expiresIn := jsnumber.FromJSON(members["expires_in"])
 	if math.IsNaN(expiresIn) || math.IsInf(expiresIn, 0) {
 		return anthropicAccessToken{}, fmt.Errorf("Token endpoint response missing required fields: %s", redactAnthropicTokenJSON(raw))
 	}
@@ -584,8 +589,7 @@ func truncateAnthropicTokenText(body string, units int) string {
 	if units <= anthropicMaxErrorBodyChars {
 		return body
 	}
-	head := utf16.Encode([]rune(body))
-	return string(utf16.Decode(head[:anthropicMaxErrorBodyChars])) + "... <" + strconv.Itoa(units-anthropicMaxErrorBodyChars) + " more chars>"
+	return jsstring.Slice(body, 0, anthropicMaxErrorBodyChars) + "... <" + strconv.Itoa(units-anthropicMaxErrorBodyChars) + " more chars>"
 }
 
 // redactAnthropicTokenJSON is JSON.stringify(redactSensitive(JSON.parse(raw))): an object keeps its error fields in source order, a string is redacted as a body, and every other value becomes null.
@@ -639,29 +643,4 @@ func jsonAsJSString(raw json.RawMessage) string {
 		return text
 	}
 	return stringifyJSONValue(raw)
-}
-
-// jsNumberFromJSON is Number(value) for the JSON value of a token response member; an absent member is NaN.
-func jsNumberFromJSON(raw json.RawMessage) float64 {
-	switch trimmed := string(bytes.TrimSpace(raw)); trimmed {
-	case "":
-		return math.NaN()
-	case "null", "false":
-		return 0
-	case "true":
-		return 1
-	}
-	if number, ok := finiteNumberOf(raw); ok {
-		return number
-	}
-	if text, ok := jsonStringOf(raw); ok {
-		text = trimJSWhitespace(text)
-		if text == "" {
-			return 0
-		}
-		if number, err := strconv.ParseFloat(text, 64); err == nil {
-			return number
-		}
-	}
-	return math.NaN()
 }

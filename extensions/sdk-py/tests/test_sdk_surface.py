@@ -14,6 +14,8 @@ from typing import Any
 
 from test_sdk import _read_frame, _start_fake_host, _write_frame
 
+import pytest
+
 import pig_sdk
 
 
@@ -27,6 +29,8 @@ class _Host:
         self.thread = threading.Thread(target=ext.run_with_socket, args=(sock_path,), daemon=True)
         self.thread.start()
         self.conn, _ = self.listener.accept()
+        # A missing frame fails the test after 10 s instead of hanging it.
+        self.conn.settimeout(10)
         self.register = _read_frame(self.conn)["register"]
         _write_frame(self.conn, {"type": "ready", "ready": {"cwd": tmp, "width": 80, **(ready or {})}})
 
@@ -176,9 +180,59 @@ def test_dialog_timeout_sends_opts() -> None:
         ("ui.select", {"title": "Pick", "options": ["a", "b"], "opts": {"timeout": 1000}}),
         ("ui.confirm", {"title": "Sure?", "message": "really", "opts": {"timeout": 2000}}),
         ("ui.input", {"title": "Name", "placeholder": "who", "opts": {"timeout": 3000}}),
-        ("ui.input", {"title": "Plain", "placeholder": ""}),
+        ("ui.input", {"title": "Plain"}),
     ]
     assert seen == [("b", True), True, ("pi", True), ("pi", True)]
+
+
+@pytest.mark.parametrize("method, call, reply, want", [
+    ("ui.select", lambda ctx: ctx.select("a", ["x"]), {"selected": 5, "ok": True}, (5, True)),
+    ("ui.select", lambda ctx: ctx.select("a", ["x"]), {"selected": None, "ok": True}, (None, True)),
+    ("ui.select", lambda ctx: ctx.select("a", ["x"]), {"selected": "", "ok": False}, (None, False)),
+    ("ui.confirm", lambda ctx: ctx.confirm("a", "m"), {"confirmed": "yes"}, "yes"),
+    ("ui.confirm", lambda ctx: ctx.confirm("a", "m"), {"confirmed": None}, None),
+    ("ui.confirm", lambda ctx: ctx.confirm("a", "m"), {}, False),
+    ("ui.input", lambda ctx: ctx.input("a", "p"), {"text": {"a": [1, "x"]}, "ok": True}, ({"a": [1, "x"]}, True)),
+    ("ui.editor", lambda ctx: ctx.editor("a", "p"), {"text": [1, 2], "ok": True}, ([1, 2], True)),
+])
+def test_dialog_results_carry_the_clients_json_types(method: str, call: Callable[[pig_sdk.Context], Any], reply: dict[str, Any], want: Any) -> None:
+    """Pi's RPC mode resolves a dialog with whatever JSON the client sent: the SDK returns it unchanged, with undefined (ok False) apart from null."""
+    seen: list[Any] = []
+    _run_command(lambda ctx: seen.append(call(ctx)), {method: reply})
+    assert seen == [want]
+    assert type(seen[0]) is type(want)
+
+
+def test_empty_and_unset_ui_members_stay_distinct_on_the_wire() -> None:
+    """Pi's rpc-mode writes "" and [] where an extension passes them and omits `undefined`: set_status("") and clear_status differ, and so do an omitted placeholder/prefill and an empty one."""
+
+    def handler(ctx: pig_sdk.Context) -> None:
+        ctx.set_status("k", "")
+        ctx.clear_status("k")
+        ctx.notify("")
+        ctx.set_title("")
+        ctx.set_editor_text("")
+        ctx.select("T", [])
+        ctx.confirm("", "")
+        ctx.input("T")
+        ctx.input("T", "")
+        ctx.editor("E")
+        ctx.editor("E", "")
+
+    calls, _ = _run_command(handler, {})
+    assert [(c["call"]["method"], c["call"]["args"]) for c in calls] == [
+        ("ui.setStatus", {"key": "k", "text": ""}),
+        ("ui.setStatus", {"key": "k"}),
+        ("ui.notify", {"message": "", "level": ""}),
+        ("ui.setTitle", {"title": ""}),
+        ("ui.setEditorText", {"text": ""}),
+        ("ui.select", {"title": "T", "options": []}),
+        ("ui.confirm", {"title": "", "message": ""}),
+        ("ui.input", {"title": "T"}),
+        ("ui.input", {"title": "T", "placeholder": ""}),
+        ("ui.editor", {"title": "E"}),
+        ("ui.editor", {"title": "E", "prefill": ""}),
+    ]
 
 
 def test_set_footer_and_header_send_lines() -> None:
@@ -226,8 +280,8 @@ def test_has_ui_and_theme_follow_host_state() -> None:
             "has_ui": ctx.has_ui(),
             "name": theme.name,
             "source_path": theme.source_path,
-            "fg": theme.fg("accent", "x"),
-            "fg_unknown": theme.fg("missing", "x"),
+            "fg": ansi(lambda token: theme.fg(token, "x"), "accent"),
+            "fg_unknown": ansi(lambda token: theme.fg(token, "x"), "missing"),
             "bg": theme.bg("panel", "x"),
             "bold": theme.bold("x"),
             "italic": theme.italic("x"),
@@ -238,7 +292,8 @@ def test_has_ui_and_theme_follow_host_state() -> None:
             "bg_ansi": ansi(theme.get_bg_ansi, "panel"),
             "mode": theme.get_color_mode(),
             "thinking": theme.get_thinking_border_color("high")("x"),
-            "thinking_unknown": theme.get_thinking_border_color("bogus")("x"),
+            # An unknown level uses the thinkingOff token, which this palette lacks (theme.ts:374).
+            "thinking_unknown": ansi(lambda level: theme.get_thinking_border_color(level)("x"), "bogus"),
             "bash": theme.get_bash_mode_border_color()("x"),
             "errors": [ansi(theme.get_fg_ansi, "missing"), ansi(theme.get_bg_ansi, "missing")],
         })
@@ -260,7 +315,7 @@ def test_has_ui_and_theme_follow_host_state() -> None:
         "name": "night",
         "source_path": "/themes/night.json",
         "fg": "\x1b[31mx\x1b[39m",
-        "fg_unknown": "x",
+        "fg_unknown": "ValueError: Unknown theme color: missing",
         "bg": "\x1b[44mx\x1b[49m",
         "bold": "\x1b[1mx\x1b[22m",
         "italic": "\x1b[3mx\x1b[23m",
@@ -271,13 +326,14 @@ def test_has_ui_and_theme_follow_host_state() -> None:
         "bg_ansi": "\x1b[44m",
         "mode": "256color",
         "thinking": "\x1b[35mx\x1b[39m",
-        "thinking_unknown": "x",
+        "thinking_unknown": "ValueError: Unknown theme color: thinkingOff",
         "bash": "\x1b[36mx\x1b[39m",
-        "errors": ["ValueError: Unknown theme color: missing", "ValueError: Unknown theme background color: missing"],
+        "errors": ["ValueError: Unknown theme color: missing", "ValueError: Unknown theme color: missing"],
     }
     after = observed[1]
     assert after["has_ui"] is True
     assert (after["name"], after["source_path"], after["mode"]) == ("plain", None, "truecolor")
+    # The replacement palette has no tokens at all, so fg leaves the text unstyled as before any palette.
     assert (after["fg"], after["bold"]) == ("x", "x")
     assert after["fg_ansi"] == "ValueError: Unknown theme color: accent"
 
@@ -357,6 +413,60 @@ def _probe_getter(call: Callable[[pig_sdk.Context], Any], answer: dict[str, Any]
         host.close()
 
 
+def test_yield_now_sends_the_yield_call_with_the_request_parent() -> None:
+    """``yield_now`` is a plain synchronous ``yield`` call with empty args, carrying the request's id like isIdle does."""
+    calls, response = _run_command(lambda ctx: ctx.yield_now(), {"yield": {}})
+    assert [c["call"]["method"] for c in calls] == ["yield"]
+    assert calls[0]["call"]["args"] == {}
+    assert calls[0]["call"]["parent_request_id"] == "r1"
+    assert response["response"].get("error") is None
+
+
+def test_sleep_yields_before_it_sleeps(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+    real_sleep = pig_sdk.time.sleep
+
+    def fake_sleep(seconds: float) -> None:
+        if seconds == 0.0123:
+            events.append("sleep")
+        else:
+            real_sleep(seconds)
+
+    monkeypatch.setattr(pig_sdk.time, "sleep", fake_sleep)
+    ext = pig_sdk.Extension("py-sleep")
+    ext.command("go", "run", lambda ctx, _args: ctx.sleep(0.0123))
+    host = _Host(ext)
+    try:
+        host.request("r1", {"method": "command", "tool": "go"})
+        while True:
+            env = host.read()
+            if env["type"] == "call":
+                events.append("call:" + env["call"]["method"])
+                assert env["call"]["parent_request_id"] == "r1"
+                host.answer(env, {})
+            elif env["type"] == "response":
+                break
+    finally:
+        host.close()
+    assert events == ["call:yield", "sleep"]
+
+
+def test_yield_and_sleep_propagate_a_host_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed ``yield`` raises as ``wait_for_idle`` does, and ``sleep`` does not sleep then."""
+    failure = {"code": "host_failed", "message": "boom"}
+    slept: list[float] = []
+    real_sleep = pig_sdk.time.sleep
+    monkeypatch.setattr(pig_sdk.time, "sleep", lambda seconds: slept.append(seconds) if seconds == 0.0123 else real_sleep(seconds))
+    for name, call in (
+        ("wait_for_idle", lambda c: c.wait_for_idle()),
+        ("yield_now", lambda c: c.yield_now()),
+        ("sleep", lambda c: c.sleep(0.0123)),
+    ):
+        raised = _probe_getter(call, None, failure)
+        assert isinstance(raised, pig_sdk.HostCallError) and "boom" in str(raised), name
+    assert slept == []
+
+
 def test_getters_distinguish_absent_empty_and_failure() -> None:
     """Pi's getters return undefined for absent state and throw for a failed host call."""
     assert _probe_getter(lambda c: c.get_session_name(), {"name": "named"}) == "named"
@@ -388,3 +498,47 @@ def test_session_log_getters_report_subscription_failure() -> None:
     for name in ("get_branch", "get_entries"):
         raised = _probe_getter(lambda c, name=name: getattr(c, name)(), None, failure)
         assert isinstance(raised, pig_sdk.HostCallError) and "log unavailable" in str(raised), name
+
+
+def test_exec_max_buffer_option_and_truncated_result() -> None:
+    results: list[pig_sdk.ExecResult] = []
+    calls, _ = _run_command(
+        lambda ctx: results.append(ctx.exec("yes", [], max_buffer=1024)),
+        {"exec": {"stdout": "yyyy", "stderr": "", "code": 1, "killed": True, "truncated": True}},
+    )
+    assert calls[0]["call"]["args"] == {"command": "yes", "args": [], "options": {"maxBuffer": 1024}}
+    assert results == [pig_sdk.ExecResult(stdout="yyyy", stderr="", exit_code=1, killed=True, truncated=True)]
+
+
+def test_select_page_index_follows_the_page_keys() -> None:
+    from pig_sdk import tui
+
+    keys = tui.get_keybindings()
+    up, down = keys.get_keys("tui.select.pageUp")[0], keys.get_keys("tui.select.pageDown")[0]
+    assert (up, down) == ("pageUp", "pageDown")
+    page_up, page_down = "\x1b[5~", "\x1b[6~"
+    assert tui.get_select_page_index(keys, page_down, 2, 20, 5) == 7
+    assert tui.get_select_page_index(keys, page_down, 18, 20, 5) == 19
+    assert tui.get_select_page_index(keys, page_up, 2, 20, 5) == 0
+    assert tui.get_select_page_index(keys, page_up, 12, 20, 5) == 7
+    assert tui.get_select_page_index(keys, page_down, 0, 0, 5) == 0
+    assert tui.get_select_page_index(keys, page_up, 0, 0, 5) == 0
+    assert tui.get_select_page_index(keys, "x", 3, 20, 5) is None
+
+
+def test_exec_result_without_truncated_reads_false_and_a_non_finite_max_buffer_sends_no_call() -> None:
+    results: list[pig_sdk.ExecResult] = []
+    errors: list[BaseException] = []
+
+    def handler(ctx: pig_sdk.Context) -> None:
+        results.append(ctx.exec("true", []))
+        for value in (float("nan"), float("inf"), float("-inf")):
+            try:
+                ctx.exec("true", [], max_buffer=value)
+            except ValueError as error:
+                errors.append(error)
+
+    calls, _ = _run_command(handler, {"exec": {"stdout": "", "stderr": "", "code": 0, "killed": False}})
+    assert len(calls) == 1, "only the exec without a cap reached the host"
+    assert results == [pig_sdk.ExecResult()]
+    assert len(errors) == 3 and all("maxBuffer must be an integer" in str(error) for error in errors)

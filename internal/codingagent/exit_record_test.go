@@ -1,6 +1,7 @@
 package codingagent
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +23,7 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
+	"github.com/MichaelKinsy/PiG/internal/profiling"
 	"github.com/MichaelKinsy/PiG/tui"
 )
 
@@ -43,7 +47,7 @@ func TestExitRecordChild(t *testing.T) {
 		select {}
 	case "background-panic":
 		// The production path: a panic in a goroutine the session started reaches the session's handler.
-		m := NewInteractiveMode(InteractiveOptions{CWD: "/work", AgentDir: agentDir, AppVersion: "9.9.9"})
+		m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: "/work", AgentDir: agentDir, AppVersion: "9.9.9"})
 		SetUncaughtGoroutineHandler(m.uncaughtOffLoop)
 		m.backgroundTasks.Go(func() { panic("boom from a background task") })
 		select {}
@@ -53,34 +57,74 @@ func TestExitRecordChild(t *testing.T) {
 		group.Go(func() { panic("boom without a handler") })
 		select {}
 	case "fatal-error":
-		// A real runtime fatal error, which no recover can intercept: concurrent map writes.
-		shared := map[int]int{}
-		var wg sync.WaitGroup
-		for range 8 {
-			wg.Go(func() {
-				for i := range 1 << 24 {
-					shared[i%64] = i
-				}
-			})
-		}
-		wg.Wait()
+		// A real runtime fatal error, which no recover can intercept, on every run. Concurrent map writes were one only
+		// when two threads happened to be inside the map's write at the same instant: a child that the host ran on one
+		// CPU at a time (a full-package run on a loaded machine) finished its 8 x 16M writes and exited 0.
+		var mu sync.Mutex
+		mu.Unlock()
 	case "wait":
 		fmt.Println("ready")
 		select {}
 	case "clean":
 		EndSessionMarker()
 	case "dead-terminal":
-		m := NewInteractiveMode(InteractiveOptions{CWD: "/work", AgentDir: agentDir, AppVersion: "9.9.9", TerminateExtensionProcesses: terminatedSentinel(agentDir)})
+		m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: "/work", AgentDir: agentDir, AppVersion: "9.9.9", TerminateExtensionProcesses: terminatedSentinel(agentDir)})
 		m.emergencyTerminalExit("terminal gone: read /dev/tty: input/output error")
+	case "dead-terminal-concurrent":
+		// The input reader, a failed terminal write and a crash on the dead terminal reach the emergency exit together.
+		m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: "/work", AgentDir: agentDir, AppVersion: "9.9.9"})
+		for i := range 8 {
+			go m.emergencyTerminalExit(fmt.Sprintf("terminal gone: path %d", i))
+		}
+		select {}
+	case "dead-terminal-after-signal":
+		// The signal goroutine already owns the line when the dead terminal's exit arrives.
+		m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: "/work", AgentDir: agentDir, AppVersion: "9.9.9"})
+		RecordEnding(agentDir, "received SIGHUP")
+		m.emergencyTerminalExit("terminal gone: EOF (hung up)")
+	case "dead-terminal-while-emergency":
+		// A goroutine fails on the dead terminal while the first emergency exit is held inside its write: the production
+		// uncaughtOffLoop handler reaches emergencyTerminalExit as a second caller, which must block behind the first.
+		m := emergencyChildMode(agentDir)
+		release := emergencyChildHolding(m)
+		SetUncaughtGoroutineHandler(m.uncaughtOffLoop)
+		m.backgroundTasks.Go(func() { panic(&os.PathError{Op: "write", Path: "/dev/tty", Err: syscall.EIO}) })
+		waitParked(1)
+		release()
+		select {}
+	case "second-emergency-never-returns":
+		// Pi's emergencyTerminalExit is `never`: a second caller that returned would end the process with status 3.
+		m := emergencyChildMode(agentDir)
+		release := emergencyChildHolding(m)
+		go func() {
+			m.emergencyTerminalExit("terminal gone: EOF (hung up)")
+			os.Exit(3)
+		}()
+		waitParked(1)
+		release()
+		select {}
+	case "crash-while-emergency":
+		// A crash that is not a dead terminal ends in os.Exit(1); with an emergency exit in flight it must wait behind it.
+		m := emergencyChildMode(agentDir)
+		release := emergencyChildHolding(m)
+		SetUncaughtGoroutineHandler(m.uncaughtOffLoop)
+		m.backgroundTasks.Go(func() { panic("boom while an emergency exit runs") })
+		waitParked(1)
+		release()
+		select {}
+	case "extension-shutdown-then-dead-terminal":
+		m := emergencyChildMode(agentDir)
+		m.requestExtensionShutdown()
+		m.emergencyTerminalExit("terminal gone: EOF (hung up)")
 	case "dead-terminal-off-loop":
 		// A goroutine fails because the terminal is gone: Pi's uncaughtCrash takes emergencyTerminalExit, which kills the
 		// detached children.
-		m := NewInteractiveMode(InteractiveOptions{CWD: "/work", AgentDir: agentDir, AppVersion: "9.9.9", TerminateExtensionProcesses: terminatedSentinel(agentDir)})
+		m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: "/work", AgentDir: agentDir, AppVersion: "9.9.9", TerminateExtensionProcesses: terminatedSentinel(agentDir)})
 		SetUncaughtGoroutineHandler(m.uncaughtOffLoop)
 		m.backgroundTasks.Go(func() { panic(&os.PathError{Op: "write", Path: "/dev/tty", Err: syscall.EIO}) })
 		select {}
 	case "dead-terminal-running-shell", "crash-running-shell":
-		m := NewInteractiveMode(InteractiveOptions{CWD: "/work", AgentDir: agentDir, AppVersion: "9.9.9"})
+		m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: "/work", AgentDir: agentDir, AppVersion: "9.9.9"})
 		startRunningShellCommand(agentDir)
 		if scenario == "dead-terminal-running-shell" {
 			m.emergencyTerminalExit("terminal gone: read /dev/tty: input/output error")
@@ -112,7 +156,7 @@ func startRunningShellCommand(agentDir string) {
 	}
 	ended := make(chan execResult, 1)
 	go func() {
-		result, err := tools.NewLocalBashOperations(nil, "").Exec(context.Background(), "sleep 60 & echo $! > shell-job-pid.tmp && mv shell-job-pid.tmp shell-job-pid; wait", agentDir, tools.BashOperationsExecOptions{})
+		result, err := tools.CreateLocalBashOperations(nil).Exec(context.Background(), "sleep 60 & echo $! > shell-job-pid.tmp && mv shell-job-pid.tmp shell-job-pid; wait", agentDir, tools.BashOperationsExecOptions{})
 		ended <- execResult{result, err}
 	}()
 	deadline := time.After(10 * time.Second)
@@ -212,7 +256,7 @@ func TestUnrecoveredGoroutinePanicBecomesACrashRecordAtTheNextStart(t *testing.T
 func TestRuntimeFatalErrorBecomesAFatalCrashRecord(t *testing.T) {
 	agentDir := t.TempDir()
 	output, code := runExitRecordChild(t, "fatal-error", agentDir)
-	if code != 2 || !strings.Contains(output, "fatal error: concurrent map") {
+	if code != 2 || !strings.Contains(output, "fatal error: sync: unlock of unlocked mutex") {
 		t.Fatalf("the child did not die of a runtime fatal error (exit %d)\n%s", code, output)
 	}
 	ReconcileSessionMarkers(agentDir, time.Now())
@@ -406,7 +450,7 @@ func TestCacheWarmerRefreshRequestPanicIsCaughtAndReschedules(t *testing.T) {
 		reported := make(chan any, 2)
 		t.Cleanup(SetUncaughtGoroutineHandler(func(value any, _ []byte) { reported <- value }))
 		f := newFakeWarmRuntime(t, withResult(func(*ai.Model) *ai.AssistantMessageEventStream { panic("provider conversion failed") }))
-		f.warmer.Start(warmRequest(models.adaptive, ai.StreamOptions{Thinking: ai.ThinkingHigh, SessionID: "s"}), alwaysCurrent)
+		f.warmer.Start(warmRequest(models.adaptive, ai.StreamOptions{Thinking: ai.ThinkingLevel(ai.ThinkingHigh), SessionID: "s"}), alwaysCurrent)
 		advance(270 * time.Second)
 		advance(270 * time.Second)
 		if got := f.callCount(); got != 2 {
@@ -427,7 +471,7 @@ func TestCacheWarmerDecisionPanicKeepsPisDecision(t *testing.T) {
 		reported := make(chan any, 1)
 		t.Cleanup(SetUncaughtGoroutineHandler(func(value any, _ []byte) { reported <- value }))
 		f := newFakeWarmRuntime(t, withDecide(func(CacheWarmingDecisionEvent) CacheWarmingAction { panic("decide failed") }))
-		f.warmer.Start(warmRequest(models.adaptive, ai.StreamOptions{Thinking: ai.ThinkingHigh, SessionID: "s"}), alwaysCurrent)
+		f.warmer.Start(warmRequest(models.adaptive, ai.StreamOptions{Thinking: ai.ThinkingLevel(ai.ThinkingHigh), SessionID: "s"}), alwaysCurrent)
 		advance(270 * time.Second)
 		if got := f.callCount(); got != 1 {
 			t.Fatalf("calls = %d, want 1: Pi's warm decision stands", got)
@@ -449,7 +493,7 @@ func TestCacheWarmerRefreshPanicOutsideTheCaughtRequestReachesTheUncaughtHandler
 		t.Cleanup(SetUncaughtGoroutineHandler(func(value any, _ []byte) { reported <- value }))
 		f := newFakeWarmRuntime(t)
 		var armed atomic.Bool
-		f.warmer.Start(warmRequest(models.adaptive, ai.StreamOptions{Thinking: ai.ThinkingHigh, SessionID: "s"}), func() bool {
+		f.warmer.Start(warmRequest(models.adaptive, ai.StreamOptions{Thinking: ai.ThinkingLevel(ai.ThinkingHigh), SessionID: "s"}), func() bool {
 			if armed.Load() {
 				panic("isCurrent failed")
 			}
@@ -479,7 +523,7 @@ func TestInprocExtensionShutdownLeavesALine(t *testing.T) {
 		newRunner: runner,
 		tuiInst:   tui.NewWithOutput(io.Discard, 80, 24),
 		layout:    tui.NewContainer(),
-		opts:      InteractiveOptions{CWD: t.TempDir(), AgentDir: agentDir},
+		opts:      InteractiveModeOptions{CWD: t.TempDir(), AgentDir: agentDir},
 	}
 	m.wireInprocContextActions()
 	if err := runner.CreateCommandContext().Shutdown(); err != nil {
@@ -544,7 +588,7 @@ func TestTerminalInputEOFDoesNotEndTheSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = reader.Close() }()
-	m := NewInteractiveMode(InteractiveOptions{CWD: t.TempDir(), AgentDir: t.TempDir()})
+	m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: t.TempDir(), AgentDir: t.TempDir()})
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	m.startTerminalInput(ctx, reader)
@@ -562,5 +606,55 @@ func TestTerminalInputEOFDoesNotEndTheSession(t *testing.T) {
 	}
 	if text := exitLogText(m.opts.AgentDir); text != "" {
 		t.Fatalf("exit.log = %q", text)
+	}
+}
+
+// A line longer than 1 MiB must not end the tail: the lines after it are the newest.
+func TestReadExitLogTailReadsPastAVeryLongLine(t *testing.T) {
+	agentDir := t.TempDir()
+	content := "first\n" + strings.Repeat("x", 2<<20) + "\nsecond\nthird\n"
+	if err := os.WriteFile(ExitLogPath(agentDir), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if tail := ReadExitLogTail(agentDir, 2); !slices.Equal(tail, []string{"second", "third"}) {
+		t.Fatalf("tail = %q, want the last two lines", tail)
+	}
+}
+
+// An exit nobody asked for leaves the flight recorder's window beside the crash output file when PIG_PROFILE=flight
+// started it, and leaves nothing when the recorder is off.
+func TestRecordExitDumpsTheFlightRecorderBesideTheCrashOutput(t *testing.T) {
+	agentDir := t.TempDir()
+	RecordExit(agentDir, "received SIGHUP")
+	if entries, _ := os.ReadDir(CrashOutputDir(agentDir)); len(entries) != 0 {
+		t.Fatalf("recorder off, crash-output holds %v", entries)
+	}
+	stop := profiling.StartWith("flight", t.TempDir(), io.Discard)
+	defer stop()
+	RecordExit(agentDir, "received SIGHUP")
+	path := filepath.Join(CrashOutputDir(agentDir), strconv.Itoa(os.Getpid())+flightRecordSuffix)
+	data, err := os.ReadFile(path)
+	if err != nil || !bytes.HasPrefix(data, []byte("go ")) {
+		t.Fatalf("no flight window at %s: %v", path, err)
+	}
+	// The window is not a session marker: reconciling markers neither reports nor removes it.
+	ReconcileSessionMarkers(agentDir, time.Now())
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("reconcile removed the flight window: %v", err)
+	}
+}
+
+// A crash recovered by uncaughtCrash also leaves the flight recorder's window: RecordExit does not run for it, and the off-loop path exits before the deferred profile stop.
+func TestUncaughtCrashDumpsTheFlightRecorder(t *testing.T) {
+	t.Setenv("PIG_HOME", t.TempDir())
+	agentDir := t.TempDir()
+	stop := profiling.StartWith("flight", t.TempDir(), io.Discard)
+	defer stop()
+	m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: "/work", AgentDir: agentDir, AppVersion: "9.9.9"})
+	var stderr bytes.Buffer
+	m.uncaughtCrash(errors.New("kaboom"), []byte("goroutine 1 [running]:\n"), &stderr)
+	data, err := os.ReadFile(filepath.Join(CrashOutputDir(agentDir), strconv.Itoa(os.Getpid())+flightRecordSuffix))
+	if err != nil || !bytes.HasPrefix(data, []byte("go ")) {
+		t.Fatalf("no flight window after a crash: %v", err)
 	}
 }

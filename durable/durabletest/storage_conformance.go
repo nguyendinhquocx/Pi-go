@@ -5,6 +5,9 @@ package durabletest
 import (
 	"context"
 	"fmt"
+	"slices"
+
+	chorddelta "github.com/MichaelKinsy/PiG/chord/delta"
 
 	"github.com/MichaelKinsy/PiG/durable"
 	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
@@ -24,6 +27,22 @@ func must[T any](value T, err error) T {
 	return value
 }
 
+func must3[A, B any](first A, second B, err error) (A, B) {
+	if err != nil {
+		panic(caseFailure{err: err})
+	}
+	return first, second
+}
+
+// roundTripCursor returns the cursor as a caller holding it across a process boundary sees it.
+func roundTripCursor(cursor durable.Cursor) durable.Cursor {
+	//portlint:allow mapkeyorder test helper: the bytes are decoded straight back into a Cursor map, so member order is unobservable
+	encoded := must(json.Marshal(cursor))
+	var roundTripped durable.Cursor
+	check(json.Unmarshal(encoded, &roundTripped))
+	return roundTripped
+}
+
 func check(err error) {
 	if err != nil {
 		panic(caseFailure{err: err})
@@ -35,12 +54,54 @@ func mint[I durable.Id](storage durable.Storage) I {
 }
 
 func commit(storage durable.Storage, writes ...durable.StorageWrite) durable.Seq {
-	return must(storage.Commit(conformanceContext, writes))
+	return must(CommitWrites(conformanceContext, storage, writes))
+}
+
+// refusalText is the message of a refusal, nil when the commit stored every batch.
+func refusalText(refused error) any {
+	if refused == nil {
+		return nil
+	}
+	return refused.Error()
 }
 
 func commitErr(storage durable.Storage, writes ...durable.StorageWrite) error {
-	_, err := storage.Commit(conformanceContext, writes)
+	_, err := CommitWrites(conformanceContext, storage, writes)
 	return err
+}
+
+// receiptChecked is storage with every commit checked against the receipt contract: one receive per stored batch, in
+// order, with increasing seqs, all before the call returns.
+type receiptChecked struct {
+	durable.Storage
+	assertions StorageConformanceAssertions
+}
+
+func checkReceipts(storage durable.Storage, assertions StorageConformanceAssertions) durable.Storage {
+	return receiptChecked{Storage: storage, assertions: assertions}
+}
+
+func (checked receiptChecked) Commit(
+	ctx context.Context, batches [][]durable.StorageWrite, receive func(index int, seq durable.Seq),
+) (durable.CommitResult, error) {
+	var seqs []durable.Seq
+	settled := false
+	recording := func(index int, seq durable.Seq) {
+		checked.assertions.Ok(!settled, "Storage.commit() received a batch after it settled")
+		checked.assertions.StrictEqual(index, len(seqs))
+		if len(seqs) > 0 {
+			checked.assertions.GreaterThan(float64(seq), float64(seqs[len(seqs)-1]))
+		}
+		seqs = append(seqs, seq)
+		receive(index, seq)
+	}
+	result, err := checked.Storage.Commit(ctx, batches, recording)
+	settled = true
+	if err != nil {
+		return result, err
+	}
+	checked.assertions.StrictEqual(len(seqs), result.Stored)
+	return result, nil
 }
 
 func createRoot(storage durable.Storage) durable.ConversationId {
@@ -202,7 +263,7 @@ func createCase(options StorageConformanceOptions, name string, test conformance
 			expect := func(actual any) expectation {
 				return expectation{assertions: options.Assertions, actual: actual}
 			}
-			test(storage, expect, options.Assertions.Rejects)
+			test(checkReceipts(storage, options.Assertions), expect, options.Assertions.Rejects)
 			return nil
 		})
 	}}
@@ -221,6 +282,54 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 				commitErr(storage, durable.ConversationWrite{Value: durable.ConversationRecord{Id: durable.ROOT_CONVERSATION_ID}}),
 				fmt.Sprintf("ID %d already belongs to conversation", durable.ROOT_CONVERSATION_ID),
 			)
+		}),
+
+		createCase(options, "receives a durable commit once before resolving, and never a refused one", func(storage durable.Storage, expect func(any) expectation, rejects func(error, string)) {
+			rootId := createRoot(storage)
+			var events []any
+			entryId := mint[durable.EntryId](storage)
+			type entryRead struct {
+				found *durable.EntryAt
+				err   error
+			}
+			read := make(chan entryRead, 1)
+			var seq durable.Seq
+			result := must(storage.Commit(ctx, [][]durable.StorageWrite{{entryWrite(entry(entryId, rootId, "message"))}}, func(_ int, received durable.Seq) {
+				seq = received
+				events = append(events, fmt.Sprintf("receive %d", received))
+				// The batch is durable when it is received: a read started now observes it. It runs on its own goroutine, as
+				// upstream's read is a promise started inside receive, since receive runs inside the commit.
+				//portlint:allow asyncorder upstream starts the read inside receive without awaiting it (storage-conformance.ts, `read = storage.entry(entryId, context)`) and awaits it only after the commit resolved; receive runs inside Commit, so a synchronous read would deadlock on the storage lock, and the channel read below is the join
+				go func() {
+					found, err := storage.Entry(ctx, entryId)
+					read <- entryRead{found, err}
+				}()
+			}))
+			events = append(events, fmt.Sprintf("resolve %d", result.Stored))
+			expect(events).toEqual([]any{fmt.Sprintf("receive %d", seq), "resolve 1"})
+			// A storage that never received has failed the check above and started no read to wait for.
+			var started entryRead
+			select {
+			case started = <-read:
+			default:
+				if len(events) == 1 {
+					return
+				}
+				started = <-read
+			}
+			check(started.err)
+			expect(started.found.CommitSeq).toBe(seq)
+
+			events = nil
+			refused := must(storage.Commit(ctx, [][]durable.StorageWrite{{durable.ConversationWrite{Value: durable.ConversationRecord{Id: rootId}}}}, func(_ int, received durable.Seq) {
+				events = append(events, fmt.Sprintf("receive %d", received))
+			}))
+			expect(refused.Stored).toBe(0)
+			expect(refusalText(refused.Refused)).toBe(fmt.Sprintf("ID %d already belongs to conversation", rootId))
+			expect(len(events)).toBe(0)
+
+			next := commit(storage, entryWrite(entry(mint[durable.EntryId](storage), rootId, "message")))
+			expect(next).toBeGreaterThan(float64(seq))
 		}),
 
 		createCase(options, "commits mixed table writes atomically and rolls all of them back on failure", func(storage durable.Storage, expect func(any) expectation, rejects func(error, string)) {
@@ -294,18 +403,15 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			expect(must(storage.Submission(ctx, submissionId)).Detail).toEqual(map[string]any{"codes": []any{"initial"}})
 
 			readEntry := must(storage.Entry(ctx, entryId)).Entry
-			readData := readEntry.Data.(map[string]any)
-			readItems := readData["nested"].([]any)
+			readItems := member(readEntry.Data, "nested").([]any)
 			readItems[0] = 9
-			readData["nested"] = append(readItems, 9)
+			setMember(readEntry.Data, "nested", append(readItems, 9))
 			readTask := must(storage.Task(ctx, taskId))
 			if readTask.State.Status != durable.TaskTerminal {
-				readNested := (*readTask.State.Checkpoint).(map[string]any)["nested"].(map[string]any)
-				readNested["count"] = 9
+				setMember(member(*readTask.State.Checkpoint, "nested"), "count", 9)
 			}
 			readInput := must(storage.Submission(ctx, submissionId))
-			readDetail := readInput.Detail.(map[string]any)
-			readDetail["codes"] = append(readDetail["codes"].([]any), "read mutation")
+			setMember(readInput.Detail, "codes", append(member(readInput.Detail, "codes").([]any), "read mutation"))
 
 			expect(must(storage.Entry(ctx, entryId)).Entry.Data).toEqual(map[string]any{"nested": []any{1, 2}})
 			expect(must(storage.Task(ctx, taskId)).State).toEqual(expectedState)
@@ -323,18 +429,17 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 
 			data["__proto__"].(map[string]any)["polluted"] = true
 			data["constructor"].(map[string]any)["label"] = "mutated"
-			firstRead := must(storage.Entry(ctx, entryId)).Entry.Data.(map[string]any)
-			_, ownProto := firstRead["__proto__"]
-			expect(ownProto).toBe(true)
-			expect(firstRead["__proto__"]).toEqual(map[string]any{"polluted": false})
-			expect(firstRead["constructor"]).toEqual(map[string]any{"label": "stored"})
-			expect(firstRead["toString"]).toBe("value")
+			firstRead := must(storage.Entry(ctx, entryId)).Entry.Data
+			expect(hasMember(firstRead, "__proto__")).toBe(true)
+			expect(member(firstRead, "__proto__")).toEqual(map[string]any{"polluted": false})
+			expect(member(firstRead, "constructor")).toEqual(map[string]any{"label": "stored"})
+			expect(member(firstRead, "toString")).toBe("value")
 
-			firstRead["__proto__"].(map[string]any)["polluted"] = true
-			secondRead := must(storage.Entry(ctx, entryId)).Entry.Data.(map[string]any)
-			expect(secondRead["__proto__"]).toEqual(map[string]any{"polluted": false})
-			expect(secondRead["constructor"]).toEqual(map[string]any{"label": "stored"})
-			expect(secondRead["toString"]).toBe("value")
+			setMember(member(firstRead, "__proto__"), "polluted", true)
+			secondRead := must(storage.Entry(ctx, entryId)).Entry.Data
+			expect(member(secondRead, "__proto__")).toEqual(map[string]any{"polluted": false})
+			expect(member(secondRead, "constructor")).toEqual(map[string]any{"label": "stored"})
+			expect(member(secondRead, "toString")).toBe("value")
 		}),
 
 		createCase(options, "indexes entries committed out of ID order", func(storage durable.Storage, expect func(any) expectation, _ func(error, string)) {
@@ -450,6 +555,22 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			expect(entryIds(third.Items)).toEqual(int64s(rootFirst))
 			expect(cursorView(third.Next)).toBeUndefined()
 
+			// Oldest first: the root's segment, then each fork's, each capped at the next fork point.
+			ascending := durable.EntryQuery{ConversationId: grandchildId, Order: new(durable.ScanAscending)}
+			firstUp := must(storage.ScanEntries(ctx, ascending, 2, nil))
+			expect(entryIds(firstUp.Items)).toEqual(int64s(rootFirst, rootForkPoint))
+			secondUp := must(storage.ScanEntries(ctx, ascending, 2, *firstUp.Next))
+			expect(entryIds(secondUp.Items)).toEqual(int64s(childForkPoint, grandchildHead))
+			thirdUp := must(storage.ScanEntries(ctx, grandchild, 2, *secondUp.Next))
+			expect(entryIds(thirdUp.Items)).toEqual(int64s(grandchildTail))
+			expect(cursorView(thirdUp.Next)).toBeUndefined()
+			expect(entryIds(must(storage.ScanEntries(ctx, durable.EntryQuery{
+				ConversationId: grandchildId, Order: new(durable.ScanAscending),
+				MinEntryId: new(rootForkPoint), MaxEntryId: new(childForkPoint),
+			}, 10, nil)).Items)).toEqual(int64s(rootForkPoint, childForkPoint))
+			_, err := storage.ScanEntries(ctx, durable.EntryQuery{ConversationId: grandchildId, Order: new(durable.ScanDescending)}, 2, *firstUp.Next)
+			rejects(err, "cursor")
+
 			currentMarker := must(storage.FindLatestHeadMarker(ctx, grandchildId, nil))
 			expect(currentMarker.Id).toBe(grandchildHead)
 			expect(currentMarker.Head).toBe(grandchildHead)
@@ -485,10 +606,70 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			expect(must(storage.VisibleEntry(ctx, grandchildId, childExcludedLater))).toBeUndefined()
 			expect(must(storage.VisibleEntry(ctx, rootId, grandchildHead))).toBeUndefined()
 			expect(must(storage.VisibleEntry(ctx, grandchildId, 999_999))).toBeUndefined()
-			_, err := storage.VisibleEntry(ctx, 999_999, rootFirst)
+			_, err = storage.VisibleEntry(ctx, 999_999, rootFirst)
 			rejects(err, "Unknown conversation")
 			_, err = storage.ScanEntries(ctx, durable.EntryQuery{ConversationId: 999_999}, 10, nil)
 			rejects(err, "Unknown conversation")
+		}),
+
+		createCase(options, "scans tables in either ID order and continues a cursor in its order", func(storage durable.Storage, expect func(any) expectation, rejects func(error, string)) {
+			rootId := createRoot(storage)
+			conversationIdList := []int64{int64(rootId)}
+			taskIdList := []int64{}
+			submissionIdList := []int64{}
+			for range 3 {
+				conversationId := mint[durable.ConversationId](storage)
+				taskId := mint[durable.TaskId](storage)
+				submissionId := mint[durable.SubmissionId](storage)
+				commit(storage,
+					durable.ConversationWrite{Value: durable.ConversationRecord{Id: conversationId}},
+					taskWrite(pendingTask(taskId, rootId, "ready")),
+					submissionWrite(durable.SubmissionRecord{Id: submissionId, ConversationId: rootId, Type: durable.SubmissionTypeInput, Status: durable.SubmissionQueued}),
+				)
+				conversationIdList = append(conversationIdList, int64(conversationId))
+				taskIdList = append(taskIdList, int64(taskId))
+				submissionIdList = append(submissionIdList, int64(submissionId))
+			}
+			type scanFn func(order *durable.ScanOrder, cursor durable.Cursor) ([]int64, *durable.Cursor, error)
+			scans := []struct {
+				scan scanFn
+				ids  []int64
+			}{
+				{func(order *durable.ScanOrder, cursor durable.Cursor) ([]int64, *durable.Cursor, error) {
+					found, err := storage.ScanConversations(ctx, durable.ConversationQuery{Order: order}, 2, cursor)
+					return conversationIds(found.Items), found.Next, err
+				}, conversationIdList},
+				{func(order *durable.ScanOrder, cursor durable.Cursor) ([]int64, *durable.Cursor, error) {
+					found, err := storage.ScanTasks(ctx, durable.TaskQuery{Order: order}, 2, cursor)
+					return taskIds(found.Items), found.Next, err
+				}, taskIdList},
+				{func(order *durable.ScanOrder, cursor durable.Cursor) ([]int64, *durable.Cursor, error) {
+					found, err := storage.ScanSubmissions(ctx, durable.SubmissionQuery{Order: order}, 2, cursor)
+					return ids(found.Items, func(record durable.SubmissionRecord) int64 { return int64(record.Id) }), found.Next, err
+				}, submissionIdList},
+			}
+			all := func(scan scanFn, order *durable.ScanOrder) []int64 {
+				found, next := must3(scan(order, nil))
+				for next != nil {
+					// A cursor carries its order; the query may omit it.
+					var page []int64
+					page, next = must3(scan(nil, roundTripCursor(*next)))
+					found = append(found, page...)
+				}
+				return found
+			}
+			for _, current := range scans {
+				reversed := slices.Clone(current.ids)
+				slices.Reverse(reversed)
+				expect(all(current.scan, nil)).toEqual(current.ids)
+				expect(all(current.scan, new(durable.ScanAscending))).toEqual(current.ids)
+				expect(all(current.scan, new(durable.ScanDescending))).toEqual(reversed)
+				_, descendingNext := must3(current.scan(new(durable.ScanDescending), nil))
+				secondPage, _ := must3(current.scan(new(durable.ScanDescending), *descendingNext))
+				expect(secondPage).toEqual(reversed[2:min(4, len(reversed))])
+				_, _, err := current.scan(new(durable.ScanAscending), *descendingNext)
+				rejects(err, "cursor")
+			}
 		}),
 
 		createCase(options, "replaces complete task records and pages filtered task scans", func(storage durable.Storage, expect func(any) expectation, _ func(error, string)) {
@@ -565,6 +746,29 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			expect(scan(durable.TaskTerminal)).toEqual([]storedTask{terminal})
 		}),
 
+		// storage-conformance.ts "stores and scans sleeping tasks by status" (Pi f75b3240ab).
+		createCase(options, "stores and scans sleeping tasks by status", func(storage durable.Storage, expect func(any) expectation, _ func(error, string)) {
+			rootId := createRoot(storage)
+			sleepingId := mint[durable.TaskId](storage)
+			sleeping := pendingTask(sleepingId, rootId, "ready")
+			until := 61_000.0
+			sleeping.State = durable.TaskState[durable.JsonValue, durable.JsonValue]{
+				Status: durable.TaskSleeping, Checkpoint: new(durable.JsonValue(map[string]any{"phase": "next"})), Until: &until,
+			}
+			sleeping.Memos = map[string]durable.JsonValue{"kept": true}
+			commit(storage, taskWrite(sleeping))
+			expect(must(storage.Task(ctx, sleepingId))).toEqual(sleeping)
+			scan := func(status durable.TaskStatus) []storedTask {
+				return must(storage.ScanTasks(ctx, durable.TaskQuery{Status: &status}, 10, nil)).Items
+			}
+			expect(scan(durable.TaskSleeping)).toEqual([]storedTask{sleeping})
+			running := sleeping
+			running.State = durable.TaskState[durable.JsonValue, durable.JsonValue]{Status: durable.TaskRunning, Checkpoint: new(durable.JsonValue(map[string]any{"phase": "next"}))}
+			commit(storage, taskWrite(running))
+			expect(scan(durable.TaskSleeping)).toEqual([]storedTask{})
+			expect(scan(durable.TaskRunning)).toEqual([]storedTask{running})
+		}),
+
 		createCase(options, "indexes request IDs per conversation and replaces complete submission records", func(storage durable.Storage, expect func(any) expectation, _ func(error, string)) {
 			rootId := createRoot(storage)
 			secondConversationId := mint[durable.ConversationId](storage)
@@ -635,6 +839,29 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			expect(must(storage.SubmissionByRequest(ctx, rootId, "passive-failed"))).toEqual(unanswered)
 		}),
 
+		createCase(options, "stores continue submissions, which have no entry and are never queued", func(storage durable.Storage, expect func(any) expectation, _ func(error, string)) {
+			rootId := createRoot(storage)
+			doneId := mint[durable.SubmissionId](storage)
+			failedId := mint[durable.SubmissionId](storage)
+			placedDone := durable.SubmissionRecord{Id: doneId, ConversationId: rootId, RequestId: new("continue-done"), Type: durable.SubmissionTypeContinue, Status: durable.SubmissionPlaced}
+			placedFailed := durable.SubmissionRecord{Id: failedId, ConversationId: rootId, RequestId: new("continue-failed"), Type: durable.SubmissionTypeContinue, Status: durable.SubmissionPlaced}
+			commit(storage, submissionWrite(placedDone), submissionWrite(placedFailed))
+			expect(must(storage.Submission(ctx, doneId))).toEqual(placedDone)
+			expect(must(storage.ScanSubmissions(ctx, durable.SubmissionQuery{Status: new(durable.SubmissionPlaced)}, 10, nil)).Items).toEqual([]durable.SubmissionRecord{placedDone, placedFailed})
+
+			done := placedDone
+			done.Status = durable.SubmissionDone
+			done.Answer = new(mint[durable.EntryId](storage))
+			unanswered := placedFailed
+			unanswered.Status = durable.SubmissionUnanswered
+			unanswered.Reason = new("nothing_to_answer")
+			commit(storage, submissionWrite(done), submissionWrite(unanswered))
+			expect(must(storage.Submission(ctx, doneId))).toEqual(done)
+			expect(must(storage.SubmissionByRequest(ctx, rootId, "continue-done"))).toEqual(done)
+			expect(must(storage.Submission(ctx, failedId))).toEqual(unanswered)
+			expect(must(storage.SubmissionByRequest(ctx, rootId, "continue-failed"))).toEqual(unanswered)
+		}),
+
 		createCase(options, "reconstructs rewindable documents and preserves half-open incarnations", func(storage durable.Storage, expect func(any) expectation, _ func(error, string)) {
 			rootId := createRoot(storage)
 			firstId := mint[durable.DocumentId](storage)
@@ -643,7 +870,7 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 				History: durable.HistoryRewindable, Fork: durable.ForkAsOf,
 			}
 			items := []any{"a"}
-			initial := durable.JsonObject{"items": items, "nested": map[string]any{"count": 1}}
+			initial := chorddelta.JsonObjectOf("items", items, "nested", map[string]any{"count": 1})
 			createdAt := commit(storage, durable.DocumentCreateWrite{Record: firstRecord, Content: base(1, initial)})
 			appended := []any{"b"}
 			changedAt := commit(storage, durable.DocumentChangeWrite{Id: firstId, Content: delta(1,
@@ -652,7 +879,7 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			)})
 
 			items[0] = "caller mutation"
-			initial["items"] = append(items, "caller mutation")
+			initial.Set("items", append(items, "caller mutation"))
 			appended[0] = "caller mutation"
 			expect(storedView(must(storage.Document(ctx, firstId, durable.AtSeq(createdAt))))).toMatchObject(map[string]any{
 				"version": 1, "value": map[string]any{"items": []any{"a"}, "nested": map[string]any{"count": 1}}, "deltasSinceBase": 0,
@@ -660,16 +887,14 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			changed := must(storage.Document(ctx, firstId, durable.AtSeq(changedAt)))
 			expect(changed.Value).toEqual(map[string]any{"items": []any{"a", "b"}, "nested": map[string]any{"count": 2}})
 			expect(changed.DeltasSinceBase).toBe(1)
-			changedItems := changed.Value["items"].([]any)
+			changedItems := changed.Value.Value("items").([]any)
 			changedItems[0] = "read mutation"
-			changed.Value["items"] = append(changedItems, "read mutation")
+			changed.Value.Set("items", append(changedItems, "read mutation"))
 			expect(must(storage.Document(ctx, firstId, durable.CurrentPoint)).Value).toEqual(map[string]any{
 				"items": []any{"a", "b"}, "nested": map[string]any{"count": 2},
 			})
 
-			checkpointAt := commit(storage, durable.DocumentChangeWrite{Id: firstId, Content: base(2, durable.JsonObject{
-				"items": []any{"checkpoint"}, "nested": map[string]any{"count": 3},
-			})})
+			checkpointAt := commit(storage, durable.DocumentChangeWrite{Id: firstId, Content: base(2, chorddelta.JsonObjectOf("items", []any{"checkpoint"}, "nested", map[string]any{"count": 3}))})
 			replacedAt := commit(storage, durable.DocumentChangeWrite{Id: firstId, Content: delta(2,
 				op("r", map[string]any{"items": []any{"replacement"}, "nested": map[string]any{"count": 4}}),
 			)})
@@ -688,7 +913,7 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			secondRecord := firstRecord
 			secondRecord.Id = secondId
 			retiredAt := commit(storage,
-				durable.DocumentCreateWrite{Record: secondRecord, Content: base(1, durable.JsonObject{"items": []any{"new"}})},
+				durable.DocumentCreateWrite{Record: secondRecord, Content: base(1, chorddelta.JsonObjectOf("items", []any{"new"}))},
 				durable.DocumentRetireWrite{Id: firstId},
 				durable.DocumentChangeWrite{Id: firstId, Content: delta(2, op("s", path("retiring"), true))},
 			)
@@ -711,42 +936,36 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			rows := func(count int, value func(int) int, stable func(int) string) []any {
 				out := make([]any, count)
 				for index := range count {
-					out[index] = map[string]any{"value": value(index), "stable": stable(index)}
+					out[index] = chorddelta.JsonObjectOf("value", value(index), "stable", stable(index))
 				}
 				return out
 			}
-			initial := durable.JsonObject{
-				"revision": 0,
-				"rows":     rows(512, func(value int) int { return value }, func(value int) string { return fmt.Sprintf("row-%d", value) }),
-			}
+			initial := chorddelta.JsonObjectOf("revision", 0, "rows", rows(512, func(value int) int { return value }, func(value int) string { return fmt.Sprintf("row-%d", value) }))
 			createdAt := commit(storage, durable.DocumentCreateWrite{Record: record, Content: base(1, initial)})
 			beforeReplacement := structuredClone(initial)
 			beforeReplacementAt := createdAt
 			for revision := 1; revision <= 24; revision++ {
-				beforeRows := beforeReplacement["rows"].([]any)
+				beforeRows := beforeReplacement.Value("rows").([]any)
 				index := (revision * 17) % len(beforeRows)
-				beforeRows[index].(map[string]any)["value"] = -revision
-				beforeReplacement["revision"] = revision
+				beforeRows[index].(*chorddelta.JsonObject).Set("value", -revision)
+				beforeReplacement.Set("revision", revision)
 				beforeReplacementAt = commit(storage, durable.DocumentChangeWrite{Id: id, Content: delta(1,
 					op("s", path("rows", index, "value"), -revision),
 					op("s", path("revision"), revision),
 				)})
 			}
 
-			replacement := durable.JsonObject{
-				"revision": 100,
-				"rows":     rows(512, func(value int) int { return 10_000 + value }, func(value int) string { return fmt.Sprintf("new-%d", value) }),
-			}
+			replacement := chorddelta.JsonObjectOf("revision", 100, "rows", rows(512, func(value int) int { return 10_000 + value }, func(value int) string { return fmt.Sprintf("new-%d", value) }))
 			replacementSnapshot := structuredClone(replacement)
 			replacementAt := commit(storage, durable.DocumentChangeWrite{Id: id, Content: delta(1, op("r", replacement))})
-			replacement["rows"].([]any)[0].(map[string]any)["value"] = -999
+			replacement.Value("rows").([]any)[0].(*chorddelta.JsonObject).Set("value", -999)
 
 			current := structuredClone(replacementSnapshot)
 			for revision := 101; revision <= 124; revision++ {
-				currentRows := current["rows"].([]any)
+				currentRows := current.Value("rows").([]any)
 				index := (revision * 19) % len(currentRows)
-				currentRows[index].(map[string]any)["value"] = -revision
-				current["revision"] = revision
+				currentRows[index].(*chorddelta.JsonObject).Set("value", -revision)
+				current.Set("revision", revision)
 				commit(storage, durable.DocumentChangeWrite{Id: id, Content: delta(1,
 					op("s", path("rows", index, "value"), -revision),
 					op("s", path("revision"), revision),
@@ -758,7 +977,7 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			expect(must(storage.Document(ctx, id, durable.AtSeq(replacementAt))).Value).toEqual(replacementSnapshot)
 			read := must(storage.Document(ctx, id, durable.CurrentPoint))
 			expect(read.Value).toEqual(current)
-			read.Value["rows"].([]any)[0].(map[string]any)["value"] = -1_000
+			read.Value.Value("rows").([]any)[0].(*chorddelta.JsonObject).Set("value", -1_000)
 			expect(must(storage.Document(ctx, id, durable.CurrentPoint)).Value).toEqual(current)
 		}),
 
@@ -775,9 +994,7 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 				Id: sourceId, Kind: "copy.source", Scope: conversationScope(rootId),
 				History: durable.HistoryRewindable, Fork: durable.ForkAsOf,
 			}
-			createdAt := commit(storage, durable.DocumentCreateWrite{Record: sourceRecord, Content: base(2, durable.JsonObject{
-				"count": 1, "rows": []any{map[string]any{"value": "base"}},
-			})})
+			createdAt := commit(storage, durable.DocumentCreateWrite{Record: sourceRecord, Content: base(2, chorddelta.JsonObjectOf("count", 1, "rows", []any{chorddelta.JsonObjectOf("value", "base")}))})
 			commit(storage, durable.DocumentChangeWrite{Id: sourceId, Content: delta(2,
 				op("s", path("count"), 2),
 				op("p", path("rows"), 1, 0, []any{map[string]any{"value": "current"}}),
@@ -807,7 +1024,7 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			expect(must(storage.Document(ctx, retiredCopyId, durable.CurrentPoint))).toBeUndefined()
 
 			commit(storage,
-				durable.DocumentChangeWrite{Id: sourceId, Content: base(2, durable.JsonObject{"count": 99, "rows": []any{}})},
+				durable.DocumentChangeWrite{Id: sourceId, Content: base(2, chorddelta.JsonObjectOf("count", 99, "rows", []any{}))},
 				durable.DocumentRetireWrite{Id: sourceId},
 			)
 			expect(must(storage.Document(ctx, currentCopyId, durable.CurrentPoint)).Value).toEqual(currentValue)
@@ -818,13 +1035,13 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 				Id: latestSourceId, Kind: "copy.latest", Scope: conversationScope(rootId),
 				History: durable.HistoryLatest, Fork: durable.ForkCurrent,
 			}
-			commit(storage, durable.DocumentCreateWrite{Record: latestSource, Content: base(4, durable.JsonObject{"retained": "copy"})})
+			commit(storage, durable.DocumentCreateWrite{Record: latestSource, Content: base(4, chorddelta.JsonObjectOf("retained", "copy"))})
 			latestCopy := latestSource
 			latestCopy.Id = latestCopyId
 			latestCopy.Scope = conversationScope(childId)
 			commit(storage, durable.DocumentCopyWrite{Record: latestCopy, Source: durable.DocumentCopySource{Id: latestSourceId, At: durable.CurrentPoint}})
 			commit(storage,
-				durable.DocumentChangeWrite{Id: latestSourceId, Content: base(4, durable.JsonObject{"retained": "source-only"})},
+				durable.DocumentChangeWrite{Id: latestSourceId, Content: base(4, chorddelta.JsonObjectOf("retained", "source-only"))},
 				durable.DocumentRetireWrite{Id: latestSourceId},
 			)
 			expect(storedView(must(storage.Document(ctx, latestCopyId, durable.CurrentPoint)))).toMatchObject(map[string]any{
@@ -836,7 +1053,7 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 				durable.DocumentCopyWrite{Record: childRecord(conflictId, childId), Source: durable.DocumentCopySource{Id: currentCopyId, At: durable.CurrentPoint}},
 				durable.DocumentRetireWrite{Id: currentCopyId},
 			)
-			expect(errorName(conflictError)).toBe("StorageRejected")
+			expect(conflictError != nil).toBe(true)
 			expect(must(storage.Document(ctx, conflictId, durable.CurrentPoint))).toBeUndefined()
 			expect(must(storage.Document(ctx, currentCopyId, durable.CurrentPoint)).Value).toEqual(currentValue)
 
@@ -844,7 +1061,7 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			mismatch := childRecord(mismatchId, childId)
 			mismatch.Kind = "copy.mismatch"
 			mismatchError := commitErr(storage, durable.DocumentCopyWrite{Record: mismatch, Source: durable.DocumentCopySource{Id: currentCopyId, At: durable.CurrentPoint}})
-			expect(errorName(mismatchError)).toBe("StorageRejected")
+			expect(mismatchError != nil).toBe(true)
 			expect(must(storage.Document(ctx, mismatchId, durable.CurrentPoint))).toBeUndefined()
 		}),
 
@@ -852,9 +1069,9 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			createRoot(storage)
 			id := mint[durable.DocumentId](storage)
 			record := durable.DocumentCreate{Id: id, Kind: "session.settings", Scope: sessionScope}
-			commit(storage, durable.DocumentCreateWrite{Record: record, Content: base(1, durable.JsonObject{"count": 1})})
+			commit(storage, durable.DocumentCreateWrite{Record: record, Content: base(1, chorddelta.JsonObjectOf("count", 1))})
 			commit(storage, durable.DocumentChangeWrite{Id: id, Content: delta(1, op("s", path("count"), 2))})
-			migratedAt := commit(storage, durable.DocumentChangeWrite{Id: id, Content: base(2, durable.JsonObject{"count": 3})})
+			migratedAt := commit(storage, durable.DocumentChangeWrite{Id: id, Content: base(2, chorddelta.JsonObjectOf("count", 3))})
 			expect(storedView(must(storage.Document(ctx, id, durable.CurrentPoint)))).toMatchObject(map[string]any{"version": 2, "value": map[string]any{"count": 3}})
 			_, err := storage.Document(ctx, id, durable.AtSeq(migratedAt))
 			rejects(err, "does not retain historical content")
@@ -876,7 +1093,7 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			taskOtherKindId := mint[durable.DocumentId](storage)
 			taskScope := durable.DocumentRecordScope{Kind: durable.ScopeTask, TaskId: taskId}
 			create := func(record durable.DocumentCreate, owner string) durable.StorageWrite {
-				return durable.DocumentCreateWrite{Record: record, Content: base(1, durable.JsonObject{"owner": owner})}
+				return durable.DocumentCreateWrite{Record: record, Content: base(1, chorddelta.JsonObjectOf("owner", owner))}
 			}
 			createdAt := commit(storage,
 				taskWrite(pendingTask(taskId, rootId, "ready")),
@@ -910,11 +1127,11 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			firstId := mint[durable.DocumentId](storage)
 			secondId := mint[durable.DocumentId](storage)
 			record := durable.DocumentCreate{Id: firstId, Kind: "singleton", Scope: sessionScope}
-			commit(storage, durable.DocumentCreateWrite{Record: record, Content: base(1, durable.JsonObject{"value": 1})})
+			commit(storage, durable.DocumentCreateWrite{Record: record, Content: base(1, chorddelta.JsonObjectOf("value", 1))})
 			secondRecord := record
 			secondRecord.Id = secondId
 			rejects(commitErr(storage,
-				durable.DocumentCreateWrite{Record: secondRecord, Content: base(1, durable.JsonObject{"value": 2})},
+				durable.DocumentCreateWrite{Record: secondRecord, Content: base(1, chorddelta.JsonObjectOf("value", 2))},
 				durable.DocumentChangeWrite{Id: firstId, Content: delta(1)},
 			), "already has a current incarnation")
 			expect(must(storage.Document(ctx, firstId, durable.CurrentPoint)).Value).toEqual(map[string]any{"value": 1})
@@ -925,12 +1142,30 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 				durable.DocumentCreateWrite{Record: durable.DocumentCreate{
 					Id: emptyId, Kind: record.Kind, Key: new("empty"), Scope: conversationScope(rootId),
 					History: durable.HistoryRewindable, Fork: durable.ForkInitial,
-				}, Content: base(1, durable.JsonObject{})},
+				}, Content: base(1, chorddelta.NewJsonObject(0))},
 				durable.DocumentRetireWrite{Id: emptyId},
 			)
 			expect(must(storage.Document(ctx, emptyId, durable.CurrentPoint))).toBeUndefined()
 			expect(must(storage.Document(ctx, emptyId, durable.AtSeq(emptyAt)))).toBeUndefined()
 			expect(must(storage.FindDocument(ctx, durable.DocumentAddress{Kind: record.Kind, Scope: conversationScope(rootId), Key: new("empty")}, durable.AtSeq(emptyAt)))).toBeUndefined()
+		}),
+
+		createCase(options, "refuses a creation and a change of one document in one commit, in either order", func(storage durable.Storage, expect func(any) expectation, rejects func(error, string)) {
+			createRoot(storage)
+			for _, order := range []string{"create first", "change first"} {
+				id := mint[durable.DocumentId](storage)
+				create := durable.DocumentCreateWrite{
+					Record:  durable.DocumentCreate{Id: id, Kind: "twice", Key: new(order), Scope: sessionScope},
+					Content: base(1, chorddelta.JsonObjectOf("x", 1)),
+				}
+				change := durable.DocumentChangeWrite{Id: id, Content: delta(1, op("s", path("x"), 2))}
+				writes := []durable.StorageWrite{create, change}
+				if order == "change first" {
+					writes = []durable.StorageWrite{change, create}
+				}
+				rejects(commitErr(storage, writes...), "more than one content command")
+				expect(must(storage.Document(ctx, id, durable.CurrentPoint))).toBeUndefined()
+			}
 		}),
 
 		createCase(options, "rolls back record tables and secondary indexes when a document command fails", func(storage durable.Storage, expect func(any) expectation, rejects func(error, string)) {
@@ -944,7 +1179,7 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			baselineSeq := commit(storage,
 				taskWrite(task),
 				submissionWrite(submission),
-				durable.DocumentCreateWrite{Record: record, Content: base(1, durable.JsonObject{"count": 1})},
+				durable.DocumentCreateWrite{Record: record, Content: base(1, chorddelta.JsonObjectOf("count", 1))},
 			)
 
 			entryId := mint[durable.EntryId](storage)
@@ -960,7 +1195,7 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 				taskWrite(runningTask),
 				submissionWrite(failedSubmission),
 				entryWrite(entry(entryId, rootId, "transient")),
-				durable.DocumentCreateWrite{Record: conflicting, Content: base(1, durable.JsonObject{"count": 2})},
+				durable.DocumentCreateWrite{Record: conflicting, Content: base(1, chorddelta.JsonObjectOf("count", 2))},
 			), "already has a current incarnation")
 
 			expect(must(storage.Task(ctx, taskId))).toEqual(task)
@@ -990,7 +1225,7 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			firstTask.Kind = first
 			secondTask := pendingTask(secondTaskId, rootId, "ready")
 			secondTask.Kind = second
-			identity := func(value string) durable.DocumentContent { return base(1, durable.JsonObject{"identity": value}) }
+			identity := func(value string) durable.DocumentContent { return base(1, chorddelta.JsonObjectOf("identity", value)) }
 			commit(storage,
 				taskWrite(firstTask),
 				taskWrite(secondTask),
@@ -1033,12 +1268,176 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 			rejects(err, "ID space is exhausted")
 		}),
 
+		createCase(options, "commits batches in order, each with its seq, checked against the earlier ones", func(storage durable.Storage, expect func(any) expectation, _ func(error, string)) {
+			rootId := createRoot(storage)
+			firstId := mint[durable.EntryId](storage)
+			lastId := mint[durable.EntryId](storage)
+			documentId := mint[durable.DocumentId](storage)
+			type receipt struct {
+				index int
+				seq   durable.Seq
+			}
+			type entryRead struct {
+				found *durable.EntryAt
+				err   error
+			}
+			var receipts []receipt
+			var read chan entryRead
+			result := must(storage.Commit(ctx, [][]durable.StorageWrite{
+				{
+					entryWrite(entry(firstId, rootId, "message")),
+					durable.DocumentCreateWrite{
+						Record: durable.DocumentCreate{
+							Id: documentId, Kind: "batch.doc", Scope: conversationScope(rootId),
+							History: durable.HistoryLatest, Fork: durable.ForkInitial,
+						},
+						Content: base(1, chorddelta.JsonObjectOf("count", 1)),
+					},
+				},
+				// Changes the document the batch before created.
+				{durable.DocumentChangeWrite{Id: documentId, Content: delta(1, op("s", path("count"), 2))}},
+				{entryWrite(entry(lastId, rootId, "message"))},
+			}, func(index int, seq durable.Seq) {
+				receipts = append(receipts, receipt{index, seq})
+				// Receipts follow the last durable batch: a read started at the first observes it.
+				if read == nil {
+					read = make(chan entryRead, 1)
+					//portlint:allow asyncorder upstream starts the read inside receive without awaiting it (storage-conformance.ts, `read ??= storage.entry(lastId, context)`) and awaits it only after the commit resolved; receive runs inside Commit, so a synchronous read would deadlock on the storage lock, and the channel read below is the join
+					go func() {
+						found, err := storage.Entry(ctx, lastId)
+						read <- entryRead{found, err}
+					}()
+				}
+			}))
+			expect(result.Stored).toBe(3)
+			expect(result.Refused).toBeUndefined()
+			expect(len(receipts)).toBe(3)
+			if len(receipts) != 3 {
+				return
+			}
+			expect([]int{receipts[0].index, receipts[1].index, receipts[2].index}).toEqual([]any{0, 1, 2})
+			first, second, last := receipts[0].seq, receipts[1].seq, receipts[2].seq
+			expect(second).toBeGreaterThan(float64(first))
+			expect(last).toBeGreaterThan(float64(second))
+			if read == nil {
+				return
+			}
+			started := <-read
+			check(started.err)
+			expect(started.found.CommitSeq).toBe(last)
+			expect(must(storage.Entry(ctx, firstId)).CommitSeq).toBe(first)
+			expect(must(storage.Document(ctx, documentId, durable.CurrentPoint)).Value).toEqual(map[string]any{"count": 2})
+			next := commit(storage, entryWrite(entry(mint[durable.EntryId](storage), rootId, "message")))
+			expect(next).toBeGreaterThan(float64(last))
+		}),
+
+		createCase(options, "stores the batches before the first one refused, and none after it", func(storage durable.Storage, expect func(any) expectation, _ func(error, string)) {
+			rootId := createRoot(storage)
+			firstId := mint[durable.EntryId](storage)
+			afterId := mint[durable.EntryId](storage)
+			var receipts []any
+			result := must(storage.Commit(ctx, [][]durable.StorageWrite{
+				{entryWrite(entry(firstId, rootId, "message"))},
+				// Refused against the state the first batch left: the ID is taken now.
+				{
+					taskWrite(pendingTask(mint[durable.TaskId](storage), rootId, "ready")),
+					entryWrite(entry(firstId, rootId, "message")),
+				},
+				{entryWrite(entry(afterId, rootId, "message"))},
+			}, func(index int, _ durable.Seq) { receipts = append(receipts, index) }))
+			expect(result.Stored).toBe(1)
+			expect(refusalText(result.Refused)).toBe(fmt.Sprintf("ID %d already belongs to entry", firstId))
+			expect(receipts).toEqual([]any{0})
+			expect(must(storage.Entry(ctx, firstId))).toBeDefined()
+			expect(must(storage.Entry(ctx, afterId))).toBeUndefined()
+			expect(len(must(storage.ScanTasks(ctx, durable.TaskQuery{}, 10, nil)).Items)).toBe(0)
+
+			// A refused first batch stores nothing; the storage goes on.
+			refused := must(storage.Commit(ctx, [][]durable.StorageWrite{
+				{durable.ConversationWrite{Value: durable.ConversationRecord{Id: rootId}}},
+			}, func(index int, _ durable.Seq) { receipts = append(receipts, index) }))
+			expect(refused.Stored).toBe(0)
+			expect(refusalText(refused.Refused)).toBe(fmt.Sprintf("ID %d already belongs to conversation", rootId))
+			expect(receipts).toEqual([]any{0})
+			commit(storage, entryWrite(entry(afterId, rootId, "message")))
+			expect(must(storage.Entry(ctx, afterId))).toBeDefined()
+		}),
+
+		createCase(options, "refuses a later batch its own malformed actions fail, keeping the batches before it", func(storage durable.Storage, expect func(any) expectation, _ func(error, string)) {
+			rootId := createRoot(storage)
+			documentId := mint[durable.DocumentId](storage)
+			commit(storage, durable.DocumentCreateWrite{
+				Record:  durable.DocumentCreate{Id: documentId, Kind: "staged", Scope: sessionScope},
+				Content: base(1, chorddelta.JsonObjectOf("n", 1)),
+			})
+			firstId := mint[durable.EntryId](storage)
+			secondId := mint[durable.EntryId](storage)
+			afterId := mint[durable.EntryId](storage)
+			var receipts []any
+			result := must(storage.Commit(ctx, [][]durable.StorageWrite{
+				{entryWrite(entry(firstId, rootId, "message"))},
+				// Malformed in itself, whatever is stored: one document retired twice.
+				{
+					entryWrite(entry(secondId, rootId, "message")),
+					durable.DocumentRetireWrite{Id: documentId},
+					durable.DocumentRetireWrite{Id: documentId},
+				},
+				{entryWrite(entry(afterId, rootId, "message"))},
+			}, func(index int, _ durable.Seq) { receipts = append(receipts, index) }))
+			expect(result.Stored).toBe(1)
+			expect(result.Refused != nil).toBe(true)
+			expect(receipts).toEqual([]any{0})
+			expect(must(storage.Entry(ctx, firstId))).toBeDefined()
+			expect(must(storage.Entry(ctx, secondId))).toBeUndefined()
+			expect(must(storage.Entry(ctx, afterId))).toBeUndefined()
+			expect(must(storage.Document(ctx, documentId, durable.CurrentPoint)).Value).toEqual(map[string]any{"n": 1})
+		}),
+
+		createCase(options, "resolves a batched copy against the state the earlier batches left", func(storage durable.Storage, expect func(any) expectation, _ func(error, string)) {
+			rootId := createRoot(storage)
+			childId := mint[durable.ConversationId](storage)
+			sourceId := mint[durable.DocumentId](storage)
+			copyId := mint[durable.DocumentId](storage)
+			record := func(id durable.DocumentId, conversationId durable.ConversationId) durable.DocumentCreate {
+				return durable.DocumentCreate{
+					Id: id, Kind: "batch.copy", Scope: conversationScope(conversationId),
+					History: durable.HistoryRewindable, Fork: durable.ForkAsOf,
+				}
+			}
+			var seqs []durable.Seq
+			result := must(storage.Commit(ctx, [][]durable.StorageWrite{
+				{durable.DocumentCreateWrite{Record: record(sourceId, rootId), Content: base(1, chorddelta.JsonObjectOf("count", 1))}},
+				{durable.DocumentChangeWrite{Id: sourceId, Content: delta(1, op("s", path("count"), 2))}},
+				{
+					durable.ConversationWrite{Value: durable.ConversationRecord{Id: childId}},
+					durable.DocumentCopyWrite{Record: record(copyId, childId), Source: durable.DocumentCopySource{Id: sourceId, At: durable.CurrentPoint}},
+				},
+			}, func(_ int, seq durable.Seq) { seqs = append(seqs, seq) }))
+			expect(result.Stored).toBe(3)
+			expect(result.Refused).toBeUndefined()
+			expect(must(storage.Document(ctx, copyId, durable.CurrentPoint)).Value).toEqual(map[string]any{"count": 2})
+			expect(must(storage.Document(ctx, sourceId, durable.AtSeq(seqs[0]))).Value).toEqual(map[string]any{"count": 1})
+
+			// A copy whose source the same batch changes is refused before the batch writes anything.
+			laterId := mint[durable.ConversationId](storage)
+			laterCopyId := mint[durable.DocumentId](storage)
+			refused := must(storage.Commit(ctx, [][]durable.StorageWrite{{
+				durable.ConversationWrite{Value: durable.ConversationRecord{Id: laterId}},
+				durable.DocumentCopyWrite{Record: record(laterCopyId, laterId), Source: durable.DocumentCopySource{Id: sourceId, At: durable.CurrentPoint}},
+				durable.DocumentChangeWrite{Id: sourceId, Content: delta(1, op("s", path("count"), 3))},
+			}}, func(int, durable.Seq) {}))
+			expect(refused.Stored).toBe(0)
+			expect(refused.Refused != nil).toBe(true)
+			expect(must(storage.Conversation(ctx, laterId))).toBeUndefined()
+			expect(must(storage.Document(ctx, sourceId, durable.CurrentPoint)).Value).toEqual(map[string]any{"count": 2})
+		}),
+
 		createCase(options, "rejects every operation after close", func(storage durable.Storage, _ func(any) expectation, rejects func(error, string)) {
 			createRoot(storage)
 			check(storage.Close(ctx))
 			_, err := storage.Conversation(ctx, durable.ROOT_CONVERSATION_ID)
 			rejects(err, "closed")
-			rejects(commitErr(storage), "closed")
+			rejects(commitErr(storage, durable.ConversationWrite{Value: durable.ConversationRecord{Id: durable.ROOT_CONVERSATION_ID}}), "closed")
 			_, err = storage.MintId()
 			rejects(err, "closed")
 		}),
@@ -1048,23 +1447,17 @@ func CreateStorageConformance(options StorageConformanceOptions) []StorageConfor
 // maxSafeInteger is JavaScript's Number.MAX_SAFE_INTEGER.
 const maxSafeInteger = 1<<53 - 1
 
-// errorName is the upstream Error.name of a storage error.
-func errorName(err error) string {
-	//nolint:errorlint // Upstream reads the thrown error's own name, not a cause in its chain.
-	if _, ok := err.(*durable.StorageRejected); ok {
-		return "StorageRejected"
-	}
-	if err == nil {
-		return ""
-	}
-	return "Error"
-}
-
-// structuredClone deep-copies a JSON object built from maps and slices.
+// structuredClone deep-copies a JSON object built from ordered objects, maps and slices.
 func structuredClone(value durable.JsonObject) durable.JsonObject {
 	var clone func(any) any
 	clone = func(value any) any {
 		switch typed := value.(type) {
+		case *chorddelta.JsonObject:
+			out := chorddelta.NewJsonObject(typed.Len())
+			for key, item := range typed.All() {
+				out.Set(key, clone(item))
+			}
+			return out
 		case map[string]any:
 			out := make(map[string]any, len(typed))
 			for key, item := range typed {
@@ -1081,5 +1474,32 @@ func structuredClone(value durable.JsonObject) durable.JsonObject {
 			return value
 		}
 	}
-	return clone(value).(map[string]any)
+	return clone(value).(*chorddelta.JsonObject)
+}
+
+// member reads key of a stored JSON object, which a storage returns as the Go map it was given or, decoded from text, as an ordered
+// object.
+func member(object any, key string) any {
+	if ordered, ok := object.(*chorddelta.JsonObject); ok {
+		return ordered.Value(key)
+	}
+	return object.(map[string]any)[key]
+}
+
+// setMember writes key of a stored JSON object of either form.
+func setMember(object any, key string, value any) {
+	if ordered, ok := object.(*chorddelta.JsonObject); ok {
+		ordered.Set(key, value)
+		return
+	}
+	object.(map[string]any)[key] = value
+}
+
+// hasMember reports whether a stored JSON object of either form has key.
+func hasMember(object any, key string) bool {
+	if ordered, ok := object.(*chorddelta.JsonObject); ok {
+		return ordered.Has(key)
+	}
+	_, ok := object.(map[string]any)[key]
+	return ok
 }

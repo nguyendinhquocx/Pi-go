@@ -2,7 +2,7 @@ package tui
 
 // diff_component.go: diff display component.
 //
-// Ports upstream components/diff.ts (147 LOC) as a Component wrapper
+// Ports packages/coding-agent/src/modes/interactive/components/diff.ts (147 LOC) as a Component wrapper
 // around the existing RenderDiff function in diff_render.go.
 
 import (
@@ -35,11 +35,12 @@ func (d *DiffComponent) Render(width int) []string {
 	if d.diffText == "" {
 		return nil
 	}
-	rendered := RenderDiff(d.diffText)
+	rendered := RenderDiff(d.diffText, RenderDiffOptions{FilePath: d.filePath})
 	// Upstream feeds renderDiff output through Text, which wraps to width.
 	var out []string
 	for line := range strings.SplitSeq(rendered, "\n") {
-		if width <= 0 || widthx.VisibleWidth(line) <= width {
+		// wrapTextWithAnsi splits on CR as well as LF, so a line that carries a CR (a diff of a CRLF file) is always wrapped.
+		if !strings.ContainsRune(line, '\r') && (width <= 0 || widthx.VisibleWidth(line) <= width) {
 			out = append(out, line)
 			continue
 		}

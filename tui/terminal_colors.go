@@ -14,6 +14,19 @@ import (
 // TerminalColorScheme is the terminal's dark or light palette preference.
 type TerminalColorScheme = TerminalTheme
 
+// The two TerminalColorScheme values (terminal-colors.ts:7 `"dark" | "light"`).
+const (
+	TerminalColorSchemeDark  TerminalColorScheme = "dark"
+	TerminalColorSchemeLight TerminalColorScheme = "light"
+)
+
+// RgbColor is terminal-colors.ts RgbColor. It preserves JavaScript numeric channels, including NaN when an overflowing channel is scaled by an infinite maximum.
+type RgbColor struct {
+	R float64
+	G float64
+	B float64
+}
+
 var colorSchemeReportPattern = lazyregexp.New(`^(?:\x1b\[\?997;(1|2)n)+$`)
 
 // IsOsc11BackgroundColorResponse recognizes a complete OSC 11 reply, even when its color payload cannot be parsed.
@@ -28,9 +41,9 @@ func ParseTerminalColorSchemeReport(data string) TerminalColorScheme {
 		return ""
 	}
 	if match[1] == "2" {
-		return "light"
+		return TerminalColorSchemeLight
 	}
-	return "dark"
+	return TerminalColorSchemeDark
 }
 
 // TerminalColors are the colors the terminal reports for its current theme. A nil Foreground or Background, or a nil Palette, was not reported.

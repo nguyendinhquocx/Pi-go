@@ -1,3 +1,4 @@
+// Ports packages/coding-agent/src/config.ts (detectInstallMethod, getInferredNpmInstall; the native ownership tier is D39).
 package codingagent
 
 import (
@@ -220,8 +221,9 @@ func resolveSelfUpdateTierOn(goos, exe string, runner cmdRunner, entrypoints ...
 	entrypoints = append([]string{exe}, entrypoints...)
 	// Follow symlinks to the real target so ownership and writability are
 	// evaluated against the binary pig would actually replace. Mirrors
-	// upstream realpathSync in isManagedByGlobalPackageManager.
-	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+	// upstream realpathSync in isManagedByGlobalPackageManager. Node's realpathSync, not filepath.EvalSymlinks: on Windows the first keeps the spelling of
+	// a component that is not a link (case, 8.3 short names such as RUNNER~1), the second rewrites it to the stored long name.
+	if resolved, err := evalCanonicalPath(exe); err == nil {
 		exe = resolved
 	}
 
@@ -257,7 +259,7 @@ func resolveSelfUpdateTierOn(goos, exe string, runner cmdRunner, entrypoints ...
 
 	verified := make([]string, 0, len(entrypoints))
 	for _, entrypoint := range entrypoints {
-		resolved, err := filepath.EvalSymlinks(entrypoint)
+		resolved, err := evalCanonicalPath(entrypoint)
 		if err == nil && ownershipPath(goos, resolved) == ownershipPath(goos, exe) {
 			verified = append(verified, entrypoint)
 		}
@@ -599,7 +601,8 @@ func ContainerRemediation(exePath string) string {
 func UnsupportedRemediation(exePath string) string {
 	return fmt.Sprintf(
 		"%s cannot self-update this installation. Executable: %s. "+
-			"Reinstall it with the package manager, wrapper, or source checkout that provided it, or download a new %s binary from your provider's releases.",
+			"Reinstall it with the package manager, wrapper, or source checkout that provided it, or download a new %s binary from your provider's releases. "+
+			"To use your own update command, set PI_SELF_UPDATE_COMMAND or the selfUpdateCommand setting.",
 		AppName, exePath, AppName)
 }
 

@@ -17,7 +17,7 @@ const piSessionOrderDir = "../../internal/codingagent/testdata/pi-session-order"
 
 // upstream: packages/coding-agent/src/core/session-manager.ts:439-585, 1529-1560. The expectations are what the real Pi 0.99.1 SessionManager returns on entries.jsonl, written by JSON.stringify; its session-manager.ts and messages.ts are the same in 0.99.2.
 //
-// An extension in Node reads the session from the log the host replicated and Pi's own code; an extension in Rust or Python asks the host, which answers with the same entries and projections. Both must hand the extension objects in Pi's member order, so the extension sees and re-serializes them as Pi does. The Go SDK decodes every object into a Go map, which has no member order (a Go language mechanic, not a host difference), so it is not a row here.
+// An extension in Node reads the session from the log the host replicated and Pi's own code; an extension in Rust, Python or Lisp asks the host, which answers with the same entries and projections. Both must hand the extension objects in Pi's member order, so the extension sees and re-serializes them as Pi does. The Go SDK decodes every object into a Go map, which has no member order (a Go language mechanic, not a host difference), so it is not a row here.
 func TestSessionReadsKeepPiMemberOrderAcrossSDKs(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping conformance suite in short mode (builds subprocess fixtures)")
@@ -45,7 +45,7 @@ func TestSessionReadsKeepPiMemberOrderAcrossSDKs(t *testing.T) {
 
 	for _, tc := range allHarnessCases() {
 		switch tc.name {
-		case "subprocess-node", "subprocess-node-packed", "subprocess-rust", "subprocess-python":
+		case "subprocess-node", "subprocess-node-packed", "subprocess-rust", "subprocess-python", "subprocess-lisp":
 		default:
 			continue
 		}
@@ -83,9 +83,9 @@ func TestSessionReadsKeepPiMemberOrderAcrossSDKs(t *testing.T) {
 			h.bridge.SetHostAction("getSessionID", func() string { return view.Session.ID() })
 			h.bridge.SetHostAction("getSessionName", func() string { return "" })
 			h.bridge.SetHostAction("getSessionFile", func() string { return view.Session.Path() })
-			h.bridge.SetHostAction("getLeafID", func() string { return *view.Session.LeafID() })
+			h.bridge.SetHostAction("getLeafID", func() string { return *view.Session.GetLeafID() })
 			h.bridge.SetHostAction("getEntriesPage", func(cursor, _ int) ([]json.RawMessage, int, bool, string) {
-				all := view.Session.Entries()
+				all := view.Session.GetEntries()
 				if cursor < 0 || cursor > len(all) {
 					cursor = 0
 				}
@@ -93,7 +93,7 @@ func TestSessionReadsKeepPiMemberOrderAcrossSDKs(t *testing.T) {
 				for _, entry := range all[cursor:] {
 					page = append(page, entry.Raw())
 				}
-				return page, len(all), false, *view.Session.LeafID()
+				return page, len(all), false, *view.Session.GetLeafID()
 			})
 			h.host.BroadcastStateUpdate()
 

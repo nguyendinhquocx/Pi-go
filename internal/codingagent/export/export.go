@@ -4,11 +4,14 @@
 package export
 
 import (
+	"bytes"
 	"cmp"
+	"compress/gzip"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -17,14 +20,20 @@ import (
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/coding/rpcclient"
+	"github.com/MichaelKinsy/PiG/internal/ecmascript"
 	"github.com/MichaelKinsy/PiG/internal/jsnumber"
 	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
+	"github.com/MichaelKinsy/PiG/internal/nodeerrno"
 	"github.com/MichaelKinsy/PiG/tui"
 )
 
 const appName = "pig"
 
-//go:embed assets/template.html assets/template.css assets/template.js assets/vendor/marked.min.js assets/vendor/highlight.min.js
+// The binary carries each asset gzip-compressed (about 277 KB of text becomes 80 KB); the uncompressed files next to them are the vendored
+// source, and TestEmbeddedAssetsMatchSources fails when a .gz does not inflate to its source. Refresh them with go generate after a pin bump.
+//
+//go:generate gzip -9nkf assets/template.html assets/template.css assets/template.js assets/vendor/marked.min.js assets/vendor/marked-cjk-friendly.min.js assets/vendor/highlight.min.js
+//go:embed assets/template.html.gz assets/template.css.gz assets/template.js.gz assets/vendor/marked.min.js.gz assets/vendor/marked-cjk-friendly.min.js.gz assets/vendor/highlight.min.js.gz
 var templateFS embed.FS
 
 // SessionData mirrors upstream export-html's payload shape.
@@ -57,9 +66,8 @@ type AgentState struct {
 }
 
 // generateThemeVars is index.ts generateThemeVars: the resolved theme colors, then the export backgrounds.
-func generateThemeVars() string {
-	th := tui.ExportTheme()
-	colors := th.Colors()
+func generateThemeVars(th *tui.Theme) string {
+	colors := th.GetResolvedThemeColors()
 	var lines []string
 	for _, k := range th.ColorKeys() {
 		lines = append(lines, fmt.Sprintf("--%s: %s;", k, colors[k]))
@@ -85,15 +93,21 @@ func exportBackgrounds(th *tui.Theme, colors map[string]string) (pageBg, cardBg,
 
 // ToHTML converts session data to Pi's self-contained HTML, with a base64 JSON.stringify payload and first-match template substitution.
 func ToHTML(data SessionData) string {
+	return toHTML(data, "")
+}
+
+// toHTML is index.ts generateHtml: ToHTML with the theme named themeName (the active theme when empty).
+func toHTML(data SessionData, themeName string) string {
 	template := mustReadAsset("assets/template.html")
 	css := mustReadAsset("assets/template.css")
 	js := mustReadAsset("assets/template.js")
 	marked := mustReadAsset("assets/vendor/marked.min.js")
+	markedCjkFriendly := mustReadAsset("assets/vendor/marked-cjk-friendly.min.js")
 	highlight := mustReadAsset("assets/vendor/highlight.min.js")
 
-	th := tui.ExportTheme()
-	bodyBg, containerBg, infoBg := exportBackgrounds(th, th.Colors())
-	css = jsReplace(css, "{{THEME_VARS}}", generateThemeVars())
+	th := tui.ExportThemeNamed(themeName)
+	bodyBg, containerBg, infoBg := exportBackgrounds(th, th.GetResolvedThemeColors())
+	css = jsReplace(css, "{{THEME_VARS}}", generateThemeVars(th))
 	css = jsReplace(css, "{{BODY_BG}}", bodyBg)
 	css = jsReplace(css, "{{CONTAINER_BG}}", containerBg)
 	css = jsReplace(css, "{{INFO_BG}}", infoBg)
@@ -113,14 +127,25 @@ func ToHTML(data SessionData) string {
 	out = jsReplace(out, "{{JS}}", js)
 	out = jsReplace(out, "{{SESSION_DATA}}", sessionDataBase64)
 	out = jsReplace(out, "{{MARKED_JS}}", marked)
+	out = jsReplace(out, "{{MARKED_CJK_FRIENDLY_JS}}", markedCjkFriendly)
 	out = jsReplace(out, "{{HIGHLIGHT_JS}}", highlight)
 	return out
 }
 
+// mustReadAsset inflates the embedded gzip of the asset at path (relative to the package, without the .gz suffix). Nothing is cached: an export
+// builds one page, and the ~277 KB of text should not stay on the heap of a session that exported once.
 func mustReadAsset(path string) string {
-	b, err := templateFS.ReadFile(path)
+	compressed, err := templateFS.ReadFile(path + ".gz")
 	if err != nil {
 		panic(err)
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		panic(fmt.Errorf("export: embedded %s.gz: %w", path, err))
+	}
+	b, err := io.ReadAll(reader)
+	if err != nil {
+		panic(fmt.Errorf("export: embedded %s.gz: %w", path, err))
 	}
 	return string(b)
 }
@@ -190,9 +215,15 @@ func FromJSONL(data []byte) (SessionData, error) {
 		if line == "" {
 			continue
 		}
-		// Validate JSON before storing as RawMessage.
+		// Pi exports the entries JSON.parse built, so the payload holds JSON.stringify's text, not the file's: escapes,
+		// number spellings and whitespace are normalized (export-html/index.ts:296-301).
 		var m map[string]any
-		if err := json.Unmarshal([]byte(line), &m); err != nil {
+		err := json.Unmarshal([]byte(line), &m)
+		var canonical []byte
+		if err == nil {
+			canonical, err = ecmascript.CanonicalJSON([]byte(line))
+		}
+		if err != nil {
 			if first {
 				return SessionData{}, fmt.Errorf("parse header: %w", err)
 			}
@@ -203,10 +234,10 @@ func FromJSONL(data []byte) (SessionData, error) {
 			if typ, _ := m["type"].(string); typ != "session" {
 				return SessionData{}, fmt.Errorf("missing session header")
 			}
-			sd.Header = json.RawMessage(line)
+			sd.Header = canonical
 			continue
 		}
-		sd.Entries = append(sd.Entries, json.RawMessage(line))
+		sd.Entries = append(sd.Entries, canonical)
 		if id, _ := m["id"].(string); id != "" {
 			idCopy := id
 			sd.LeafID = &idCopy
@@ -220,7 +251,7 @@ func FromJSONL(data []byte) (SessionData, error) {
 
 // ExportFromFile reads a session JSONL file and writes the upstream-style HTML export.
 func ExportFromFile(inputPath, outputPath string) (string, error) {
-	return ExportFromFileWithTools(inputPath, outputPath, nil, "", nil)
+	return ExportFromFileWithTools(inputPath, outputPath, nil, "", nil, "")
 }
 
 // ExportFromFileWithTools is ExportFromFile with tool calls and results drawn
@@ -228,8 +259,8 @@ func ExportFromFile(inputPath, outputPath string) (string, error) {
 // AgentSession.exportToHtml passes a tool renderer. A non-nil state
 // is the live agent state upstream passes to exportSessionToHtml, which embeds
 // its systemPrompt and tools; nil is upstream exportFromFile (CLI --export),
-// whose session data carries neither.
-func ExportFromFileWithTools(inputPath, outputPath string, getToolRenderers func(name string) *extension.ToolRenderers, cwd string, state *AgentState) (string, error) {
+// whose session data carries neither. themeName is the export theme (opts.themeName); empty exports with the active theme.
+func ExportFromFileWithTools(inputPath, outputPath string, getToolRenderers func(name string) *extension.ToolRenderers, cwd string, state *AgentState, themeName string) (string, error) {
 	data, err := os.ReadFile(inputPath)
 	if err != nil {
 		return "", fmt.Errorf("read session: %w", err)
@@ -244,13 +275,27 @@ func ExportFromFileWithTools(inputPath, outputPath string, getToolRenderers func
 		sd.Tools = append([]ToolSchema{}, state.Tools...)
 	}
 	RenderCustomTools(&sd, getToolRenderers, cwd, 100)
-	htmlStr := ToHTML(sd)
+	htmlStr := toHTML(sd, themeName)
 	if outputPath == "" {
 		base := strings.TrimSuffix(filepath.Base(inputPath), ".jsonl")
 		outputPath = fmt.Sprintf("%s-session-%s.html", appName, base)
 	}
 	if err := os.WriteFile(outputPath, []byte(htmlStr), 0o644); err != nil {
-		return "", fmt.Errorf("write html: %w", err)
+		// writeFileSync's error: "ENOENT: no such file or directory, open '<path>'".
+		return "", nodeerrno.FromPathError(err)
+	}
+	return outputPath, nil
+}
+
+// WriteHTML writes the export of data to outputPath as exportFromFile does (index.ts: generateHtml, then writeFileSync), or to
+// "<app>-session-<basename of inputPath without .jsonl>.html" in the working directory when outputPath is empty. It returns the path written.
+func WriteHTML(data SessionData, inputPath, outputPath string) (string, error) {
+	htmlStr := toHTML(data, "")
+	if outputPath == "" {
+		outputPath = fmt.Sprintf("%s-session-%s.html", appName, strings.TrimSuffix(filepath.Base(inputPath), ".jsonl"))
+	}
+	if err := os.WriteFile(outputPath, []byte(htmlStr), 0o644); err != nil {
+		return "", nodeerrno.FromPathError(err)
 	}
 	return outputPath, nil
 }
@@ -301,15 +346,6 @@ func exportLuminance(c rgbChannels) float64 {
 	return float64(0.2126*toLinear(c.r)) + float64(0.7152*toLinear(c.g)) + float64(0.0722*toLinear(c.b))
 }
 
-// jsRound is Math.round: halves round toward positive infinity.
-func jsRound(v float64) float64 {
-	f := math.Floor(v)
-	if v-f >= 0.5 {
-		return f + 1
-	}
-	return f
-}
-
 // rgbCSS is index.ts's `rgb(${r}, ${g}, ${b})` template: each channel is JavaScript's Number to string, which writes an unclamped channel of 1e21 or more in exponent form.
 func rgbCSS(r, g, b float64) string {
 	return "rgb(" + jsnumber.String(r) + ", " + jsnumber.String(g) + ", " + jsnumber.String(b) + ")"
@@ -321,8 +357,8 @@ func adjustBrightness(color string, factor float64) string {
 	if !ok {
 		return color
 	}
-	// float64() keeps the product rounded before jsRound subtracts the floor, as JavaScript does; arm64 would otherwise fuse the product into that subtraction.
-	adjust := func(c float64) float64 { return math.Min(255, math.Max(0, jsRound(float64(c*factor)))) }
+	// float64() keeps the product rounded before Math.round (jsnumber.Round) subtracts the floor, as JavaScript does; arm64 would otherwise fuse the product into that subtraction.
+	adjust := func(c float64) float64 { return math.Min(255, math.Max(0, jsnumber.Round(float64(c*factor)))) }
 	return rgbCSS(adjust(parsed.r), adjust(parsed.g), adjust(parsed.b))
 }
 

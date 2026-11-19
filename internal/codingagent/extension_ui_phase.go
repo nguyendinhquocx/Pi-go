@@ -1,5 +1,7 @@
 package codingagent
 
+// Ports packages/coding-agent/src/modes/interactive/interactive-mode.ts (session start, before-switch and before-fork extension UI phase).
+
 import (
 	"context"
 	"encoding/json"
@@ -13,6 +15,12 @@ import (
 // session_before_fork handler cancelled the replacement. The command then ends
 // without output, as upstream's { cancelled: true } results do.
 var errSessionReplacementCancelled = errors.New("session replacement cancelled by an extension")
+
+// errInteractiveShutdown reports that the owner loop finished shutting down (session_shutdown emitted, resume command
+// printed) before an awaited extension phase did, as when a session_start handler calls ctx.shutdown(). Callers return it
+// without further UI or crash reporting, and Run then returns nil so the process exits 0, as Pi's shutdown() ends with
+// process.exit(0).
+var errInteractiveShutdown = errors.New("interactive session shut down")
 
 // emitSessionStartWithUI awaits handler completion without blocking its UI callbacks.
 func (m *InteractiveMode) emitSessionStartWithUI(ctx context.Context, reason string) error {
@@ -47,7 +55,7 @@ func (m *InteractiveMode) beforeSessionFork(ctx context.Context, entryID, positi
 	})
 }
 
-func (m *InteractiveMode) awaitSessionBefore(ctx context.Context, eventType string, event any) (bool, error) {
+func (m *InteractiveMode) awaitSessionBefore(ctx context.Context, eventType string, event extension.ExtensionEvent) (bool, error) {
 	runner := m.newRunner
 	if runner == nil || !runner.HasHandlers(eventType) {
 		return false, nil
@@ -74,17 +82,31 @@ func (m *InteractiveMode) awaitSessionBefore(ctx context.Context, eventType stri
 }
 
 // awaitExtensionUI preserves an awaited extension phase while the owner loop continues servicing its UI calls. Extension code never runs on that loop.
+// When the loop finishes shutdown first, the phase is cancelled and abandoned, not joined, and the result is
+// errInteractiveShutdown: a handler that ignores cancellation must not keep the process alive.
 func (m *InteractiveMode) awaitExtensionUI(ctx context.Context, work func(context.Context) error) error {
 	if m.runCtx == nil {
 		return work(ctx)
 	}
 	m.currentInputTicket.resume()
 	m.currentInputTicket.settle()
+	workCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	done := make(chan struct{})
 	var result error
-	m.backgroundTasks.Go(func() { defer close(done); result = work(ctx) })
+	// Not in backgroundTasks, which Run joins: after shutdown the phase is abandoned at process exit.
+	// upstream: packages/coding-agent/src/modes/interactive/interactive-mode.ts:shutdown
+	go func() {
+		defer close(done)
+		defer RecoverUncaught()
+		result = work(workCtx)
+	}()
 	if err := m.inputLoopUntil(ctx, os.Stdin, done); err != nil {
 		return err
+	}
+	if m.tuiTornDown {
+		cancel(errInteractiveShutdown)
+		return errInteractiveShutdown
 	}
 	select {
 	case <-done:

@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+
 	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
@@ -73,7 +75,9 @@ type ClassifierQuestions []ClassifierQuestionEntry
 
 // ClassifierContext is the input to a classification: the state to judge and the questions to answer about it.
 type ClassifierContext struct {
-	State     JsonObject
+	State JsonObject
+	// Images are judged together with State. Only models whose Input includes "image" accept them; other models return an error result (types.ts:669-677).
+	Images    []ImageContent
 	Questions ClassifierQuestions
 }
 
@@ -150,15 +154,17 @@ type ClassifierResult struct {
 
 // ClassifierOptions configures classifier provider requests. Cancellation comes from the request context.
 type ClassifierOptions struct {
-	// TelemetryContext parents provider request spans; nil means no recording backend.
-	TelemetryContext telemetry.TelemetryContext
+	// Telemetry is the explicit parent span for telemetry produced by this logical request; nil is Pi's omitted option, which uses the no-op span.
+	Telemetry telemetry.TelemetrySpan
 	// Fetch replaces HTTP execution without changing the caller's request context or redirect policy.
 	Fetch  *http.Client
 	APIKey string
 	// APIKeySet distinguishes an explicit empty key from an omitted override.
 	APIKeySet bool
 	Headers   ProviderHeaders
-	Env       ProviderEnv
+	// Identity is how the request identifies the calling app: `User-Agent` and provider attribution headers.
+	Identity *ClientIdentity
+	Env      ProviderEnv
 	// TimeoutMs bounds each HTTP attempt. Nil means no timeout.
 	TimeoutMs *int
 	// MaxRetries is the retry budget after a retryable failure. Nil means 2.
@@ -215,6 +221,9 @@ func (m *Models) Classify(ctx context.Context, model *ClassifierModel, request C
 }
 
 func (m *Models) classify(ctx context.Context, model *ClassifierModel, request ClassifierContext, options ModelsClassifierOptions) (ClassifierResult, error) {
+	if err := AssertClassifierInputSupported(model, request); err != nil {
+		return ClassifierResult{}, err
+	}
 	provider, err := m.requireProvider(model)
 	if err != nil {
 		return ClassifierResult{}, err
@@ -222,7 +231,7 @@ func (m *Models) classify(ctx context.Context, model *ClassifierModel, request C
 	if provider.Classify == nil {
 		return ClassifierResult{}, NewModelsError(ModelsErrorProvider, "Provider "+model.Provider+" does not support classification", nil)
 	}
-	auth, err := m.resolveRequestAuth(ctx, model, options.APIKey, options.APIKeySet, options.Headers, options.Env, options.TransformHeaders)
+	auth, err := m.resolveRequestAuth(ctx, model, options.APIKey, options.APIKeySet, options.Headers, options.Env, "", options.Identity, options.TransformHeaders)
 	if err != nil {
 		return ClassifierResult{}, err
 	}
@@ -232,7 +241,7 @@ func (m *Models) classify(ctx context.Context, model *ClassifierModel, request C
 		requestModel.BaseURL = auth.baseURL
 	}
 	requestOptions := options.ClassifierOptions
-	requestOptions.APIKey, requestOptions.Headers, requestOptions.Env = auth.apiKey, auth.headers, auth.env
+	requestOptions.APIKey, requestOptions.Headers, requestOptions.Env, requestOptions.Identity = auth.apiKey, auth.headers, auth.env, auth.identity
 	return provider.Classify(ctx, requestModel, request, requestOptions)
 }
 
@@ -267,22 +276,15 @@ func arrayIndexKey(key string) (uint64, bool) {
 	return value, true
 }
 
+// marshalJSONString is JSON.stringify(value) for a string.
 func marshalJSONString(value string) []byte {
-	var buffer bytes.Buffer
-	encoder := json.NewEncoder(&buffer)
-	encoder.SetEscapeHTML(false)
-	_ = encoder.Encode(value)
-	return bytes.TrimSuffix(buffer.Bytes(), []byte{'\n'})
+	encoded, _ := jsstring.MarshalJSON(value)
+	return encoded
 }
 
+// marshalJSONValue is JSON.stringify(value): negative zero is 0 and the line and paragraph separators are written literally.
 func marshalJSONValue(value any) ([]byte, error) {
-	var buffer bytes.Buffer
-	encoder := json.NewEncoder(&buffer)
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(value); err != nil {
-		return nil, err
-	}
-	return bytes.TrimSuffix(buffer.Bytes(), []byte{'\n'}), nil
+	return jsstring.MarshalJSON(value)
 }
 
 // writeJSONObject writes ordered entries as one JSON object.
@@ -400,7 +402,7 @@ func (a ClassifierChoiceAnswer) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fmt.Appendf(nil, `{"type":"choice","choice":%s,"probabilities":%s,"confidence":%s}`, marshalJSONString(a.Choice), probabilities, confidence), nil
+	return fmt.Appendf(nil, `{"type":%s,"choice":%s,"probabilities":%s,"confidence":%s}`, marshalJSONString(a.AnswerType()), marshalJSONString(a.Choice), probabilities, confidence), nil
 }
 
 func (a ClassifierScoreAnswer) MarshalJSON() ([]byte, error) {
@@ -412,7 +414,7 @@ func (a ClassifierScoreAnswer) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fmt.Appendf(nil, `{"type":"score","score":%s,"confidence":%s}`, score, confidence), nil
+	return fmt.Appendf(nil, `{"type":%s,"score":%s,"confidence":%s}`, marshalJSONString(a.AnswerType()), score, confidence), nil
 }
 
 func (a ClassifierBoolAnswer) MarshalJSON() ([]byte, error) {
@@ -420,7 +422,7 @@ func (a ClassifierBoolAnswer) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fmt.Appendf(nil, `{"type":"bool","probability":%s}`, probability), nil
+	return fmt.Appendf(nil, `{"type":%s,"probability":%s}`, marshalJSONString(a.AnswerType()), probability), nil
 }
 
 // MarshalJSON writes the answers as an object keyed by question ID, in order.

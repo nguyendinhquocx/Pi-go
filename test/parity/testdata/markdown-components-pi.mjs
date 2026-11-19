@@ -1,9 +1,10 @@
+import { PI_PACKAGE_VERSION } from "./pi-version.mjs";
 import assert from 'node:assert/strict';
 import {readFileSync,realpathSync} from 'node:fs';
 import {join} from 'node:path';
 import {pathToFileURL} from 'node:url';
 const root=process.env.PI_PACKAGE_ROOT??realpathSync('extensions/sdk-ts/node_modules/@earendil-works/pi-coding-agent');
-assert.equal(JSON.parse(readFileSync(join(root,'package.json'),'utf8')).version,'1.0.3');
+assert.equal(JSON.parse(readFileSync(join(root,'package.json'),'utf8')).version,PI_PACKAGE_VERSION);
 const dist=join(root,'node_modules/@earendil-works/pi-tui/dist');
 const {Markdown}=await import(pathToFileURL(join(dist,'components/markdown.js')).href);
 const {setCapabilities}=await import(pathToFileURL(join(dist,'terminal-image.js')).href);
@@ -30,7 +31,7 @@ emit('stock-nested-style',new Markdown('**nested**',0,0,themeModule.getMarkdownT
 emit('user-preserve-options',new UserMessageComponent('1. first\n1. second\n\n"\\"').render(24));
 emit('user-zones',new UserMessageComponent('hello').render(20));
 const order=[],widths=[];
-const user=new UserMessageComponent('The input is $x^2$.',undefined,1,[(source,context)=>{order.push('formula');widths.push(context.availableWidth);assert.deepEqual(context,{messageType:'user',isStreaming:false,availableWidth:78});return source.replace('$x^2$','x²')},source=>{order.push('suffix');return source+' Done.'}]);
+const user=new UserMessageComponent('The input is $x^2$.',undefined,1,[(source,context)=>{order.push('formula');widths.push(context.availableWidth);assert.deepEqual(context,{messageType:'user',isStreaming:false,availableWidth:78,messageId:undefined,timestamp:undefined});return source.replace('$x^2$','x²')},source=>{order.push('suffix');return source+' Done.'}]);
 const userLines=user.render(80);console.log(JSON.stringify({name:'user-transform',calls:order,widths,lines:userLines}));
 let suffix='before';const changed=new UserMessageComponent('Message',undefined,1,[source=>source+' '+suffix]);const before=changed.render(80);suffix='after';changed.invalidate();const after=changed.render(80);console.log(JSON.stringify({name:'user-invalidation',frames:[before,after]}));
 suffix='before';const padded=new UserMessageComponent('Message',undefined,1,[source=>source+' '+suffix]);const paddingFrames=[];for(const pad of [1,0,1]){padded.setOutputPad(pad);paddingFrames.push(padded.render(24));suffix='after';}console.log(JSON.stringify({name:'user-padding-transform',frames:paddingFrames}));

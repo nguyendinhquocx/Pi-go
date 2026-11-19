@@ -9,7 +9,7 @@ import (
 func BenchmarkSessionQueueReentrantPublication(b *testing.B) {
 	for _, shape := range []string{"empty", "ordinary", "overflow"} {
 		b.Run(shape, func(b *testing.B) {
-			services, err := NewServices(ServicesOptions{CWD: b.TempDir(), AgentDir: b.TempDir()})
+			services, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: b.TempDir(), AgentDir: b.TempDir()})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -18,9 +18,10 @@ func BenchmarkSessionQueueReentrantPublication(b *testing.B) {
 				b.Fatal(err)
 			}
 			done := make(chan struct{})
+			eventsCh := session.Events()
 			go func() {
 				defer close(done)
-				for event := range session.Events() {
+				for event := range eventsCh {
 					AcknowledgeEvent(event)
 				}
 			}()

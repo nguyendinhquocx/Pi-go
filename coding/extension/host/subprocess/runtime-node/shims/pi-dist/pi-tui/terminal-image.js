@@ -49,6 +49,20 @@ function detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink) {
     if (term.startsWith("screen")) {
         return { images: null, trueColor: hasTrueColorHint, hyperlinks: false };
     }
+    // Herdr forwards OSC 8 hyperlinks and supports the Kitty graphics protocol. Check it before
+    // outer-terminal detection because variables like KITTY_WINDOW_ID can leak into its panes.
+    if (termProgram === "herdr") {
+        return { images: "kitty", trueColor: hasTrueColorHint, hyperlinks: true };
+    }
+    if (termProgram === "rex") {
+        return { images: "kitty", trueColor: true, hyperlinks: true };
+    }
+    // Orca supports Kitty graphics but only advertises it through ORCA_IMAGE_PROTOCOL. Require
+    // both signals so Orca releases predating that advertisement keep the text fallback instead
+    // of reserving image rows that nothing renders.
+    if (termProgram === "orca" && process.env.ORCA_IMAGE_PROTOCOL === "kitty") {
+        return { images: "kitty", trueColor: true, hyperlinks: true };
+    }
     if (process.env.KITTY_WINDOW_ID || termProgram === "kitty") {
         return { images: "kitty", trueColor: true, hyperlinks: true };
     }
@@ -227,8 +241,12 @@ export function encodeITerm2(base64Data, options = {}) {
 }
 const kittyImageMetadata = new Map();
 let kittyTransmissionGeneration = 0;
+// Tallest registered image. Bounds backward searches for image lines above a
+// viewport: no image line further up than this can reach into it.
+let maxKittyImageRows = 0;
 export function registerKittyImageMetadata(metadata) {
     kittyTransmissionGeneration += 1;
+    maxKittyImageRows = Math.max(maxKittyImageRows, metadata.rows);
     kittyImageMetadata.delete(metadata.imageId);
     kittyImageMetadata.set(metadata.imageId, { ...metadata, transmissionGeneration: kittyTransmissionGeneration });
     if (kittyImageMetadata.size > 1000) {
@@ -236,6 +254,10 @@ export function registerKittyImageMetadata(metadata) {
         if (oldestImageId !== undefined)
             kittyImageMetadata.delete(oldestImageId);
     }
+}
+/** Return the row height of the tallest Kitty image registered so far. */
+export function getMaxKittyImageRows() {
+    return maxKittyImageRows;
 }
 function getRegisteredKittyImageMetadataFromControls(controls) {
     const imageId = /(?:^|,)i=(\d+)(?:,|$)/.exec(controls)?.[1];

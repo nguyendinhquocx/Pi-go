@@ -1,5 +1,5 @@
 // Oracle for the anthropic-messages row of the D82 multi-provider observation matrix.
-// Pins Pi 1.0.3 and drives its real pipeline (packages/ai/src/api/anthropic-messages.ts, utils/event-stream.ts,
+// Pins Pi 1.1.0 and drives its real pipeline (packages/ai/src/api/anthropic-messages.ts, utils/event-stream.ts,
 // api/lazy.ts, coding-agent/src/core/model-runtime.ts) against a loopback server.
 //
 // Two measurements per fixture:
@@ -11,8 +11,12 @@
 //
 // Usage: node probe.mjs <out.json> [inputs.json]        (needs PI_PACKAGE_ROOT)
 //        node probe.mjs --rpc <cli.js|pig-binary> <out.json>   (adds the "rpc" section)
+const PIG_UPSTREAM_VERSION = process.env.PIG_UPSTREAM_VERSION; // the pin's display version, from `eval "$(python3 automation/pin/pin.py env)"`
+if (!PIG_UPSTREAM_VERSION) throw new Error('PIG_UPSTREAM_VERSION is not set: run eval "$(python3 automation/pin/pin.py env)" before the probe');
+import { PI_PACKAGE_VERSION } from "../../../../../test/parity/testdata/pi-version.mjs";
 import { createServer } from 'node:http';
 import { createHook } from 'node:async_hooks';
+import { subscribe } from 'node:diagnostics_channel';
 import { once } from 'node:events';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -23,7 +27,7 @@ import { createInterface } from 'node:readline';
 
 const root = process.env.PI_PACKAGE_ROOT;
 const base = root + '/node_modules/@earendil-works/';
-for (const [path, version] of [[root, '1.0.3'], [base + 'pi-ai', '1.0.3'], [base + 'pi-agent-core', '1.0.3']]) {
+for (const [path, version] of [[root, PI_PACKAGE_VERSION], [base + 'pi-ai', PI_PACKAGE_VERSION], [base + 'pi-agent-core', PI_PACKAGE_VERSION]]) {
   assert.equal(JSON.parse(await readFile(path + '/package.json', 'utf8')).version, version);
 }
 const anthropicVersion = JSON.parse(await readFile(root + '/node_modules/@anthropic-ai/sdk/package.json', 'utf8')).version;
@@ -161,7 +165,7 @@ function newEpoch(reason, bytes) {
 }
 function stamp(record) { return { seq: state.seq++, epoch: state.epoch, tick: state.tick, ...record }; }
 // Clocks are the only nondeterministic field; the oracle pins them to 0.
-const copy = value => value === undefined ? undefined : JSON.parse(JSON.stringify(value, (key, v) => key === 'timestamp' && typeof v === 'number' ? 0 : v));
+const copy = value => value === undefined ? undefined : JSON.parse(JSON.stringify(value, (key, v) => key === 'timestamp' && typeof v === 'number' ? 0 : key === 'durationMs' && typeof v === 'number' ? 0 : v));
 
 // Every macrotask callback (timer, immediate, I/O completion) starts a new epoch. Promise jobs and
 // process.nextTick callbacks do not: they belong to the macrotask that scheduled them.
@@ -184,6 +188,20 @@ function message(event) {
   return copy(event.partial ?? event.message ?? event.error);
 }
 
+// The client's sockets: undici connects with net.connect, which publishes each socket on this channel. A later chunk is written only
+// once the client has read every byte written before it (clientHasRead), so each chunk reaches the client in a macrotask of its own
+// whatever the machine's load: a fixed wait let a stall of the loop (a cold module, a collection) write the next chunk before the
+// poll phase read the last one, and Node then coalesced the two into one read().
+const clientSockets = new Set();
+subscribe('net.client.socket', ({ socket }) => { clientSockets.add(socket); socket.once('close', () => clientSockets.delete(socket)); });
+async function clientHasRead(res) {
+  // The client end of this response's connection: its local port is the server end's remote port.
+  const server = res.socket;
+  const client = () => [...clientSockets].find(socket => socket.localPort === server.remotePort && socket.remotePort === server.localPort);
+  // A connection that closed (the consumer aborted, or the case ended) has nothing left to read: stop, or the loop spins forever.
+  while (!server.destroyed && (client()?.bytesRead ?? 0) < server.bytesWritten) await new Promise(resolve => setImmediate(resolve));
+}
+
 function serverFor(delivery, body) {
   let requests = 0;
   const server = createServer(async (req, res) => {
@@ -201,7 +219,7 @@ function serverFor(delivery, body) {
     }
     for (let i = 0; i < plan.chunks.length; i++) {
       const chunk = plan.chunks[i];
-      if (chunk.wait) await new Promise(resolve => setTimeout(resolve, chunk.wait));
+      if (chunk.wait || i > 0) await clientHasRead(res);
       if (res.destroyed) return;
       const bytes = Buffer.from(chunk.data, 'latin1');
       if (i === plan.chunks.length - 1) res.end(bytes); else res.write(bytes);
@@ -307,9 +325,9 @@ function persistPlan(plan) {
   }) };
 }
 if (inputsPath) {
-  await writeFile(inputsPath, JSON.stringify({ piVersion: '1.0.3', anthropicSdkVersion: anthropicVersion, nodeVersion: process.version, axes, bodies: Object.fromEntries(shapes.map(shape => [shape, Buffer.from(bodyOf(shape), 'latin1').toString('utf8')])), replyBody: Buffer.from(replyBody, 'latin1').toString('utf8'), plans: Object.fromEntries(shapes.map(shape => [shape, Object.fromEntries(Object.keys(deliveries).map(name => [name, persistPlan(deliveries[name](bodyOf(shape)))]))])) }, null, 2) + '\n');
+  await writeFile(inputsPath, JSON.stringify({ piVersion: PIG_UPSTREAM_VERSION, anthropicSdkVersion: anthropicVersion, nodeVersion: process.version, axes, bodies: Object.fromEntries(shapes.map(shape => [shape, Buffer.from(bodyOf(shape), 'latin1').toString('utf8')])), replyBody: Buffer.from(replyBody, 'latin1').toString('utf8'), plans: Object.fromEntries(shapes.map(shape => [shape, Object.fromEntries(Object.keys(deliveries).map(name => [name, persistPlan(deliveries[name](bodyOf(shape)))]))])) }, null, 2) + '\n');
 }
-const output = { piVersion: '1.0.3', anthropicSdkVersion: anthropicVersion, nodeVersion: process.version, axes };
+const output = { piVersion: PIG_UPSTREAM_VERSION, anthropicSdkVersion: anthropicVersion, nodeVersion: process.version, axes };
 output.cases = [];
 if (!process.env.PROBE_RPC_ONLY) for (const shape of shapes) for (const layers of layersFor(shape)) for (const delivery of Object.keys(deliveries)) {
   output.cases.push(await traceCase(shape, delivery, layers));

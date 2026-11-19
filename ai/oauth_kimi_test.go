@@ -1,10 +1,12 @@
 package ai
 
+// pi: packages/ai/src/auth/oauth/kimi-coding.ts
+
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"reflect"
 	"slices"
 	"strings"
@@ -112,7 +114,7 @@ func TestKimiOAuthUpstream(t *testing.T) {
 					return
 				}
 				wantPolls := []time.Duration{time.Second}
-				wantCreds := Credential{Type: CredentialOAuth, Access: "a", Refresh: "r", Expires: start.Add(61 * time.Second).UnixMilli()}
+				wantCreds := Credential{Type: CredentialOAuth, Access: "a", Refresh: "r", Expires: start.Add(61 * time.Second).UnixMilli(), order: credentialKeyOrder{keys: accessFirstCredentialMembers}}
 				if tc.interval == 5 {
 					if got := pollTimes(); !slices.Equal(got, []time.Duration{5 * time.Second}) {
 						t.Fatalf("first polls = %v", got)
@@ -120,7 +122,7 @@ func TestKimiOAuthUpstream(t *testing.T) {
 					time.Sleep(5 * time.Second)
 					synctest.Wait()
 					wantPolls = []time.Duration{5 * time.Second, 10 * time.Second}
-					wantCreds = Credential{Type: CredentialOAuth, Access: "access-token", Refresh: "refresh-token", Expires: start.Add(3610 * time.Second).UnixMilli()}
+					wantCreds = Credential{Type: CredentialOAuth, Access: "access-token", Refresh: "refresh-token", Expires: start.Add(3610 * time.Second).UnixMilli(), order: credentialKeyOrder{keys: accessFirstCredentialMembers}}
 				}
 				if got := pollTimes(); loginErr != nil || !reflect.DeepEqual(creds, wantCreds) || !slices.Equal(got, wantPolls) {
 					t.Fatalf("creds=%#v err=%v polls=%v", creds, loginErr, got)
@@ -237,7 +239,7 @@ func TestKimiOAuthRejectsUntrustedVerificationURL(t *testing.T) {
 	}))
 	defer server.Close()
 	provider := kimiOAuthProvider{client: server.Client(), oauthHost: server.URL, sleep: func(context.Context, time.Duration) error { return nil }}
-	if _, err := provider.Login(OAuthLoginCallbacks{}); err == nil || !strings.Contains(err.Error(), "invalid Kimi Code device authorization response") {
+	if _, err := provider.Login(OAuthLoginCallbacks{}); err == nil || !strings.Contains(err.Error(), "Invalid Kimi Code device authorization response") {
 		t.Fatalf("Login() error = %v", err)
 	}
 }
@@ -296,18 +298,23 @@ func TestKimiOAuthRefreshUnauthorizedDoesNotRetry(t *testing.T) {
 
 func TestTrustedHTTPURL(t *testing.T) {
 	for _, test := range []struct {
-		value string
-		want  bool
+		value any
+		want  string
 	}{
-		{"https://example.test/path", true},
-		{"http://127.0.0.1/callback", true},
-		{"file:///tmp/token", false},
-		{"javascript:alert(1)", false},
-		{"not a URL", false},
+		{"https://example.test/path", "https://example.test/path"},
+		{"http://127.0.0.1/callback", "http://127.0.0.1/callback"},
+		{"HTTPS://Example.test", "https://example.test/"},
+		{"https://example.test/a\x07b", "https://example.test/a%07b"},
+		{"file:///tmp/token", ""},
+		{"javascript:alert(1)", ""},
+		{"not a URL", ""},
+		{"", ""},
+		{nil, ""},
+		{42.0, ""},
 	} {
-		t.Run(url.PathEscape(test.value), func(t *testing.T) {
+		t.Run(fmt.Sprint(test.value), func(t *testing.T) {
 			if got := trustedHTTPURL(test.value); got != test.want {
-				t.Fatalf("trustedHTTPURL(%q) = %v, want %v", test.value, got, test.want)
+				t.Fatalf("trustedHTTPURL(%#v) = %q, want %q", test.value, got, test.want)
 			}
 		})
 	}

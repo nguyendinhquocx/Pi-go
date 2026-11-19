@@ -78,7 +78,7 @@ func TestCacheWarmingReplaysTheExactProviderPayload(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	services, err := NewServices(ServicesOptions{CWD: t.TempDir(), AgentDir: agentDir})
+	services, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: t.TempDir(), AgentDir: agentDir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,8 +92,9 @@ func TestCacheWarmingReplaysTheExactProviderPayload(t *testing.T) {
 	}
 	defer func() { _ = sess.Close() }()
 	appended := make(chan json.RawMessage, 1)
+	eventsCh := sess.Events()
 	go func() {
-		for event := range sess.Events() {
+		for event := range eventsCh {
 			if entry, ok := event.(agent.EntryAppendedEvent); ok {
 				appended <- entry.Entry
 			}
@@ -143,7 +144,7 @@ func TestCacheWarmingReplaysTheExactProviderPayload(t *testing.T) {
 		}
 		wantUsage := entry.Usage
 		wantCost := ai.CalculateCost(model, &wantUsage)
-		if entry.Usage.Cost != wantCost || wantCost.Total == 0 {
+		if !reflect.DeepEqual(entry.Usage.Cost, wantCost) || wantCost.Total == 0 {
 			t.Fatalf("entry_appended usage cost = %+v, want provider-calculated %+v", entry.Usage.Cost, wantCost)
 		}
 	case <-time.After(5 * time.Second):

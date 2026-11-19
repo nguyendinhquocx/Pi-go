@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
 // Network timeout for update checks. Mirrors upstream NETWORK_TIMEOUT_MS
@@ -18,13 +19,16 @@ const UpdateCheckNetworkTimeout = 10 * time.Second
 // isOfflineModeEnabled (package-manager.ts:29).
 func IsOfflineModeEnabled() bool {
 	if value := os.Getenv("PI_OFFLINE"); value != "" {
-		return value == "1" || strings.EqualFold(value, "true") || strings.EqualFold(value, "yes")
+		lower := jsstring.ToLower(value)
+		return value == "1" || lower == "true" || lower == "yes"
 	}
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("PIG_OFFLINE")))
 	return v == "1" || v == "true" || v == "yes"
 }
 
 // EnsureConfiguredPackagesInstalled reinstalls missing installations and npm packages whose local manifest does not satisfy the configured version or range. Offline mode reports these sources as missing without installing them.
+//
+// Ports packages/coding-agent/src/core/package-manager.ts (isOfflineModeEnabled, resolvePackageSources missing-source installation).
 //
 // Returns the source strings that were reinstalled and the sources that remain unavailable because installation failed or offline mode prevented it.
 // upstream: packages/coding-agent/src/core/package-manager.ts:resolvePackageSources
@@ -59,6 +63,28 @@ func EnsureConfiguredPackagesInstalled(cwd, agentDir string, sm *codingagent.Set
 		reinstalled = append(reinstalled, pkg.Source.Source)
 	}
 	return reinstalled, missing
+}
+
+// MissingLocalPackages lists each configured local Package whose directory does not exist, resolved against its scope's settings directory, as the
+// install failure the session warns about and `pig install --validate-only` reports (D216). Pi skips such a Package without a word.
+func MissingLocalPackages(cwd, agentDir string, sm *codingagent.SettingsManager) []PackageInstallFailure {
+	var failures []PackageInstallFailure
+	for _, pkg := range ConfiguredPackagesForResolution(cwd, agentDir, sm) {
+		if DetectSourceKind(pkg.Source.Source) != "local" {
+			continue
+		}
+		root, err := ResolveLocalPackageRoot(SettingsBaseDir(cwd, agentDir, pkg.Scope == "project"), pkg.Source.Source)
+		path := ""
+		if err == nil {
+			path = root
+			if _, statErr := os.Stat(root); statErr == nil {
+				continue
+			}
+			err = fmt.Errorf("Path does not exist: %s", root)
+		}
+		failures = append(failures, PackageInstallFailure{Source: pkg.Source.Source, Scope: pkg.Scope, Path: path, Message: err.Error()})
+	}
+	return failures
 }
 
 // InstallMissingPackages installs each configured npm and git Package whose installation is absent or does not satisfy its configured version, as DefaultPackageManager.resolve installs a source when it has no onMissing callback (package-manager.ts:1251-1305). The first failed installation is returned. A local Package that does not exist is skipped, as resolveLocalExtensionSource skips it, and offline mode installs nothing.

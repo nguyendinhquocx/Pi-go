@@ -2,6 +2,18 @@
 
 The Go SDK bridges Pi's extension API through PiG's subprocess host (D19). Each factory returns `*sdk.Extension`. Use `pig extension init ./my-extension --lang go` to create a module. Run `pig reload --sdk-path` to stage and locate the SDK from the installed binary.
 
+## Pi helper exports
+
+The helpers Pi exports to extensions keep their names in Go case and behave like Pi's, which the conformance suite checks against Pi's own code: `TruncateHead`, `TruncateTail`, `TruncateLine`, `FormatSize` and `DefaultMaxLines`/`DefaultMaxBytes` (Pi's truncate.ts), `WithFileMutationQueue`, `IsToolCallEventType` (Pi's `isToolCallEventType`, matching the tool name exactly), and `AgentDir`, `ConfigDirName`, `Version`, `PackageDir`, `GetShellConfig` (Pi's `getAgentDir()`, `CONFIG_DIR_NAME`, `VERSION`, `getPackageDir()`, `getShellConfig()`). Pi's pure pi-ai helpers are here too (`StringEnum`, `ClampThinkingLevel`, `GetSupportedThinkingLevels`, `CalculateCost`, `ContentText`, `NormalizeContext`, `GetCurrentSystemPrompt`, `IsContextOverflow`, `IsRetryableAssistantError`, `EnvAPIKeyAuth` and the rest of `pi_ai_text.go` and `pi_ai_models.go`); the transcript helpers take and return raw JSON because a system message's `sections` are read in key order. Byte limits count UTF-8 bytes and `TruncateLine` counts UTF-16 units like a JavaScript string. A nil `TruncationOptions` limit takes Pi's default; 0 is used as given. The host-config functions return `ErrHostInfoUnavailable`, never a made-up path, when the process was not started by a PiG host. `Context.GetEditorComponent` returns the factory this extension installed with `SetEditorComponent`, or nil. Pi's `getEditorComponent` returns the factory installed by any extension, so one extension can wrap another's editor; PiG returns only the calling extension's own factory.
+
+`Context.SetWorkingMessage("")` shows an empty working label, as Pi does; `Context.ClearWorkingMessage()` restores the default label (Pi's `setWorkingMessage()` with no argument).  `Context.ClearHiddenThinkingLabel()` does the same for `SetHiddenThinkingLabel`.
+
+`Context.SetStatus(key, "")` sets an empty status text, as Pi's `setStatus(key, "")` does (RPC mode writes it); `Context.ClearStatus(key)` is Pi's `setStatus(key, undefined)`. `Input(title, "")` and `Editor(title, "")` send an empty placeholder or prefill, as Pi's `input(title, "")` and `editor(title, "")` do (RPC mode writes `placeholder: ""` and `prefill: ""`); `InputWithoutPlaceholder(title)`, `InputWithoutPlaceholderWithOptions(title, opts)` and `EditorWithoutPrefill(title)` are Pi's `input(title)`, `input(title, undefined, opts)` and `editor(title)` (a Go string cannot be undefined), for which RPC mode writes no such member.
+
+## Upgrading an older extension
+
+`pig extension upgrade` applies the rewrite rules in the `upgrade` package of this module to an extension written for an earlier SDK. Add a rule there, with an old-extension fixture under `upgrade/testdata/fixtures`, for every breaking change; `make sdk-apidiff` fails a break without a rule and a release note. See the upgrade section of the extensions guide.
+
 ## Breaking changes / migration to 0.3.0
 
 Pi 0.99.1 distinguishes unknown context usage from zero and an omitted boolean option from false. Go uses pointers for these values. Rust uses `Option`; Python uses `None`. The Go helpers below select an explicit caller fallback without changing the nullable fields or wire values.
@@ -18,7 +30,7 @@ if usage := ctx.GetContextUsage(); usage != nil && usage.Tokens > 0 {
 }
 ```
 
-`GetContextUsage`, like every host-backed `Context` getter, now also returns an `error`: a host or transport failure is returned instead of an empty value, an assumed default (`IsIdle` no longer assumes idle, `IsProjectTrusted` no longer assumes trusted, `GetFlag` no longer falls back to the registered default) or a nil result. Pi's `undefined` results are nil pointers: `GetSessionName`, `GetSessionFile` and `GetLeafID` return `*string`, `GetModelInfo` and `GetContextUsage` return nil when absent, and `GetFlag` returns a nil value. `GetBranch` and `GetEntries` also return `error`: a failed session-log subscription is reported on every read. Go `ExecOptions.Timeout` and `DialogOptions.Timeout` are `float64`. The full signature table is in `docs/site/docs/extensions.md` ("Host-backed getters report failures and Pi's undefined"). Use `if usage, err := ctx.GetContextUsage(); err != nil { return err } else if usage != nil { ... }`.
+`GetContextUsage`, like every host-backed `Context` getter, now also returns an `error`: a host or transport failure is returned instead of an empty value, an assumed default (`IsIdle` no longer assumes idle, `IsProjectTrusted` no longer assumes trusted, `GetFlag` no longer falls back to the registered default) or a nil result. Pi's `undefined` results are nil pointers: `GetSessionName`, `GetSessionFile` and `GetLeafID` return `*string`, `GetModelInfo` and `GetContextUsage` return nil when absent, and `GetFlag` returns a nil value. `GetBranch` and `GetEntries` also return `error`: a failed session-log subscription is reported on every read. Go `ExecOptions.Timeout` and `DialogOptions.Timeout` are `float64`; `ExecOptions.MaxBuffer` is a `*float64` that caps stdout and stderr together (past it the command is terminated and `ExecResult.Truncated` is set), and a command that ignores SIGTERM is killed five seconds later. The full signature table is in `docs/site/docs/extensions.md` ("Host-backed getters report failures and Pi's undefined"). Use `if usage, err := ctx.GetContextUsage(); err != nil { return err } else if usage != nil { ... }`.
 
 After, when unknown means “do not display a count”:
 
@@ -80,3 +92,7 @@ The SDK carries the extension API additions of upstream 0.99.1. Every one is add
 A registration made before `Run` is applied when the extension loads, and the host validates it: a rejected MCP server or virtual model fails the load with the host's message, as an upstream factory that throws does. A registration made after load returns the host's refusal as its error. `ExecuteTool` never fails for a tool failure: it returns an outcome with `IsError` set. `ExecuteToolOptions.OnUpdate` runs on its own goroutine, in order, and finishes before `ExecuteTool` returns.
 
 An extension cannot set upstream's `Extension.replaceable`: the CLI sets it on its built-in extensions.
+
+## Child agent sessions
+
+`ctx.CreateAgentSession(sdk.CreateAgentSessionOptions{...})` is Pi's `createAgentSession`: a child agent session over the host's model runtime that your extension prompts (`Prompt`, `Steer`, `FollowUp`), observes (`Subscribe`), aborts (`Abort`) and disposes (`Dispose`), with `CustomTools` served by this extension. Calls block as Pi's Promises resolve; the session ends with the connection. See [Child agent sessions](../../docs/extension-authoring.md#child-agent-sessions-createagentsession).

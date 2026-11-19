@@ -69,7 +69,7 @@ func TestInteractiveThemeSelectionPresence(t *testing.T) {
 			t.Setenv("COLORFGBG", "15;0")
 			cwd, agentDir := writeThemeLayers(t, tc.global, tc.project)
 			manager := NewSettingsManager(cwd, agentDir)
-			m := NewInteractiveMode(InteractiveOptions{
+			m := NewInteractiveMode(nil, InteractiveModeOptions{
 				CWD: cwd, AgentDir: agentDir,
 				Settings: manager.Get(), SettingsManager: manager, InitialThemeSetting: tc.initial,
 			})
@@ -82,6 +82,9 @@ func TestInteractiveThemeSelectionPresence(t *testing.T) {
 			m.backgroundCtx = ctx
 			var output bytes.Buffer
 			m.themeState.output = &output
+			m.tuiInst = tui.NewWithOutput(&output, 100, 30)
+			// The replacement renderer schedules its renders on the owner loop, as the production renderer does.
+			m.installRenderDispatcher()
 			t.Cleanup(func() { m.disposeTheme(); m.backgroundTasks.Wait() })
 			m.initTheme()
 			m.applyThemeFromSettings(ctx)
@@ -163,17 +166,18 @@ console.log(JSON.stringify(results));
 
 // upstream 0.99.1 startup-ui.ts createStartupTui and theme.ts resolveThemeSetting: an explicitly empty theme resolves to itself, which setTheme rejects, so the prompt starts on the system theme and stays there once the terminal's colors arrive.
 func TestStartupPromptExplicitEmptyThemeFallsBackToSystem(t *testing.T) {
+	restoreTUIKeybindings(t)
 	restoreStartupTheme(t)
 	var settings Settings
 	if err := json.Unmarshal([]byte(`{"theme":""}`), &settings); err != nil {
 		t.Fatal(err)
 	}
-	configureStartupTheme(settings, nil)
+	configureStartupTui(StartupUIOptions{Settings: settings})
 	if got := tui.ActiveTheme().Name; got != tui.SystemThemeName {
 		t.Fatalf("initial theme = %q, want the system fallback for the empty name", got)
 	}
 	terminal := &fakeStartupTerminal{replies: append(whiteTerminalReplies(), []byte("h"), []byte("\r"))}
-	input := tui.NewExtensionInputComponent("Name", "")
+	input := tui.NewExtensionInputComponent("Name", "", nil, nil)
 	completed, err := runStartupComponentWith(input, StartupUIOptions{Settings: settings}, false, tui.NewWithOutput(startupQueryWriter{terminal}, 80, 24), terminal)
 	if err != nil || !completed {
 		t.Fatalf("completed=%v err=%v", completed, err)
@@ -188,14 +192,15 @@ func TestStartupPromptExplicitEmptyThemeFallsBackToSystem(t *testing.T) {
 
 // upstream 0.99.1 theme.ts resolveThemeSetting returns undefined for a malformed slash setting, so startup uses the system theme.
 func TestStartupPromptMalformedThemeUsesSystemTheme(t *testing.T) {
+	restoreTUIKeybindings(t)
 	restoreStartupTheme(t)
 	settings := Settings{Theme: "light/dark/extra"}
-	configureStartupTheme(settings, nil)
+	configureStartupTui(StartupUIOptions{Settings: settings})
 	if got := tui.ActiveTheme().Name; got != tui.SystemThemeName {
 		t.Fatalf("initial theme = %q, want the system theme", got)
 	}
 	terminal := &fakeStartupTerminal{replies: append(whiteTerminalReplies(), []byte("\r"))}
-	selector := tui.NewExtensionSelector("Pick", []string{"a"})
+	selector := tui.NewExtensionSelectorComponent("Pick", []string{"a"}, nil, nil)
 	done := make(chan error, 1)
 	go func() {
 		_, err := runStartupComponentWith(selector, StartupUIOptions{Settings: settings}, false, tui.NewWithOutput(startupQueryWriter{terminal}, 80, 24), terminal)

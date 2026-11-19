@@ -1,3 +1,5 @@
+//go:build !pig_strip_bedrock_converse_stream && !pig_strip_mistral_conversations
+
 package ai
 
 import (
@@ -8,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
+	"github.com/MichaelKinsy/PiG/third_party/awssdk/service/bedrockruntime"
 )
 
 func payloadHasZeroTemperature(payload any) bool {
@@ -53,7 +55,7 @@ func TestProvidersSendExplicitZeroTemperature(t *testing.T) {
 		env      ProviderEnv
 	}{
 		{name: "anthropic", provider: NewAnthropicProvider(AnthropicConfig{APIKey: "test", Model: "claude-test", BaseURL: "https://example.test", ProviderID: "anthropic"})},
-		{name: "amazon_bedrock", provider: NewBedrockProvider("anthropic.claude-test", "https://example.test"), env: ProviderEnv{"AWS_BEDROCK_SKIP_AUTH": "1", "AWS_REGION": "us-east-1"}},
+		{name: "amazon_bedrock", provider: NewBedrockTestProvider("anthropic.claude-test", "", "https://example.test"), env: ProviderEnv{"AWS_BEDROCK_SKIP_AUTH": "1", "AWS_REGION": "us-east-1"}},
 		{name: "openai_completions", provider: NewOpenAIProvider(OpenAIConfig{APIKey: "test", Model: "model", BaseURL: "https://example.test/v1", ProviderID: "openai"})},
 		{name: "openai_responses", provider: NewOpenAIResponsesProvider(OpenAIResponsesConfig{APIKey: "test", Model: "model", BaseURL: "https://example.test/v1", ProviderID: "openai"})},
 		{name: "google", provider: NewGoogleProvider(GoogleConfig{APIKey: "test", Model: "model", BaseURL: "https://example.test", ProviderID: "google"})},

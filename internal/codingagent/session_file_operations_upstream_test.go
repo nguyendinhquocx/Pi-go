@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
 // SPDX-FileCopyrightText: Copyright (c) 2025 Mario Zechner
 // SPDX-License-Identifier: MIT
 
@@ -65,7 +64,7 @@ func TestLoadEntriesFromFileUpstream(t *testing.T) {
 			if tc.want == 2 {
 				for i, want := range []string{"session", "message"} {
 					var e SessionEntryBase
-					if err := json.Unmarshal(entries[i], &e); err != nil {
+					if err := json.Unmarshal(entries[i].Raw(), &e); err != nil {
 						t.Fatal(err)
 					}
 					if e.Type != want {
@@ -185,8 +184,8 @@ func TestLoadEntriesFromFileUpstream(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if s.ID() != "abc" || len(s.Entries()) != 1 {
-			t.Fatalf("id=%s entries=%d", s.ID(), len(s.Entries()))
+		if s.ID() != "abc" || len(s.GetEntries()) != 1 {
+			t.Fatalf("id=%s entries=%d", s.ID(), len(s.GetEntries()))
 		}
 		messages := s.BuildContext(nil)
 		if len(messages) != 1 || messages[0].User == nil || extractUserText(messages[0]) != "hi" || messages[0].User.Timestamp != 1 {
@@ -327,8 +326,8 @@ func TestSessionFileOperationsUpstream(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if s.ID() == "" || s.Header().Type != "session" {
-			t.Fatal(s.Header())
+		if s.ID() == "" || s.GetHeader().Type != "session" {
+			t.Fatal(s.GetHeader())
 		}
 		records := readJSONLLines(t, path)
 		if len(records) != 1 || records[0]["type"] != "session" || records[0]["id"] != s.ID() {
@@ -388,7 +387,7 @@ func TestSessionFileOperationsUpstream(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if one.ID() != two.ID() || two.Header().Type != "session" {
+		if one.ID() != two.ID() || two.GetHeader().Type != "session" {
 			t.Fatal("identity changed")
 		}
 	})
@@ -417,10 +416,10 @@ func TestSessionFileCreationUpstream(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.AppendModelSwitch("anthropic", "claude-sonnet-4-5", ""); err != nil {
+		if _, err := s.AppendModelChange("anthropic", "claude-sonnet-4-5"); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.AppendThinkingLevelChange("off"); err != nil {
+		if _, err := s.AppendThinkingLevelChange("off"); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := os.Stat(s.Path()); !os.IsNotExist(err) {
@@ -435,7 +434,7 @@ func TestSessionFileCreationUpstream(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.AppendModelSwitch("anthropic", "claude-sonnet-4-5", ""); err != nil {
+		if _, err := s.AppendModelChange("anthropic", "claude-sonnet-4-5"); err != nil {
 			t.Fatal(err)
 		}
 		upstreamSessionUser(t, s, "first question")
@@ -465,4 +464,101 @@ func TestSessionFileCreationUpstream(t *testing.T) {
 			t.Fatalf("roles = %v", got)
 		}
 	})
+	// .upstream/current/packages/coding-agent/test/session-manager/file-operations.test.ts:477 (#10166, #10661, #11460: a failed write must not leave later entries pointing to a missing parent)
+	t.Run("does not keep an entry in memory when writing it fails", func(t *testing.T) {
+		if os.Geteuid() == 0 || os.PathSeparator == '\\' {
+			t.Skip("file permissions do not stop the root user or Windows")
+		}
+		dir := t.TempDir()
+		s, err := NewSessionManagerWithDir(dir, dir).Create("", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		firstID := upstreamSessionUser(t, s, "first question")
+		file := s.Path()
+
+		if err := os.Chmod(file, 0o444); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.AppendMessage(mkAssistantMsg("lost answer")); err == nil {
+			t.Fatal("AppendMessage into a read-only session file succeeded")
+		}
+		if got := s.GetLeafID(); got == nil || *got != firstID {
+			t.Fatalf("leaf = %v, want %q", got, firstID)
+		}
+		if got := sessionEntryIDs(s.GetEntries()); !slices.Equal(got, []string{firstID}) {
+			t.Fatalf("entries = %v, want [%s]", got, firstID)
+		}
+
+		if err := os.Chmod(file, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		secondID, err := s.AppendMessage(mkAssistantMsg("second answer"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, ok := s.GetEntry(secondID)
+		if !ok || second.Base().ParentID == nil || *second.Base().ParentID != firstID {
+			t.Fatalf("second entry = %+v, want parent %q", second, firstID)
+		}
+
+		reopened, err := NewSessionManagerWithDir(dir, dir).Open(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := sessionEntryIDs(reopened.GetBranch()); !slices.Equal(got, []string{firstID, secondID}) {
+			t.Fatalf("reopened branch = %v, want [%s %s]", got, firstID, secondID)
+		}
+	})
+	// .upstream/current/packages/coding-agent/test/session-manager/file-operations.test.ts:495
+	t.Run("does not keep an entry in memory when creating the file fails", func(t *testing.T) {
+		if os.Geteuid() == 0 || os.PathSeparator == '\\' {
+			t.Skip("file permissions do not stop the root user or Windows")
+		}
+		dir := t.TempDir()
+		sessionDir := filepath.Join(dir, "sessions")
+		if err := os.Mkdir(sessionDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		s, err := NewSessionManagerWithDir(dir, sessionDir).Create("", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		modelChangeID, err := s.AppendModelChange("anthropic", "claude-sonnet-4-5")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := os.Chmod(sessionDir, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		_, appendErr := s.AppendMessage(mkUserMsg("first question"))
+		if err := os.Chmod(sessionDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if appendErr == nil {
+			t.Fatal("AppendMessage into a read-only session directory succeeded")
+		}
+		if got := s.GetLeafID(); got == nil || *got != modelChangeID {
+			t.Fatalf("leaf = %v, want %q", got, modelChangeID)
+		}
+		if got := sessionEntryIDs(s.GetEntries()); !slices.Equal(got, []string{modelChangeID}) {
+			t.Fatalf("entries = %v, want [%s]", got, modelChangeID)
+		}
+
+		if _, err := s.AppendMessage(mkUserMsg("second question")); err != nil {
+			t.Fatal(err)
+		}
+		if got := readSessionFileRoles(t, s.Path()); !slices.Equal(got, []string{"session", "model_change", "user"}) {
+			t.Fatalf("roles = %v", got)
+		}
+	})
+}
+
+func sessionEntryIDs(entries []SessionEntry) []string {
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		ids = append(ids, entry.Base().ID)
+	}
+	return ids
 }

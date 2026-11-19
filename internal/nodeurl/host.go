@@ -7,9 +7,11 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/net/idna"
+	"golang.org/x/text/unicode/norm"
 )
 
 // whatwgDomainToASCII is the WHATWG URL Standard's domain-to-ASCII: UTS #46
@@ -56,8 +58,9 @@ func parseSpecialHost(server string, file bool) (string, error) {
 		}
 		return "[" + serializeIPv6(addr) + "]", nil
 	}
-	ascii, err := whatwgDomainToASCII.ToASCII(strings.ToValidUTF8(string(percentDecode(server)), string(utf8.RuneError)))
-	if err != nil || ascii == "" || strings.ContainsFunc(ascii, isForbiddenDomainCodePoint) {
+	decoded := strings.ToValidUTF8(string(percentDecode(server)), string(utf8.RuneError))
+	ascii, ok := domainToASCII(decoded)
+	if !ok || ascii == "" || strings.ContainsFunc(ascii, isForbiddenDomainCodePoint) {
 		return "", fmt.Errorf("invalid %s host %q", kind, server)
 	}
 	if endsInANumber(ascii) {
@@ -71,6 +74,43 @@ func parseSpecialHost(server string, file bool) (string, error) {
 		return "", nil
 	}
 	return ascii, nil
+}
+
+// domainToASCII is the WHATWG domain to ASCII (beStrict false) as ada 4 implements it in Node 24.22 and 26: an ASCII domain is only lowercased, so an "xn--" label in it is never decoded, validated or rejected (Node 22.19 and 24.19 run UTS #46 over it, ada 3, and reject "xn--", "xn--a" and the like); any other domain is mapped, validated and encoded by UTS #46.
+func domainToASCII(domain string) (string, bool) {
+	if isASCII(domain) {
+		return strings.ToLower(domain), true
+	}
+	ascii, err := whatwgDomainToASCII.ToASCII(domain)
+	return ascii, err == nil && !hasInvalidPunycodeLabel(domain)
+}
+
+// labelSeparators maps the UTS #46 label separators that NFKC leaves alone to a full stop.
+var labelSeparators = strings.NewReplacer("\u3002", ".", "\uff61", ".")
+
+// dropIgnoredCodePoint drops the code points UTS #46 maps to nothing: format characters other than the joiners (U+200C and U+200D map through the deviation rules), variation selectors, U+034F, and the Hangul fillers and Khmer inherent vowels that Unicode 16 made ignored. It also drops the format characters UTS #46 disallows; those fail the mapping anyway.
+func dropIgnoredCodePoint(r rune) rune {
+	switch r {
+	case 0x200c, 0x200d:
+		return r
+	case 0x34f, 0x115f, 0x1160, 0x17b4, 0x17b5, 0x3164, 0xffa0:
+		return -1
+	}
+	if unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Variation_Selector, r) {
+		return -1
+	}
+	return r
+}
+
+// hasInvalidPunycodeLabel reports, for a non-ASCII domain, a label that is only the "xn--" prefix, or that starts with it and holds a non-ASCII character. Node rejects both; x/net/idna decodes an empty payload and drops the label, and accepts the mixed label by encoding it again. UTS #46 maps the ideographic, fullwidth and halfwidth ideographic full stops to the label separator and compatibility forms to ASCII before the label split, and ignores the code points dropIgnoredCodePoint drops, so the check reads the NFKC form with those separators replaced and those code points dropped.
+func hasInvalidPunycodeLabel(host string) bool {
+	mapped := labelSeparators.Replace(strings.Map(dropIgnoredCodePoint, norm.NFKC.String(host)))
+	for label := range strings.SplitSeq(mapped, ".") {
+		if len(label) >= 4 && strings.EqualFold(label[:4], "xn--") && (len(label) == 4 || !isASCII(label)) {
+			return true
+		}
+	}
+	return false
 }
 
 // isForbiddenDomainCodePoint reports the WHATWG forbidden domain code points.

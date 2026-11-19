@@ -64,7 +64,7 @@ func TestSignalEmitsSessionShutdownToExtensions(t *testing.T) {
 			if out, err := tmuxCommand("new-session", "-d", "-s", session, "-x", "120", "-y", "34", command).CombinedOutput(); err != nil {
 				t.Fatalf("tmux new-session: %v\n%s", err, out)
 			}
-			t.Cleanup(func() { _ = tmuxCommand("kill-session", "-t", session).Run() })
+			t.Cleanup(func() { _ = killSession(t, session) })
 
 			pid := waitForPanePID(t, session)
 			// The footer paints before extension initialization. Wait for this extension's session_start status before sending a termination signal.
@@ -126,10 +126,14 @@ func TestInteractiveSigintTerminatesAndRestoresTerminal(t *testing.T) {
 	dir := t.TempDir()
 
 	session := "pig-sigint-" + randID()
-	if out, err := tmuxCommand("new-session", "-d", "-s", session, "-x", "120", "-y", "34").CombinedOutput(); err != nil {
+	// An interactive shell with line editing sets the terminal for its own
+	// prompt when it starts, which re-enables ISIG under a raw fixture applied
+	// before that start (a slow runner hits this). Without line editing the
+	// shell leaves the line discipline alone, so only the fixture and pig set it.
+	if out, err := tmuxCommand("new-session", "-d", "-s", session, "-x", "120", "-y", "34", "bash --noprofile --norc --noediting -i").CombinedOutput(); err != nil {
 		t.Fatalf("tmux new-session: %v\n%s", err, out)
 	}
-	t.Cleanup(func() { _ = tmuxCommand("kill-session", "-t", session).Run() })
+	t.Cleanup(func() { _ = killSession(t, session) })
 
 	// Keep a shell as the pane owner so the pty outlives pig and its terminal
 	// state can be read after the signal.

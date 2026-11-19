@@ -1,5 +1,15 @@
 package imageprocessing
 
+// pi: packages/coding-agent/src/utils/tool-result-images.ts
+
+// pi: packages/coding-agent/src/utils/mime.ts
+
+// pi: packages/coding-agent/src/utils/image-resize.ts
+
+// pi: packages/coding-agent/src/utils/image-resize-core.ts
+
+// pi: packages/coding-agent/src/utils/exif-orientation.ts
+
 import (
 	"bytes"
 	"encoding/base64"
@@ -288,9 +298,13 @@ func TestResizeReencodesIfOverThreshold(t *testing.T) {
 }
 
 func TestResizePreservesAlpha(t *testing.T) {
-	// 1000×1000 PNG with alpha: longest side fits, but force resize
-	// by making it 3000×3000. Output MUST be PNG (not JPEG) per
-	// chunk-d.md gotcha #610.
+	// 3000×3000 PNG with alpha: the longest side exceeds the limit, so it is
+	// resized. Pi picks the smaller of the PNG and the JPEG candidate
+	// (image-resize-core.ts, e7a0df27) and has no alpha rule, so a translucent
+	// image whose JPEG is smaller goes out as a JPEG, as it does in Pi. What
+	// holds in both cases: the result decodes, and a PNG result keeps its
+	// alpha channel (chunk-d.md gotcha #610); the PNG candidate itself keeps
+	// it, which TestPNGCandidateKeepsAlpha pins.
 	img := image.NewRGBA(image.Rect(0, 0, 3000, 3000))
 	// Half-transparent green.
 	for y := range 3000 {
@@ -308,16 +322,37 @@ func TestResizePreservesAlpha(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resize: %v", err)
 	}
-	if mime != "image/png" {
-		t.Errorf("PNG-with-alpha must stay PNG; got %s", mime)
-	}
-	// Decode and check alpha is preserved.
-	decoded, err := png.Decode(bytes.NewReader(out))
+	decoded, _, err := image.Decode(bytes.NewReader(out))
 	if err != nil {
-		t.Fatalf("decode: %v", err)
+		t.Fatalf("decode %s: %v", mime, err)
 	}
-	if !imageHasAlpha(decoded) {
-		t.Errorf("alpha channel lost in re-encode")
+	if mime == "image/png" && !imageHasAlpha(decoded) {
+		t.Errorf("alpha channel lost in a PNG result")
+	}
+}
+
+func TestPNGCandidateKeepsAlpha(t *testing.T) {
+	img := image.NewNRGBA(image.Rect(0, 0, 8, 8))
+	for i := 0; i < len(img.Pix); i += 4 {
+		img.Pix[i], img.Pix[i+1], img.Pix[i+2], img.Pix[i+3] = 0, 255, 0, 128
+	}
+	candidate, fits, err := firstFittingCandidate(img, []int{JPEGQuality}, 1<<30)
+	if err != nil || !fits {
+		t.Fatalf("candidate: fits=%v err=%v", fits, err)
+	}
+	if candidate.MIME == "image/png" {
+		decoded, err := png.Decode(bytes.NewReader(candidate.Data))
+		if err != nil || !imageHasAlpha(decoded) {
+			t.Fatalf("the PNG candidate lost its alpha channel: %v", err)
+		}
+	}
+	data, err := encodePNG(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := png.Decode(bytes.NewReader(data))
+	if err != nil || !imageHasAlpha(decoded) {
+		t.Fatalf("encodePNG lost the alpha channel: %v", err)
 	}
 }
 
@@ -594,17 +629,32 @@ func TestDetectSupportedImageMimeType(t *testing.T) {
 	}
 }
 
+// utils/mime.ts:25 detectSupportedImageMimeTypeFromFile opens the file and sniffs its first 4100 bytes: an unopenable file rejects with the open error, an empty file is no image, and a signature past the window is not seen.
 func TestDetectSupportedImageMimeTypeFromFile(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/sample.gif"
 	if err := os.WriteFile(path, []byte("GIF89a\x00"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := DetectSupportedImageMimeTypeFromFile(path); got != "image/gif" {
-		t.Fatalf("DetectSupportedImageMimeTypeFromFile() = %q, want %q", got, "image/gif")
+	if got, err := DetectSupportedImageMimeTypeFromFile(path); err != nil || got != "image/gif" {
+		t.Fatalf("DetectSupportedImageMimeTypeFromFile() = %q, %v, want %q", got, err, "image/gif")
 	}
-	if got := DetectSupportedImageMimeTypeFromFile(dir + "/missing"); got != "" {
-		t.Fatalf("DetectSupportedImageMimeTypeFromFile(missing) = %q, want empty", got)
+	if got, err := DetectSupportedImageMimeTypeFromFile(dir + "/missing"); err == nil || got != "" || !os.IsNotExist(err) {
+		t.Fatalf("DetectSupportedImageMimeTypeFromFile(missing) = %q, %v, want the open error", got, err)
+	}
+	empty := dir + "/empty"
+	if err := os.WriteFile(empty, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := DetectSupportedImageMimeTypeFromFile(empty); err != nil || got != "" {
+		t.Fatalf("empty file = %q, %v, want no image and no error", got, err)
+	}
+	late := dir + "/late.gif"
+	if err := os.WriteFile(late, append(make([]byte, ImageTypeSniffBytes), []byte("GIF89a\x00")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := DetectSupportedImageMimeTypeFromFile(late); err != nil || got != "" {
+		t.Fatalf("a signature after the sniff window = %q, %v, want none", got, err)
 	}
 }
 
@@ -691,4 +741,36 @@ func TestToolImageInputLimitsAcceptNodeBase64(t *testing.T) {
 	if err != nil || config.Width != 10 || config.Height != 5 {
 		t.Fatalf("resized dimensions=%+v err=%v", config, err)
 	}
+}
+
+// imageHasAlpha reports whether img has a pixel that is not opaque (it samples one pixel in 16 on each axis for the generic case).
+func imageHasAlpha(img image.Image) bool {
+	switch m := img.(type) {
+	case *image.RGBA:
+		for i := 3; i < len(m.Pix); i += 4 {
+			if m.Pix[i] != 0xff {
+				return true
+			}
+		}
+		return false
+	case *image.NRGBA:
+		for i := 3; i < len(m.Pix); i += 4 {
+			if m.Pix[i] != 0xff {
+				return true
+			}
+		}
+		return false
+	case *image.RGBA64, *image.NRGBA64:
+		return true
+	}
+	bounds := img.Bounds()
+	for y := bounds.Min.Y; y < bounds.Max.Y; y += 16 {
+		for x := bounds.Min.X; x < bounds.Max.X; x += 16 {
+			_, _, _, a := img.At(x, y).RGBA()
+			if a < 0xffff {
+				return true
+			}
+		}
+	}
+	return false
 }

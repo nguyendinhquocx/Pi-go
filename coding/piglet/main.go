@@ -32,13 +32,16 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+
+	"go.yaml.in/yaml/v3"
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/coding/extension/installresolver"
 	sourceref "github.com/MichaelKinsy/PiG/coding/source"
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
 	"github.com/MichaelKinsy/PiG/internal/fspublish"
+	"github.com/MichaelKinsy/PiG/internal/pigstrip"
 )
 
 // ── Pre-session CLI ──────────────────────────────────────────────────────────
@@ -84,6 +87,10 @@ func RunCommand(args []string, stdout, stderr io.Writer) int {
 		return cmdTrust(rest, stdout, stderr)
 	case "verify":
 		return cmdVerify(rest, stdout, stderr)
+	case "tree":
+		return cmdTree(rest, stdout, stderr)
+	case "lineage":
+		return cmdLineage(rest, stdout, stderr)
 	default:
 		_, _ = fmt.Fprintf(stderr, "Unknown piglet command %q.\n", sub)
 		printHelp(stderr)
@@ -91,14 +98,14 @@ func RunCommand(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-func printHelp(w io.Writer) {
-	_, _ = fmt.Fprint(w, `Usage:
+const pigletUsageText = `Usage:
   pig piglet list [--json]         List source and Piglet Binary facets
   pig piglet show <name>           Show source/effective Piglet details and records
   pig piglet show --record <path>   Validate and show a Piglet record
-  pig piglet validate <name|path>  Validate schema and resolve every origin
+  pig piglet validate <name|path> [--allow-install-scripts]
+                                   Validate schema and resolve every origin
   pig piglet schema                Print the published Piglet JSON Schema v1
-  pig piglet add <path|npm:ref|git:ref>
+  pig piglet add <path|npm:ref|git:ref> [--allow-install-scripts]
                                       Install one validated Piglet source
   pig piglet update <name>          Update an installed signed GitHub Binary release
   pig piglet pull <release-ref>      Install one signed Piglet Binary release
@@ -113,7 +120,13 @@ func printHelp(w io.Writer) {
   pig piglet build <name> --format <script|binary|image> --out <destination> [--sign-key <key>]
                                       Write a source script or build an artifact
   pig piglet keygen <key-path>     Create an ed25519 Piglet Binary signing key pair
-  pig piglet verify <binary>       Check a Piglet Binary's signature without running it
+  pig piglet verify <binary> [--source <name|path>] [--workspace <dir>]
+                                      Check a Piglet Binary's signature, and with --source its recorded
+                                      Piglet digests against that source, without running it
+  pig piglet tree [name] [--depth <n>] [--json]
+                                      Show installed Piglets arranged by extends
+  pig piglet lineage <name|path|binary> [--source <name|path>] [--json]
+                                      Show an extends chain with each link's changes
   pig piglet trust [list|add|revoke|require]
                                       Manage trusted Piglet Binary signer keys
                                       (image, --locked, and --record are reserved)
@@ -124,7 +137,37 @@ Piglets are discovered from (in order):
   .pig/piglets/         workspace
   ~/.pig/piglets/       user
   /etc/pig/piglets/     system
-`)
+`
+
+// pigletUsageFor is the usage text; it lists the system Piglet directory only where the platform has one (SystemPigletsDir).
+func pigletUsageFor(systemDir string) string {
+	if systemDir != "" {
+		return pigletUsageText
+	}
+	return strings.Replace(pigletUsageText, "  /etc/pig/piglets/     system\n", "", 1)
+}
+
+// printHelp prints the `pig piglet` usage. pig additive (D92): without the
+// Piglet builder, the build and publish entries are left out.
+func printHelp(w io.Writer) {
+	pigletUsage := pigletUsageFor(SystemPigletsDir())
+	if !pigstrip.Has(pigstrip.ListFeatures, pigstrip.PigletBuilder) {
+		_, _ = io.WriteString(w, pigletUsage)
+		return
+	}
+	var out strings.Builder
+	builder := false
+	for line := range strings.SplitAfterSeq(pigletUsage, "\n") {
+		if entry, ok := strings.CutPrefix(line, "  pig piglet "); ok {
+			builder = strings.HasPrefix(entry, "build ") || strings.HasPrefix(entry, "publish ")
+		} else if !strings.HasPrefix(line, "    ") {
+			builder = false
+		}
+		if !builder {
+			out.WriteString(line)
+		}
+	}
+	_, _ = io.WriteString(w, out.String())
 }
 
 type pigletListOutput struct {
@@ -193,7 +236,8 @@ func cmdList(args []string, stdout, stderr io.Writer) int {
 			for i, record := range p.Records {
 				targets[i] = record.Target
 			}
-			binary = strings.Join(targets, ",")
+			// Records are sorted by target; several releases for one target name it once.
+			binary = strings.Join(slices.Compact(targets), ",")
 		}
 		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t-\t%s\n", p.Name, p.Location, source, binary, p.Description)
 	}
@@ -207,6 +251,13 @@ type pigletShowOutput struct {
 	Piglet    any                `json:"piglet,omitempty"`
 	Effective bool               `json:"effective,omitempty"`
 	Records   []pigletRecordJSON `json:"records"`
+	//portlint:allow emptydrop PiG-only format with no Pi counterpart (Pi has no Piglets or runtime slot)
+	StripDelta []string `json:"stripDelta,omitempty"`
+	//portlint:allow emptydrop PiG-only format with no Pi counterpart (Pi has no Piglets)
+	MCPScope string `json:"mcpScope,omitempty"`
+	// Closed is set only for the running Piglet Binary: whether it was built with build.closed.
+	//portlint:allow emptydrop PiG-only format with no Pi counterpart (Pi has no Piglets)
+	Closed *bool `json:"closed,omitempty"`
 }
 
 type pigletRecordJSON struct {
@@ -223,6 +274,21 @@ type pigletRecordJSON struct {
 	ResolutionDigest    string                `json:"resolutionDigest,omitempty"`
 	BinaryDigest        string                `json:"binaryDigest,omitempty"`
 	Components          []pigletComponentJSON `json:"components,omitempty"`
+	//portlint:allow emptydrop PiG-only format with no Pi counterpart (Pi has no Piglets or runtime slot)
+	Strip []pigletStripJSON `json:"strip,omitempty"`
+	//portlint:allow emptydrop PiG-only format with no Pi counterpart (Pi has no Piglets or runtime slot)
+	StripKeep []pigletStripKeepJSON `json:"stripKeep,omitempty"`
+}
+
+type pigletStripJSON struct {
+	Kind        string `json:"kind"`
+	ID          string `json:"id"`
+	Disposition string `json:"disposition"`
+}
+
+type pigletStripKeepJSON struct {
+	Kind string   `json:"kind"`
+	IDs  []string `json:"ids"`
 }
 
 type pigletComponentJSON struct {
@@ -287,6 +353,10 @@ func cmdShow(args []string, stdout, stderr io.Writer) int {
 		return showRecordFile(recordPath, jsonMode, stdout, stderr)
 	}
 	if nameOrPath == "" {
+		// pig additive (D209): without an argument, show the Piglet the session that started this shell runs.
+		nameOrPath = ActiveSourceFromEnv()
+	}
+	if nameOrPath == "" {
 		_, _ = fmt.Fprintln(stderr, "Usage: pig piglet show <name|path> [--effective] [--workspace <dir>] [--json]")
 		return 2
 	}
@@ -305,8 +375,12 @@ func cmdShow(args []string, stdout, stderr io.Writer) int {
 	}
 	resolved, err := Resolve(nameOrPath)
 	if err != nil {
-		if info != nil && info.Path == "" && len(info.Records) > 0 {
-			return renderBinaryOnlyPiglet(*info, jsonMode, stdout, stderr)
+		closed, running := runningBinaryNamed(nameOrPath)
+		if running && info == nil {
+			info = &PigletInfo{Name: nameOrPath}
+		}
+		if running || (info != nil && info.Path == "" && len(info.Records) > 0) {
+			return renderBinaryOnlyPiglet(*info, binaryClosure(running, closed), jsonMode, stdout, stderr)
 		}
 		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
@@ -343,13 +417,21 @@ func cmdShow(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 	}
+	// pig additive (D92): the strip delta report against the newest Binary.
+	// Without --effective a child's file lacks its lineage's keep mode, so
+	// the record's modes stand in.
+	deltaStrip := p.Strip
+	if !effectiveMode && p.Extends != nil {
+		deltaStrip = nil
+	}
+	stripDelta := StripDeltaReport(p.Name, deltaStrip)
 	if jsonMode {
 		pigletValue, err := pigletJSONValue(p)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "error: encode Piglet JSON: %v\n", err)
 			return 1
 		}
-		return renderPigletShowJSON(pigletShowOutput{Name: p.Name, Source: resolved, Piglet: pigletValue, Effective: effectiveMode, Records: recordJSON(records)}, stdout, stderr)
+		return renderPigletShowJSON(pigletShowOutput{Name: p.Name, Source: resolved, Piglet: pigletValue, Effective: effectiveMode, Records: recordJSON(records), StripDelta: stripDelta, MCPScope: MCPScopeLine(p)}, stdout, stderr)
 	}
 
 	// Human-readable output
@@ -365,7 +447,27 @@ func cmdShow(args []string, stdout, stderr io.Writer) int {
 	case len(*p.BuiltinTools) == 0:
 		_, _ = fmt.Fprintln(stdout, "Built-in tools: none")
 	default:
-		_, _ = fmt.Fprintf(stdout, "Built-in tools: %s\n", strings.Join(*p.BuiltinTools, ", "))
+		_, _ = fmt.Fprintf(stdout, "Built-in tools: %s (a limit; it does not activate a tool)\n", strings.Join(*p.BuiltinTools, ", "))
+	}
+	if active := ActiveByDefaultTools(p); len(active) > 0 {
+		_, _ = fmt.Fprintf(stdout, "Active by default: %s\n", strings.Join(active, ", "))
+	} else {
+		_, _ = fmt.Fprintln(stdout, "Active by default: none")
+	}
+	if line := MCPScopeLine(p); line != "" {
+		_, _ = fmt.Fprintln(stdout, line)
+	}
+	// pig additive (D91, D92): slots and strip read as one model; see renderSlots.
+	frontend := ""
+	if p.HasFrontend() {
+		frontend = p.Slots.Frontend.Member
+		if dir, err := p.FrontendDir(); err == nil {
+			frontend = dir
+		}
+	}
+	renderSlots(stdout, "", frontend, p.Strip.KeepLists(), p.Strip.StrippedIDs())
+	if len(stripDelta) > 0 {
+		_, _ = fmt.Fprintf(stdout, "\n%s\n", strings.Join(stripDelta, "\n"))
 	}
 
 	if len(p.Packages) > 0 {
@@ -413,8 +515,9 @@ func cmdShow(args []string, stdout, stderr io.Writer) int {
 			if idx := strings.Index(preview, "\n"); idx > 0 {
 				preview = preview[:idx]
 			}
-			if len(preview) > 80 {
-				preview = preview[:77] + "..."
+			if jsstring.Length(preview) > 80 {
+				// A cut inside a surrogate pair is written as U+FFFD, as Node writes a lone surrogate.
+				preview = jsstring.StreamText(jsstring.Slice(preview, 0, 77)) + "..."
 			}
 			_, _ = fmt.Fprintf(stdout, "\nSystem prompt: %s (%d bytes)\n", preview, len(p.SystemPrompt.Text))
 		}
@@ -455,6 +558,9 @@ func cmdShow(args []string, stdout, stderr io.Writer) int {
 		}
 		if p.Build.OutputName != "" {
 			_, _ = fmt.Fprintf(stdout, "  output: %s\n", p.Build.OutputName)
+		}
+		if p.Build.Closed {
+			_, _ = fmt.Fprintln(stdout, "  closed: true")
 		}
 	}
 	if p.Release != nil && p.Release.Version != "" {
@@ -514,10 +620,54 @@ func recordJSON(records []RecordInfo) []pigletRecordJSON {
 			Path: record.Path, ResolutionPath: record.ResolutionPath, ArtifactPath: record.ArtifactPath, PigletDigest: record.PigletDigest, ReleaseVersion: record.ReleaseVersion,
 			Target: record.Target, ArtifactDigest: record.ArtifactDigest, Verified: record.VerificationOK, Signature: signatureSummary(record),
 			ComponentPlanDigest: record.ComponentPlanDigest, ResolutionDigest: record.ResolutionDigest, BinaryDigest: record.BinaryDigest,
-			Components: componentJSON(record.Components),
+			Components: componentJSON(record.Components), Strip: stripJSON(record.Strip), StripKeep: stripKeepJSON(record.StripKeep),
 		}
 	}
 	return output
+}
+
+func stripJSON(ids []StrippedID) []pigletStripJSON {
+	if len(ids) == 0 {
+		return nil
+	}
+	output := make([]pigletStripJSON, len(ids))
+	for i, id := range ids {
+		output[i] = pigletStripJSON(id)
+	}
+	return output
+}
+
+func stripKeepJSON(lists []StripIDList) []pigletStripKeepJSON {
+	if len(lists) == 0 {
+		return nil
+	}
+	output := make([]pigletStripKeepJSON, len(lists))
+	for i, list := range lists {
+		output[i] = pigletStripKeepJSON{Kind: list.Kind, IDs: append([]string{}, list.IDs...)}
+	}
+	return output
+}
+
+// renderSlots lists every slot the Piglet changes: the frontend member it
+// replaces, then each keep-mode strip list with the IDs it keeps, then each
+// stripped built-in with its disposition. A slot is named by its manifest
+// path: frontend, the strip list (extensions), or the strip list and the ID
+// (tools.grep, extensions.mcp). Slots left at PiG's default are not listed.
+// pig additive (D91, D92): `pig piglet show` reports keep/replace/strip as one model.
+func renderSlots(stdout io.Writer, indent, frontend string, keeps []StripIDList, ids []StrippedID) {
+	if frontend == "" && len(keeps) == 0 && len(ids) == 0 {
+		return
+	}
+	_, _ = fmt.Fprintf(stdout, "\n%sSlots:\n", indent)
+	if frontend != "" {
+		_, _ = fmt.Fprintf(stdout, "%s  frontend  replaced(%s)\n", indent, frontend)
+	}
+	for _, keep := range keeps {
+		_, _ = fmt.Fprintf(stdout, "%s  %s  keep([%s])\n", indent, keep.Field(), strings.Join(keep.IDs, ", "))
+	}
+	for _, id := range ids {
+		_, _ = fmt.Fprintf(stdout, "%s  %s  stripped(%s)\n", indent, id.SlotID(), id.Disposition)
+	}
 }
 
 func componentJSON(components []RecordComponent) []pigletComponentJSON {
@@ -541,11 +691,30 @@ func renderPigletShowJSON(output pigletShowOutput, stdout, stderr io.Writer) int
 	return 0
 }
 
-func renderBinaryOnlyPiglet(info PigletInfo, jsonMode bool, stdout, stderr io.Writer) int {
+// binaryClosure is what `pig piglet show` says about the running Piglet Binary: nil when the Binary is not the Piglet shown.
+func binaryClosure(running, closed bool) *bool {
+	if !running {
+		return nil
+	}
+	return &closed
+}
+
+func renderBinaryOnlyPiglet(info PigletInfo, closed *bool, jsonMode bool, stdout, stderr io.Writer) int {
+	stripDelta := StripDeltaReport(info.Name, nil)
 	if jsonMode {
-		return renderPigletShowJSON(pigletShowOutput{Name: info.Name, Records: recordJSON(info.Records)}, stdout, stderr)
+		return renderPigletShowJSON(pigletShowOutput{Name: info.Name, Records: recordJSON(info.Records), StripDelta: stripDelta, Closed: closed}, stdout, stderr)
 	}
 	_, _ = fmt.Fprintf(stdout, "Piglet: %s\nSource: none (Piglet Binary only)\n", info.Name)
+	if closed != nil {
+		if *closed {
+			_, _ = fmt.Fprintln(stdout, "Binary: closed (build.closed: true; it refuses --piglet, --system-prompt and ambient discovery)")
+		} else {
+			_, _ = fmt.Fprintln(stdout, "Binary: open (it accepts overlay Piglets; build.closed: true closes it)")
+		}
+	}
+	if len(stripDelta) > 0 {
+		_, _ = fmt.Fprintf(stdout, "\n%s\n", strings.Join(stripDelta, "\n"))
+	}
 	renderRecordSummary(stdout, info.Records)
 	return 0
 }
@@ -559,6 +728,7 @@ func renderRecordSummary(stdout io.Writer, records []RecordInfo) {
 		_, _ = fmt.Fprintf(stdout, "  %s  version=%s  build-checks-passed=%t\n    record=%s\n    artifact=%s (%s)\n    signature: %s\n",
 			record.Target, record.ReleaseVersion, record.VerificationOK, record.Path, record.ArtifactPath, record.ArtifactDigest, signatureSummary(record))
 		renderComponentSummary(stdout, "    ", record.Components)
+		renderSlots(stdout, "    ", "", record.StripKeep, record.Strip)
 	}
 }
 
@@ -598,6 +768,7 @@ func showRecordFile(path string, jsonMode bool, stdout, stderr io.Writer) int {
 	if record.Binary != nil {
 		_, _ = fmt.Fprintf(stdout, "Resolution: %s\nTarget: %s\nArtifact digest: %s\nVerified: %t\n",
 			record.Binary.ResolutionDigest, record.Binary.Target, record.Binary.Artifact.Digest, record.Binary.Verification.Passed)
+		renderSlots(stdout, "", "", recordStripKeep(record.Binary.StripKeep), recordStrip(record.Binary.Strip))
 	}
 	return 0
 }
@@ -644,12 +815,15 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 	jsonMode := false
 	nameOrPath := ""
 	workspace := ""
+	allowInstallScripts := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch arg {
 		case "--json":
 			jsonMode = true
 		case "--no-input":
+		case allowInstallScriptsFlag:
+			allowInstallScripts = true
 		case "--workspace":
 			if i+1 >= len(args) {
 				_, _ = fmt.Fprintln(stderr, "error: --workspace requires a directory")
@@ -658,18 +832,18 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 			i++
 			workspace = args[i]
 		case "-h", "--help":
-			_, _ = fmt.Fprintln(stdout, "Usage: pig piglet validate <name-or-path> [--workspace <dir>] [--json] [--no-input]")
+			_, _ = fmt.Fprintln(stdout, "Usage: pig piglet validate <name-or-path> [--workspace <dir>] [--allow-install-scripts] [--json] [--no-input]")
 			return 0
 		default:
 			if strings.HasPrefix(arg, "-") || nameOrPath != "" {
-				_, _ = fmt.Fprintln(stderr, "Usage: pig piglet validate <name-or-path> [--workspace <dir>] [--json] [--no-input]")
+				_, _ = fmt.Fprintln(stderr, "Usage: pig piglet validate <name-or-path> [--workspace <dir>] [--allow-install-scripts] [--json] [--no-input]")
 				return 2
 			}
 			nameOrPath = arg
 		}
 	}
 	if nameOrPath == "" {
-		_, _ = fmt.Fprintln(stderr, "Usage: pig piglet validate <name-or-path> [--workspace <dir>] [--json] [--no-input]")
+		_, _ = fmt.Fprintln(stderr, "Usage: pig piglet validate <name-or-path> [--workspace <dir>] [--allow-install-scripts] [--json] [--no-input]")
 		return 2
 	}
 	output := pigletValidationOutput{Extensions: []pigletResolvedResource{}, Skills: []pigletResolvedResource{}, Errors: []string{}}
@@ -682,7 +856,7 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 	if workspace == "" {
 		workspace, _ = os.Getwd()
 	}
-	resolution, err := ResolveEffectiveWithOptions(resolved, ResolveOptions{Workspace: workspace})
+	resolution, err := ResolveEffectiveWithOptions(resolved, ResolveOptions{Workspace: workspace, AllowInstallScripts: allowInstallScripts})
 	if err != nil {
 		output.Errors = append(output.Errors, err.Error())
 		return renderPigletValidation(output, jsonMode, stdout, stderr)
@@ -774,9 +948,16 @@ type resolvedPigletAddSource struct {
 	originSource     string
 	materializedRoot string
 	bundled          bool
+	// installScripts lets the package manager run lifecycle scripts while the Piglet's Packages install.
+	installScripts bool
 }
 
-func resolvePigletAddSource(raw string, stdout, stderr io.Writer) (resolvedPigletAddSource, error) {
+// allowInstallScriptsFlag opts a Piglet command in to the lifecycle scripts of the npm and Git Packages it installs.
+//
+// pig additive (D194): Piglet resolution installs Packages without running lifecycle scripts unless the user opts in.
+const allowInstallScriptsFlag = "--allow-install-scripts"
+
+func resolvePigletAddSource(raw string, allowInstallScripts bool, stdout, stderr io.Writer) (resolvedPigletAddSource, error) {
 	expanded := expandPath(raw)
 	if _, err := os.Stat(expanded); err == nil {
 		return resolvedPigletAddSource{path: expanded}, nil
@@ -804,7 +985,7 @@ func resolvePigletAddSource(raw string, stdout, stderr io.Writer) (resolvedPigle
 		if remotePigletAddOffline() {
 			return resolvedPigletAddSource{}, fmt.Errorf("cannot add remote Piglet %q while offline; unset PIG_OFFLINE and PI_OFFLINE to allow fetching", raw)
 		}
-		materializedRoot, err := installresolver.Materialize(cwd, raw, "user", stdout, stderr)
+		materializedRoot, err := installresolver.Materialize(cwd, raw, "user", installresolver.MaterializeOptions{AllowInstallScripts: allowInstallScripts}, stdout, stderr)
 		if err != nil {
 			return resolvedPigletAddSource{}, err
 		}
@@ -965,10 +1146,13 @@ func cmdAdd(args []string, stdout, stderr io.Writer) int {
 	jsonMode := slices.Contains(args, "--json")
 	var filtered []string
 	help := false
+	allowInstallScripts := false
 	var parseErr error
 	for _, arg := range args {
 		switch arg {
 		case "--json", "--no-input":
+		case allowInstallScriptsFlag:
+			allowInstallScripts = true
 		case "-h", "--help":
 			help = true
 		default:
@@ -988,28 +1172,29 @@ func cmdAdd(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if help {
-		_, _ = fmt.Fprintln(stdout, "Usage: pig piglet add <path|npm:ref|git:ref|catalog-ref> [--json] [--no-input]")
+		_, _ = fmt.Fprintln(stdout, "Usage: pig piglet add <path|npm:ref|git:ref|catalog-ref> [--allow-install-scripts] [--json] [--no-input]")
 		return 0
 	}
 	if !jsonMode {
-		return cmdAddHuman(filtered, stdout, stderr)
+		return cmdAddHuman(filtered, allowInstallScripts, stdout, stderr)
 	}
 	var humanOut, humanErr strings.Builder
-	code := cmdAddHuman(filtered, &humanOut, &humanErr)
+	code := cmdAddHuman(filtered, allowInstallScripts, &humanOut, &humanErr)
 	writePigletCommandJSON(pigletCommandOutput{Command: "add", Success: code == 0, Output: strings.TrimSpace(humanOut.String()), Error: strings.TrimSpace(humanErr.String())}, stdout)
 	return code
 }
 
-func cmdAddHuman(args []string, stdout, stderr io.Writer) int {
+func cmdAddHuman(args []string, allowInstallScripts bool, stdout, stderr io.Writer) int {
 	if len(args) != 1 {
 		_, _ = fmt.Fprintln(stderr, "Usage: pig piglet add <path|npm:ref|git:ref|catalog-ref>")
 		return 2
 	}
-	source, err := resolvePigletAddSource(args[0], stdout, stderr)
+	source, err := resolvePigletAddSource(args[0], allowInstallScripts, stdout, stderr)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
+	source.installScripts = allowInstallScripts
 	pigletsDir := codingagent.PigletsDir()
 	candidate, err := planPigletAdd(source, pigletsDir)
 	if err != nil {
@@ -1041,6 +1226,7 @@ func planPigletAdd(source resolvedPigletAddSource, pigletsDir string) (pigletAdd
 	if err != nil {
 		return pigletAddCandidate{}, err
 	}
+	p.installScripts = source.installScripts
 	if p.Extends != nil {
 		return pigletAddCandidate{}, fmt.Errorf("Piglet add cannot copy an extends dependency closure; run the Piglet from its source path")
 	}
@@ -1489,6 +1675,11 @@ func pruneEmptyRecordDirs(root string) {
 
 // ── In-session extension ─────────────────────────────────────────────────────
 
+// InspectCommand is the name of the read-only /piglet command the in-session
+// extension registers. Its strip ID is "/piglet" in the commands list
+// (pig additive, D92).
+const InspectCommand = "piglet"
+
 // BuildExtensionWithPiglet returns an extension.Extension that applies
 // Piglet-based tool scoping at runtime. The caller supplies the Piglet selected
 // before extension loading. The extension applies tool scope on session_start
@@ -1496,9 +1687,10 @@ func pruneEmptyRecordDirs(root string) {
 // extension returns it from before_agent_start so Pig core uses it as the
 // session system prompt.
 //
-// The returned Extension registers read-only /piglet inspection. Piglet
-// selection/editing is deliberately not available in-session: a different
-// composition is selected by a separate Pig invocation.
+// The returned Extension registers read-only /piglet inspection unless the
+// process strips it (strip.commands: /piglet). Piglet selection/editing is
+// deliberately not available in-session: a different composition is selected
+// by a separate Pig invocation.
 func BuildExtensionWithPiglet(initial *Piglet) extension.Extension {
 	return buildExtension(initial)
 }
@@ -1506,14 +1698,20 @@ func BuildExtensionWithPiglet(initial *Piglet) extension.Extension {
 // BuildExtensionWithPigletTools is BuildExtensionWithPiglet with the owner of extension-registered tools: owner names
 // the Piglet extension entry whose `tools` allowlist scopes a tool, or "" when no loaded extension registered it.
 func BuildExtensionWithPigletTools(initial *Piglet, owner func(extension.ToolInfo) string) extension.Extension {
-	return buildExtensionWithOwner(initial, owner)
+	return buildExtensionWithOwner(initial, owner, nil)
+}
+
+// BuildExtensionWithToolScope is BuildExtensionWithPigletTools with the compiled scope the Session's registry filter
+// also uses, so the extension reports the tools that very scope removed.
+func BuildExtensionWithToolScope(initial *Piglet, scope *extension.ToolScope) extension.Extension {
+	return buildExtensionWithOwner(initial, nil, scope)
 }
 
 func buildExtension(initial *Piglet) extension.Extension {
-	return buildExtensionWithOwner(initial, nil)
+	return buildExtensionWithOwner(initial, nil, nil)
 }
 
-func buildExtensionWithOwner(initial *Piglet, owner func(extension.ToolInfo) string) extension.Extension {
+func buildExtensionWithOwner(initial *Piglet, owner func(extension.ToolInfo) string, shared *extension.ToolScope) extension.Extension {
 	activePiglet := initial
 	var resolvedSystemPrompt string // cached after first resolution
 
@@ -1533,9 +1731,7 @@ func buildExtensionWithOwner(initial *Piglet, owner func(extension.ToolInfo) str
 			nameOrPath = os.Getenv("PIG_PIGLET_NAME")
 		}
 		if nameOrPath == "" {
-			if _, err := os.Stat("/opt/pig/piglet.yaml"); err == nil {
-				nameOrPath = "/opt/pig/piglet.yaml"
-			}
+			nameOrPath = AmbientPigletPath()
 		}
 		if nameOrPath == "" {
 			return // no piglet specified
@@ -1578,41 +1774,28 @@ func buildExtensionWithOwner(initial *Piglet, owner func(extension.ToolInfo) str
 		}
 	}
 
-	// Convert extension.ToolInfo (from GetAllTools) to piglet.ToolInfo
-	convertTools := func(tools []extension.ToolInfo) []ToolInfo {
-		out := make([]ToolInfo, len(tools))
-		for i, t := range tools {
-			// SourceInfo is currently `any`: try to extract a string source name
-			source := ""
-			switch s := t.SourceInfo.(type) {
-			case string:
-				source = s
-			case map[string]any:
-				if name, ok := s["name"].(string); ok {
-					source = name
-				}
-			}
-			// The session reports an extension tool's provenance object (path, source, scope, origin), which names no
-			// Piglet entry; the owner resolves the entry that registered the tool.
-			if source == "" && owner != nil {
-				source = owner(t)
-			}
-			// Real extension tools carry codingagent.PiSourceInfo (value or pointer). When no owner names the entry, such a
-			// tool is still an extension's: never govern it by root `tools` as a built-in.
-			if source == "" {
-				if info, ok := piSourceInfo(t.SourceInfo); ok && info.Source != "builtin" && (info.Source != "" || info.Path != "") {
-					source = info.Source
-					if source == "" {
-						source = info.Path
-					}
-				}
-			}
-			if source == "" {
-				source = "builtin"
-			}
-			out[i] = ToolInfo{Name: t.Name, Source: source}
+	scope := func() *extension.ToolScope {
+		if shared != nil {
+			return shared
 		}
-		return out
+		return CompileToolScope(activePiglet, owner)
+	}
+	// reported is the last notice of hidden tools the user saw; the notice repeats only when it changes.
+	var reported string
+	notifyHidden := func(ctx *extension.Context) {
+		if activePiglet == nil || shared == nil {
+			return
+		}
+		notice := ToolScopeNotice(activePiglet, shared.Hidden())
+		if notice == "" || notice == reported {
+			return
+		}
+		reported = notice
+		if ui, err := ctx.UI(); err == nil {
+			ui.Notify(notice, "info")
+			return
+		}
+		_, _ = fmt.Fprintln(os.Stderr, notice)
 	}
 
 	applyScoping := func(ctx *extension.Context, reason string) {
@@ -1626,27 +1809,16 @@ func buildExtensionWithOwner(initial *Piglet, owner func(extension.ToolInfo) str
 			return
 		}
 
-		converted := convertTools(allTools)
-		pigletScoped := ScopeTools(activePiglet, converted)
-
-		// The Piglet scope only narrows the session's current selection (the startup default, --tools, or an earlier extension's SetActiveTools, including a selection of no tools) and never activates a tool that selection left inactive. A nil list means no tool-scoping action is wired, so the Piglet scope applies alone.
-		currentActive := ctx.GetActiveTools()
-		active := []string{}
-		if currentActive != nil && len(currentActive) < len(allTools) {
-			// Intersect with the current selection, which may be empty.
-			allowed := make(map[string]struct{}, len(currentActive))
-			for _, name := range currentActive {
-				allowed[name] = struct{}{}
+		compiled := scope()
+		pigletScoped := make([]string, 0, len(allTools))
+		for _, tool := range allTools {
+			if compiled.Keeps(tool) {
+				pigletScoped = append(pigletScoped, tool.Name)
 			}
-			for _, name := range pigletScoped {
-				if _, ok := allowed[name]; ok {
-					active = append(active, name)
-				}
-			}
-		} else {
-			active = append(active, pigletScoped...)
 		}
 
+		// The Piglet scope only narrows the session's current selection (the startup default, --tools, or an earlier extension's SetActiveTools, including a selection of no tools) and never activates a tool that selection left inactive. A nil list means no tool-scoping action is wired, so the Piglet scope applies alone, in registry order.
+		active := narrowSelection(ctx.GetActiveTools(), pigletScoped)
 		removed := len(allTools) - len(active)
 		if removed > 0 {
 			tracef("[piglet] Applied scoping (%s): %d/%d tools active, %d hidden\n",
@@ -1717,6 +1889,17 @@ func buildExtensionWithOwner(initial *Piglet, owner func(extension.ToolInfo) str
 			flagVal := extCtx.GetFlagValue("piglet")
 			resolvePiglet(flagVal)
 			applyScoping(extCtx, "before_agent_start")
+			notifyHidden(extCtx)
+			// The agent learns the Piglet and its tool scope in one line.
+			if activePiglet != nil {
+				if options := extension.BeforeAgentStartOptions(ctx); options != nil {
+					trusted, err := extCtx.IsProjectTrusted()
+					line := AgentToolScopeLine(activePiglet, err == nil && !trusted)
+					if !strings.Contains(options.AppendSystemPrompt, line) {
+						options.AppendSystemPrompt = strings.TrimSpace(options.AppendSystemPrompt + "\n\n" + line)
+					}
+				}
+			}
 
 			// Return system prompt override if the piglet declares one.
 			if resolvedSystemPrompt != "" {
@@ -1728,9 +1911,17 @@ func buildExtensionWithOwner(initial *Piglet, owner func(extension.ToolInfo) str
 		},
 	}
 
+	// pig additive (D92): a Piglet that strips /piglet runs without the
+	// command, so no surface derived from the extension's commands offers it
+	// and typed /piglet goes to the model as an unknown slash command does in
+	// Pi. Scoping, the --piglet flag and the system prompt stay.
+	if pigstrip.Has(pigstrip.ListCommands, "/"+InspectCommand) {
+		return ext
+	}
+
 	// /piglet is read-only inspection of the composition active in this process.
-	ext.Commands["piglet"] = extension.RegisteredCommand{
-		Name:        "piglet",
+	ext.Commands[InspectCommand] = extension.RegisteredCommand{
+		Name:        InspectCommand,
 		Description: "Inspect the active Piglet composition",
 		Handler: func(ctx context.Context, args string) error {
 			extCtx := extension.FromContext(ctx)
@@ -1767,20 +1958,13 @@ func formatActivePiglet(active *Piglet) string {
 	if source := active.SourcePath(); source != "" {
 		_, _ = fmt.Fprintf(&out, "\nSource: %s", source)
 	}
-	return out.String()
-}
-
-// piSourceInfo reads the provenance object the session reports as a tool's sourceInfo, as a value or a pointer.
-func piSourceInfo(v any) (codingagent.PiSourceInfo, bool) {
-	switch s := v.(type) {
-	case codingagent.PiSourceInfo:
-		return s, true
-	case *codingagent.PiSourceInfo:
-		if s != nil {
-			return *s, true
+	// pig additive (D202): an overlay's lineage starts with the Piglet Binary it is laid over.
+	if len(active.lineage) > 0 {
+		if binary, ok := strings.CutPrefix(active.lineage[0].Source, "binary:"); ok {
+			_, _ = fmt.Fprintf(&out, "\nOverlay of: %s (Piglet Binary)", binary)
 		}
 	}
-	return codingagent.PiSourceInfo{}, false
+	return out.String()
 }
 
 // tracef prints Piglet load and scoping progress only when PIG_PIGLET_DEBUG is set. Written to stderr during an
@@ -1790,4 +1974,23 @@ func tracef(format string, args ...any) {
 		return
 	}
 	_, _ = fmt.Fprintf(os.Stderr, format, args...)
+}
+
+// narrowSelection returns the names of the current selection that the Piglet scope admits, in the selection's order and each once at its first position: setActiveTools declares tools in its argument order (upstream: agent-session.ts:1561-1565, _applyToolLoadout), so narrowing never reorders the session's selection. A nil selection means no tool-scoping action is wired; the Piglet scope then applies alone.
+func narrowSelection(currentActive, pigletScoped []string) []string {
+	if currentActive == nil {
+		return append([]string{}, pigletScoped...)
+	}
+	admitted := make(map[string]bool, len(pigletScoped))
+	for _, name := range pigletScoped {
+		admitted[name] = true
+	}
+	active := []string{}
+	for _, name := range currentActive {
+		if admitted[name] {
+			active = append(active, name)
+			admitted[name] = false
+		}
+	}
+	return active
 }

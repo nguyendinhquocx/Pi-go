@@ -110,28 +110,80 @@ func TestOpenAIResponsesCompatHeadersUpstream(t *testing.T) {
 
 func TestOpenAIResponsesCompatDefaultsUpstream(t *testing.T) {
 	request := Context{SystemPrompt: "sys", Messages: []Message{UserMessage{Content: UserText("hi")}}}
-	// .upstream/v0.87.1/packages/ai/test/openai-responses-compat.test.ts:75
+	// .upstream/v0.87.1/packages/ai/test/openai-responses-compat.test.ts:75 (Pi e5fe9777: #2567, Copilot rejected reasoning.effort "none"; gpt-6-sol has off: "none", so this exercises the Copilot exception)
 	t.Run("omits reasoning when no reasoning is requested", func(t *testing.T) {
-		payload, _, _ := captureResponsesCompat(t, responsesCompatConfig(t, "github-copilot", "gpt-5-mini"), request, StreamOptions{}, "data: [DONE]\n\n")
+		payload, _, _ := captureResponsesCompat(t, responsesCompatConfig(t, "github-copilot", "gpt-6-sol"), request, StreamOptions{}, "data: [DONE]\n\n")
 		if _, ok := payload["reasoning"]; ok {
 			t.Fatalf("reasoning=%s", payload["reasoning"])
 		}
 	})
-	// .upstream/v0.87.1/packages/ai/test/openai-responses-compat.test.ts:110
+	// .upstream/v1.4.0+b3a29f11/packages/ai/test/openai-responses-compat.test.ts:151 gpt-5.6-luna declares its tools in additional_tools items; tool_choice applies to them.
 	t.Run("forwards required tool choice", func(t *testing.T) {
 		ctx := Context{Messages: []Message{UserMessage{Content: UserText("Do not call ping. Respond with text instead.")}}, Tools: []ToolSchema{{Name: "ping", Description: "Ping", Parameters: JsonObject{"type": "object", "properties": JsonObject{"value": JsonObject{"type": "string"}}, "required": []string{"value"}}}}}
-		payload, _, _ := captureResponsesCompat(t, responsesCompatConfig(t, "openai", "gpt-5.4"), ctx, StreamOptions{ToolChoice: "required"}, "data: [DONE]\n\n")
+		payload, _, _ := captureResponsesCompat(t, responsesCompatConfig(t, "openai", "gpt-5.6-luna"), ctx, StreamOptions{ToolChoice: "required"}, "data: [DONE]\n\n")
 		assertShapeJSON(t, payload["tool_choice"], `"required"`)
-		var tools []struct {
-			Name string `json:"name"`
+		if tools, ok := payload["tools"]; ok {
+			t.Fatalf("top-level tools=%s, want every tool in additional_tools items", tools)
 		}
-		if err := json.Unmarshal(payload["tools"], &tools); err != nil {
+		var input []struct {
+			Type  string `json:"type"`
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		}
+		if err := json.Unmarshal(payload["input"], &input); err != nil {
 			t.Fatal(err)
 		}
-		if len(tools) != 1 || tools[0].Name != "ping" {
-			t.Fatalf("tools=%#v", tools)
+		if len(input) != 2 || input[0].Type != "additional_tools" || len(input[0].Tools) != 1 || input[0].Tools[0].Name != "ping" {
+			t.Fatalf("input=%s", payload["input"])
 		}
 	})
+	// Pi 81d6759f (#11415): GPT-5.5 and older namespace the tools loaded through additional_tools or tool search and reject replayed calls without the namespace, so OpenAI and OpenCode declare their tools at the top level; GPT-5.6 and later keep additional_tools. Every model keeps its mid-conversation system messages.
+	for _, tc := range []struct {
+		provider, id    string
+		additionalTools bool
+	}{
+		{"openai", "gpt-5.4", false}, {"openai", "gpt-5.4-mini", false}, {"openai", "gpt-5.4-pro", false}, {"openai", "gpt-5.5", false},
+		{"opencode", "gpt-5.4", false}, {"opencode", "gpt-5.4-mini", false}, {"opencode", "gpt-5.4-pro", false}, {"opencode", "gpt-5.5", false},
+		{"openai", "gpt-5.6-sol", true}, {"openai", "gpt-5.6-terra", true}, {"openai", "gpt-5.6-luna", true},
+		{"opencode", "gpt-5.6-sol", true}, {"opencode", "gpt-5.6-terra", true}, {"opencode", "gpt-5.6-luna", true},
+	} {
+		t.Run("declares "+tc.provider+"/"+tc.id+" tools "+map[bool]string{false: "at the top level", true: "in additional_tools items"}[tc.additionalTools], func(t *testing.T) {
+			cfg := responsesCompatConfig(t, tc.provider, tc.id)
+			if cfg.Compat == nil || cfg.Compat.SupportsMidConvoSystemMessages == nil || !*cfg.Compat.SupportsMidConvoSystemMessages {
+				t.Fatalf("compat = %+v, want supportsMidConvoSystemMessages kept", cfg.Compat)
+			}
+			if additional := cfg.Compat.SupportsAdditionalTools != nil && *cfg.Compat.SupportsAdditionalTools; additional != tc.additionalTools {
+				t.Fatalf("supportsAdditionalTools = %t, want %t", additional, tc.additionalTools)
+			}
+			ctx := Context{Messages: []Message{UserMessage{Content: UserText("Call ping.")}}, Tools: []ToolSchema{{Name: "ping", Description: "Ping", Parameters: JsonObject{"type": "object", "properties": JsonObject{"value": JsonObject{"type": "string"}}, "required": []string{"value"}}}}}
+			payload, _, _ := captureResponsesCompat(t, cfg, ctx, StreamOptions{}, "data: [DONE]\n\n")
+			var input []struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(payload["input"], &input); err != nil {
+				t.Fatal(err)
+			}
+			var tools []struct {
+				Name string `json:"name"`
+			}
+			_ = json.Unmarshal(payload["tools"], &tools)
+			if tc.additionalTools {
+				if len(tools) != 0 || len(input) == 0 || input[0].Type != "additional_tools" {
+					t.Fatalf("tools=%s input=%s, want the tool in an additional_tools item", payload["tools"], payload["input"])
+				}
+				return
+			}
+			if len(tools) != 1 || tools[0].Name != "ping" {
+				t.Fatalf("tools=%s, want ping at the top level", payload["tools"])
+			}
+			for _, item := range input {
+				if item.Type == "additional_tools" {
+					t.Fatalf("input=%s carries an additional_tools item", payload["input"])
+				}
+			}
+		})
+	}
 	// .upstream/v0.87.1/packages/ai/test/openai-responses-compat.test.ts:157
 	t.Run("sets strict mode explicitly for Cloudflare OpenAI Responses tools", func(t *testing.T) {
 		cfg := responsesCompatConfig(t, "cloudflare-ai-gateway", "gpt-5.6-sol")
@@ -192,7 +244,7 @@ func TestOpenAIResponsesCompatDefaultsUpstream(t *testing.T) {
 	} {
 		t.Run("applies "+tc.id+" cost multiplier for requested "+tc.tier+" and returned "+tc.returned+" service tier", func(t *testing.T) {
 			model, _ := LookupModelExact("openai/" + tc.id)
-			options := StreamOptions{ModelCost: (&Model{Capabilities: model.ToCapabilities()}).CostRates(), SamplingParams: map[string]any{"service_tier": tc.tier}}
+			options := StreamOptions{ModelCost: (&Model{Capabilities: model.ToCapabilities()}).CostRates(), ServiceTier: tc.tier}
 			reply := fmt.Sprintf("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"service_tier\":%q,\"usage\":{\"input_tokens\":100000,\"output_tokens\":100000,\"total_tokens\":200000,\"input_tokens_details\":{\"cached_tokens\":0}}}}\n\n", tc.returned)
 			_, _, result := captureResponsesCompat(t, responsesCompatConfig(t, "openai", tc.id), request, options, reply)
 			// Input and output have equal token scales in the upstream fixture.

@@ -1,11 +1,15 @@
 package codingagent
 
+// pi: packages/coding-agent/src/modes/interactive/components/extension-selector.ts
+
 import (
 	"context"
 	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/MichaelKinsy/PiG/coding/extension"
 
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
@@ -26,19 +30,17 @@ func TestExtensionDialogTimeoutCountsDownAndCancels(t *testing.T) {
 		after time.Duration
 	}{
 		{"select", func(ctx context.Context, ui *ExtUIContext) (string, error) {
-			return ui.Select(ctx, "Pick", []string{"first"}, map[string]any{"timeout": float64(1500)})
+			return ui.Select(ctx, "Pick", []string{"first"}, extension.ExtensionUIDialogOptions{Timeout: new(float64(1500))})
 		}, nil, []string{"Pick (2s)", "Pick (1s)"}, 2 * time.Second},
 		{"confirm", func(ctx context.Context, ui *ExtUIContext) (string, error) {
-			confirmed, err := ui.Confirm(ctx, "Timed", "Sure?", struct {
-				Timeout int `json:"timeout"`
-			}{1000})
+			confirmed, err := ui.Confirm(ctx, "Timed", "Sure?", extension.ExtensionUIDialogOptions{Timeout: new(float64(1000))})
 			if confirmed {
 				return "confirmed", err
 			}
 			return "", err
 		}, nil, []string{"Timed", "Sure? (1s)"}, time.Second},
 		{"input", func(ctx context.Context, ui *ExtUIContext) (string, error) {
-			return ui.Input(ctx, "Name", "", map[string]any{"timeout": float64(1000)})
+			return ui.Input(ctx, "Name", "", extension.ExtensionUIDialogOptions{Timeout: new(float64(1000))})
 		}, []string{"abc"}, []string{"Name (1s)"}, time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -53,7 +55,7 @@ func TestExtensionDialogTimeoutCountsDownAndCancels(t *testing.T) {
 			if elapsed < tc.after-100*time.Millisecond {
 				t.Fatalf("dialog expired after %v; want the %v countdown", elapsed, tc.after)
 			}
-			if m.extensionDialog != nil {
+			if m.shownExtensionDialog() != nil {
 				t.Fatal("expired dialog is still installed")
 			}
 			plain := widthx.StripAnsi(output.String())
@@ -78,7 +80,7 @@ func TestExtensionDialogAnsweredBeforeTimeoutStopsCountdown(t *testing.T) {
 	m, output := newExtensionDialogProbe(t)
 	ui := &ExtUIContext{m: m}
 	value, err := runTimedExtensionDialog(t, m, func() (string, error) {
-		return ui.Select(t.Context(), "Pick", []string{"first"}, map[string]any{"timeout": float64(1000)})
+		return ui.Select(t.Context(), "Pick", []string{"first"}, extension.ExtensionUIDialogOptions{Timeout: new(float64(1000))})
 	}, []string{"\r"})
 	if value != "first" || err != nil {
 		t.Fatalf("answered dialog = %q, %v; want first", value, err)
@@ -118,7 +120,7 @@ func runTimedExtensionDialog(t *testing.T, m *InteractiveMode, call func() (stri
 		select {
 		case task := <-m.uiTaskCh:
 			task()
-			if !installed && m.extensionDialog != nil {
+			if !installed && m.shownExtensionDialog() != nil {
 				installed = true
 				for _, key := range keys {
 					if err := m.dispatchKey(context.Background(), key); err != nil {

@@ -2,6 +2,7 @@ package durable
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 )
 
@@ -13,7 +14,7 @@ type fakeErasedRuntime struct {
 	commits []NextTaskState[JsonValue, JsonValue]
 }
 
-func (runtime *fakeErasedRuntime) Commit(_ context.Context, change func(Tx, ErasedRunningTask) (*NextTaskState[JsonValue, JsonValue], error)) error {
+func (runtime *fakeErasedRuntime) Commit(_ context.Context, change func(Tx, ErasedRunningTask) (*NextTaskState[JsonValue, JsonValue], error), _ ...CommitOptions) error {
 	next, err := change(nil, runtime.current)
 	if err != nil {
 		return err
@@ -58,8 +59,13 @@ func TestErasedPhasesRunTheTypedTask(t *testing.T) {
 		},
 	}
 	for _, phase := range []string{"plan", "run"} {
-		got := jsonOf(t, (*runtime.current.State.Checkpoint).(map[string]any)["phase"])
-		if got != `"`+phase+`"` {
+		var checkpoint struct {
+			Phase string `json:"phase"`
+		}
+		if err := json.Unmarshal([]byte(jsonOf(t, *runtime.current.State.Checkpoint)), &checkpoint); err != nil {
+			t.Fatal(err)
+		}
+		if got := `"` + checkpoint.Phase + `"`; got != `"`+phase+`"` {
 			t.Fatalf("phase = %s, want %s", got, phase)
 		}
 		if err := definition.Phases[phase](context.Background(), runtime.current, runtime); err != nil {

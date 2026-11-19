@@ -1,6 +1,7 @@
 import { statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { cacheImportedModules } from "./compile-cache.mjs";
+import { moduleRegistry } from "./runtime-modules.mjs";
 
 // Node module hooks for the extension runtime. Extensions load through jiti
 // (jiti-loader.mjs), as in Pi, which serves the specifiers below as virtual
@@ -13,23 +14,26 @@ process.emitWarning = () => {};
 
 // Specifiers Pi's extension loader serves from its own bundle
 // (core/extensions/virtual-modules.ts). Pi resolves the pi-ai root to its
-// compat entry point, so both names share one shim here. The pi-ai/oauth entry
+// extension view (compat entry point plus TypeBox's Type and StringEnum), so both names share one shim here. pi-ai/models is its own entry (shims/pi-ai-models.mjs). The pi-ai/oauth entry
 // point is type-only; pi-ai/providers/all and pi-agent-core are Pi's own modules.
 export const shims = new Map([
-  ["@mariozechner/pi-coding-agent", new URL("./shims/pi-coding-agent.mjs", import.meta.url).href],
-  ["@earendil-works/pi-coding-agent", new URL("./shims/pi-coding-agent.mjs", import.meta.url).href],
-  ["@mariozechner/pi-tui", new URL("./shims/pi-tui.mjs", import.meta.url).href],
-  ["@earendil-works/pi-tui", new URL("./shims/pi-tui.mjs", import.meta.url).href],
-  ["@mariozechner/pi-agent-core", new URL("./shims/pi-agent-core.mjs", import.meta.url).href],
-  ["@earendil-works/pi-agent-core", new URL("./shims/pi-agent-core.mjs", import.meta.url).href],
-  ["@mariozechner/pi-ai", new URL("./shims/pi-ai.mjs", import.meta.url).href],
-  ["@earendil-works/pi-ai", new URL("./shims/pi-ai.mjs", import.meta.url).href],
-  ["@mariozechner/pi-ai/compat", new URL("./shims/pi-ai.mjs", import.meta.url).href],
-  ["@earendil-works/pi-ai/compat", new URL("./shims/pi-ai.mjs", import.meta.url).href],
-  ["@mariozechner/pi-ai/oauth", new URL("./shims/pi-ai-oauth.mjs", import.meta.url).href],
-  ["@earendil-works/pi-ai/oauth", new URL("./shims/pi-ai-oauth.mjs", import.meta.url).href],
-  ["@mariozechner/pi-ai/providers/all", new URL("./shims/pi-dist/pi-ai/sdk-bundle/providers.js", import.meta.url).href],
-  ["@earendil-works/pi-ai/providers/all", new URL("./shims/pi-dist/pi-ai/sdk-bundle/providers.js", import.meta.url).href],
+  // Pi's package.json "exports" names ./dist/index.js, so an extension that resolves the package (import.meta.resolve) and goes two directories up reaches the package root and finds the CLI at <root>/dist/cli.js (pi-open-agents resolvePiEntryPoint). The vendored package root, which getPackageDir() reports, has that layout: dist/index.js re-exports the barrel and dist/cli.js starts the harness.
+  ["@mariozechner/pi-coding-agent", new URL("./shims/pi-dist/pi-coding-agent/dist/index.js", import.meta.url).href],
+  ["@earendil-works/pi-coding-agent", new URL("./shims/pi-dist/pi-coding-agent/dist/index.js", import.meta.url).href],
+  ["@mariozechner/pi-tui", new URL("./shims/pi-dist/pi-tui/dist/index.js", import.meta.url).href],
+  ["@earendil-works/pi-tui", new URL("./shims/pi-dist/pi-tui/dist/index.js", import.meta.url).href],
+  ["@mariozechner/pi-agent-core", new URL("./shims/pi-dist/pi-agent-core/dist/index.js", import.meta.url).href],
+  ["@earendil-works/pi-agent-core", new URL("./shims/pi-dist/pi-agent-core/dist/index.js", import.meta.url).href],
+  ["@mariozechner/pi-ai", new URL("./shims/pi-dist/pi-ai/dist/index.js", import.meta.url).href],
+  ["@earendil-works/pi-ai", new URL("./shims/pi-dist/pi-ai/dist/index.js", import.meta.url).href],
+  ["@mariozechner/pi-ai/compat", new URL("./shims/pi-dist/pi-ai/dist/index.js", import.meta.url).href],
+  ["@earendil-works/pi-ai/compat", new URL("./shims/pi-dist/pi-ai/dist/index.js", import.meta.url).href],
+  ["@mariozechner/pi-ai/models", new URL("./shims/pi-dist/pi-ai/dist/models.js", import.meta.url).href],
+  ["@earendil-works/pi-ai/models", new URL("./shims/pi-dist/pi-ai/dist/models.js", import.meta.url).href],
+  ["@mariozechner/pi-ai/oauth", new URL("./shims/pi-dist/pi-ai/dist/oauth.js", import.meta.url).href],
+  ["@earendil-works/pi-ai/oauth", new URL("./shims/pi-dist/pi-ai/dist/oauth.js", import.meta.url).href],
+  ["@mariozechner/pi-ai/providers/all", new URL("./shims/pi-dist/pi-ai/dist/providers/all.js", import.meta.url).href],
+  ["@earendil-works/pi-ai/providers/all", new URL("./shims/pi-dist/pi-ai/dist/providers/all.js", import.meta.url).href],
   // Pi aliases these to the TypeBox it ships; shims/typebox*.mjs bundle the
   // same pinned release (automation/gen/vendor-typebox.sh).
   ["typebox", new URL("./shims/typebox.mjs", import.meta.url).href],
@@ -104,14 +108,39 @@ export function load(url, context, nextLoad) {
   // The stamp is taken before Node reads the source, so an edit made while it reads counts as an edit.
   const stamp = stampOf(url);
   const remember = (loaded) => {
-    loads.set(moduleKey(url), { url, format: loaded?.format, stamp });
+    recordLoad(url, loaded?.format, stamp);
     return loaded;
   };
   const result = nextLoad(url, context);
   return typeof result?.then === "function" ? result.then(remember) : remember(result);
 }
 
-// pig divergence (D93): when a reload pass starts, each extension ES module whose source changed since Node loaded it, and each extension ES module that imports one, directly or through others, gets a URL carrying the pass, so the reload evaluates them again; every other module keeps its instance and its state. A CommonJS module keeps its module, so an edit of one, or of a module only it imports, is not evaluated again. The asynchronous hooks of a Node release without module.registerHooks run in their own thread, so there the maps stay empty and every module keeps its instance, as in Pi.
+function recordLoad(url, format, stamp) {
+  loads.set(moduleKey(url), { url, format, stamp });
+}
+
+// Bun runs neither Node hook API. register-loader.mjs records the same facts from a Bun runtime plugin through the two functions below. Bun resolves a module several times before it evaluates it and adds it to its registry only once evaluated, so recorded holds each module whose current evaluation is recorded: the first resolution that finds the module outside the registry starts the record, and a reload that removes the module from the registry ends it. Bun evaluates a module again under its own URL, so each evaluation's imports replace the previous one's.
+const recorded = new Set();
+export function recordBunLoad(url, inRegistry, format) {
+  const key = moduleKey(url);
+  if (inRegistry || recorded.has(key) || !extensionModule(url)) return;
+  recorded.add(key);
+  const stamp = stampOf(url);
+  imports.delete(url);
+  recordLoad(url, format(), stamp);
+}
+
+export function recordBunImport(parentURL, url) {
+  if (!extensionModule(url) || !extensionModule(parentURL)) return;
+  if (!imports.has(parentURL)) imports.set(parentURL, new Set());
+  imports.get(parentURL).add(moduleKey(url));
+}
+
+export { extensionModule };
+
+const onBun = typeof globalThis.Bun !== "undefined";
+
+// pig divergence (D93): when a reload pass starts, each extension ES module whose source changed since Node loaded it, and each extension ES module that imports one, directly or through others, gets a URL carrying the pass, so the reload evaluates them again; every other module keeps its instance and its state. A CommonJS module keeps its module, so an edit of one, or of a module only it imports, is not evaluated again. The asynchronous hooks of a Node release without module.registerHooks run in their own thread, so there the maps stay empty and every module keeps its instance, as in Pi. On Bun the runtime plugin of register-loader.mjs fills the maps, and a module evaluated again keeps its URL.
 export function reevaluateEdited(pass) {
   const stale = new Set();
   for (const [key, loaded] of loads) {
@@ -135,6 +164,12 @@ export function reevaluateEdited(pass) {
     }
   }
   for (const key of stale) {
+    // pig divergence (D93): Bun keeps every module, ES modules included, in the registry its require.cache exposes; a module removed from it is evaluated again, from its own URL, by the next import.
+    if (onBun) {
+      delete moduleRegistry()[fileURLToPath(key)];
+      recorded.delete(key);
+      continue;
+    }
     const url = new URL(key);
     url.searchParams.set(reloadParam, pass);
     latest.set(key, url.href);

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -116,6 +117,9 @@ func parsedKeyName(codepoint int) (string, bool) {
 	case cpArrowRight:
 		return "right", true
 	}
+	if codepoint <= cpF1 && codepoint >= cpF12 {
+		return "f" + strconv.Itoa(cpF1-codepoint+1), true
+	}
 	if codepoint >= '0' && codepoint <= 'z' && (codepoint <= '9' || codepoint >= 'a') {
 		return string(rune(codepoint)), true
 	}
@@ -153,15 +157,26 @@ func formatKeyNameWithModifiers(keyName string, modifier int) (string, bool) {
 // false when the input is not one recognized key.
 func ParseKey(data string) (string, bool) {
 	if kitty := parseCSIu(data); kitty != nil {
-		return formatParsedKey(kitty.codepoint, kitty.modifier, kitty.baseLayoutKey, kitty.hasBaseLayoutKey)
+		codepoint, modifier := kitty.codepoint, kitty.modifier
+		if cp, mod, ok := logicalShiftedSymbol(kitty.shiftedKey, kitty.hasShiftedKey, kitty.modifier, isSymbolCodepoint); ok {
+			codepoint, modifier = cp, mod
+		}
+		return formatParsedKey(codepoint, modifier, kitty.baseLayoutKey, kitty.hasBaseLayoutKey)
 	}
 	if modified := parseModifyOtherKeys(data); modified != nil {
-		return formatParsedKey(modified.codepoint, modified.modifier, 0, false)
+		codepoint, modifier := modified.codepoint, modified.modifier
+		if cp, mod, ok := logicalShiftedSymbol(modified.codepoint, true, modified.modifier, isShiftedSymbolCodepoint); ok {
+			codepoint, modifier = cp, mod
+		}
+		return formatParsedKey(codepoint, modifier, 0, false)
 	}
 	if modified := parseModifiedArrow(data); modified != nil {
 		return formatParsedKey(modified.codepoint, modified.modifier, 0, false)
 	}
 	if modified := parseModifiedFunc(data); modified != nil {
+		return formatParsedKey(modified.codepoint, modified.modifier, 0, false)
+	}
+	if modified := parseBareFKey(data); modified != nil {
 		return formatParsedKey(modified.codepoint, modified.modifier, 0, false)
 	}
 

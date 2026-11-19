@@ -7,6 +7,8 @@ package tui
 import (
 	"strings"
 
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
 
@@ -34,8 +36,19 @@ func NewPaddedText(content string, paddingX, paddingY int, bgFn func(string) str
 	return &Text{Content: content, PaddingX: paddingX, PaddingY: paddingY, CustomBgFn: bgFn}
 }
 
+// SetText replaces the text. The same text keeps the wrapped lines, since renderers often set the text they showed
+// before on every update (text.ts setText).
 func (t *Text) SetText(content string) {
+	if content == t.Content {
+		return
+	}
 	t.Content = content
+	t.Invalidate()
+}
+
+// SetPaddingX sets the horizontal padding and invalidates the cached lines (text.ts setPaddingX).
+func (t *Text) SetPaddingX(paddingX int) {
+	t.PaddingX = paddingX
 	t.Invalidate()
 }
 
@@ -54,7 +67,7 @@ func (t *Text) Render(width int) []string {
 	if t.cacheValid && t.cachedText == t.Content && t.cachedWidth == width {
 		return t.cachedLines
 	}
-	if t.Content == "" || strings.TrimSpace(t.Content) == "" {
+	if t.Content == "" || jsstring.Trim(t.Content) == "" {
 		t.cachedText = t.Content
 		t.cachedWidth = width
 		t.cachedLines = []string{}

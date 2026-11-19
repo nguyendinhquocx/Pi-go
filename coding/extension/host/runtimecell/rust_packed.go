@@ -34,6 +34,9 @@ type RustExtension struct {
 	Crate   string
 	Factory string
 	Hash    string
+	// Verify, when set, reports an error when the extension's source no longer matches Hash. A caller that derived Hash from the
+	// source files sets it, so that a build proves the compiler read the source that was hashed (see cellInputsUnchanged).
+	Verify func() error
 }
 
 // RustPackedCell describes a generated Rust packed-cell artifact.
@@ -74,7 +77,7 @@ func BuildRustPackedCell(ctx context.Context, cacheRoot, key string, extensions 
 	for _, extension := range normalized {
 		lockCandidates = append(lockCandidates, RustSDKPathOverride(extension.Root))
 	}
-	lockCandidates = append(lockCandidates, stagedSDKRoots("sdk-rs")...)
+	lockCandidates = append(lockCandidates, stagedSDKRoots("rust")...)
 	return pigsdklock.WithBuildCandidates(ctx, lockCandidates, func() (*RustPackedCell, error) {
 		sdkRoot, err := findRustSDKRoot(normalized)
 		if err != nil {
@@ -114,17 +117,22 @@ func BuildRustPackedCell(ctx context.Context, cacheRoot, key string, extensions 
 				if os.Getenv("CARGO_BUILD_JOBS") == "" {
 					cmd.Env = append(cmd.Env, "CARGO_BUILD_JOBS=1")
 				}
+				//portlint:allow clock measures cargo's elapsed time for the failure record (a duration, not a date); the package's Now seam (cache_lifecycle.go:71) dates cache entries for collection
+				cargoStarted := time.Now()
 				if out, err := buildprogress.CombinedOutput(ctx, cmd); err != nil {
 					invalidateCommandVersion(cacheRoot, "rustc", "--version")
 					invalidateCommandVersion(cacheRoot, "cargo", "--version")
 					if explained, ok := explainMissingToolchain("rust", err); ok {
 						return "", explained
 					}
-					failure, recordable := RustBuildFailure(cacheRoot, hash, scratch, err, out)
+					failure, recordable := RustBuildFailure(cacheRoot, hash, scratch, err, out, BuildRun{Elapsed: time.Since(cargoStarted), ContextErr: ctx.Err()})
 					if ctx.Err() != nil || cmd.ProcessState == nil || cmd.ProcessState.ExitCode() < 0 || !recordable {
 						return "", failure
 					}
 					return "", cacheBuildFailure(failure)
+				}
+				if err := cellInputsUnchanged(key, hash, rustPackedCellHash(cacheRoot, key, normalized, sdkRoot), rustExtensionVerifiers(normalized)); err != nil {
+					return "", err
 				}
 				return filepath.Join(cargoTargetDirectory(scratch), "release", packageName+strings.TrimPrefix(artifactName, "runner")), nil
 			})
@@ -240,7 +248,11 @@ func findRustSDKRoot(extensions []RustExtension) (string, error) {
 			return abs, nil
 		}
 	}
-	for _, root := range stagedSDKRoots("sdk-rs") {
+	// pig additive (D92): only an author override serves a Rust SDK the active Piglet strips; this binary staged none.
+	if err := StrippedSDKError("rust"); err != nil {
+		return "", err
+	}
+	for _, root := range stagedSDKRoots("rust") {
 		if _, err := os.Stat(filepath.Join(root, "Cargo.toml")); err == nil {
 			return root, nil
 		}
@@ -274,7 +286,8 @@ func findRustSDKRoot(extensions []RustExtension) (string, error) {
 	return "", fmt.Errorf("cannot locate github.com/MichaelKinsy/PiG checkout for Rust SDK; set PIG_SDK_RS_ROOT")
 }
 
-// RustSDKPathOverride returns an extension crate's explicit local SDK path.
+// RustSDKPathOverride returns an extension crate's explicit local SDK path,
+// judging a retired staged SDK against the config root the environment names.
 func RustSDKPathOverride(root string) string {
 	var manifest struct {
 		Dependencies map[string]any `toml:"dependencies"`
@@ -297,6 +310,12 @@ func RustSDKPathOverride(root string) string {
 	if _, err := os.Stat(filepath.Join(path, "Cargo.toml")); err != nil {
 		return ""
 	}
+	// A path into the config root's SDK staging area that misses the current
+	// staging is left from an earlier host build; it is treated as absent so the
+	// build uses the SDK staged now.
+	if RetiredStagedSDK(path, ambientStagedSDKDir("rust")) {
+		return ""
+	}
 	return path
 }
 
@@ -310,6 +329,25 @@ func copyRustSDKLockfile(sdkRoot, cellDir string) error {
 	}
 	if err := os.WriteFile(filepath.Join(cellDir, "Cargo.lock"), data, 0o644); err != nil {
 		return fmt.Errorf("write generated Cargo.lock: %w", err)
+	}
+	return nil
+}
+
+// WriteRustWarmCell writes a Rust cell crate with no extensions into dir: the manifest and the lock copy a real cell gets,
+// and an empty main. Building it fills a Cargo target with the units every cell of that SDK shares, pig-sdk included
+// (Cargo keys a path dependency's unit on its path), so make test-warm seeds the cell's own unit and not a lookalike.
+func WriteRustWarmCell(dir, sdkRoot string) error {
+	if err := os.MkdirAll(filepath.Join(dir, "src"), 0o755); err != nil {
+		return fmt.Errorf("create Rust warm cell: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Cargo.toml"), []byte(renderRustCargoToml(nil, sdkRoot, "pig-warm-cell")), 0o644); err != nil {
+		return fmt.Errorf("write warm cell Cargo.toml: %w", err)
+	}
+	if err := copyRustSDKLockfile(sdkRoot, dir); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "src", "main.rs"), []byte("fn main() {}\n"), 0o644); err != nil {
+		return fmt.Errorf("write warm cell main.rs: %w", err)
 	}
 	return nil
 }
@@ -329,12 +367,12 @@ func renderRustCargoToml(extensions []RustExtension, sdkRoot, packageName string
 func renderRustRunner(extensions []RustExtension) string {
 	var b strings.Builder
 	b.WriteString("use std::env;\nuse std::io::BufRead;\nuse std::process;\nuse std::sync::{Arc, Condvar, Mutex};\nuse std::thread;\n\n")
-	b.WriteString("#[derive(Clone, Copy)]\nstruct Item { name: &'static str, env: &'static str, run: fn(String) -> std::io::Result<()> }\n\n")
+	b.WriteString("#[derive(Clone, Copy)]\nstruct Item { name: &'static str, env: &'static str, run: fn(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()> }\n\n")
 	b.WriteString(rustRunnerState)
 	b.WriteString("fn main() {\n")
 	b.WriteString("    let items: Vec<Item> = vec![\n")
 	for _, ext := range extensions {
-		fmt.Fprintf(&b, "        Item { name: %q, env: %q, run: |sock| %s::%s().run_with_socket(&sock) },\n", ext.Name, SocketEnvName(ext.Name), ext.Crate, ext.Factory)
+		fmt.Fprintf(&b, "        Item { name: %q, env: %q, run: |sock, built| { let extension = build(&sock, %s::%s); built(); extension.run_with_socket(&sock) } },\n", ext.Name, SocketEnvName(ext.Name), ext.Crate, ext.Factory)
 	}
 	b.WriteString("    ];\n")
 	b.WriteString(rustRunnerMain)
@@ -347,15 +385,35 @@ const rustRunnerState = `#[derive(Default)]
 struct State { live: usize, parked: bool, input_closed: bool, failed: bool }
 type Shared = Arc<(Mutex<State>, Condvar)>;
 
+// Builds one member at a time with PIG_EXT_SOCKET set to that member's socket, which is what an isolated extension's factory sees: a helper the factory
+// calls before run (pig_sdk::parse_frontmatter, parse_date) dials that socket. The members' factories run one at a time, as Pi loads extensions one at a time.
+static FACTORY_TURN: Mutex<()> = Mutex::new(());
+
+#[allow(unused_unsafe)]
+fn build<T>(sock: &str, factory: impl FnOnce() -> T) -> T {
+    let _turn = FACTORY_TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = env::var("PIG_EXT_SOCKET").ok();
+    unsafe { env::set_var("PIG_EXT_SOCKET", sock) };
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(factory));
+    match previous {
+        Some(previous) => unsafe { env::set_var("PIG_EXT_SOCKET", previous) },
+        None => unsafe { env::remove_var("PIG_EXT_SOCKET") },
+    }
+    match built { Ok(built) => built, Err(payload) => std::panic::resume_unwind(payload) }
+}
+
 // The host percent-encodes the four characters that delimit a control line (packed_go.go encodeAdmissionField); the percent sign decodes last.
 fn unescape_field(field: &str) -> String {
     field.replace("%09", "\t").replace("%0A", "\n").replace("%0D", "\r").replace("%25", "%")
 }
 
-fn start(item: Item, sock: String, shared: Shared) {
+// start runs a member on a thread of its own and returns a receiver that ends once the member's factory has returned, panicked or never ran.
+fn start(item: Item, sock: String, shared: Shared) -> std::sync::mpsc::Receiver<()> {
     shared.0.lock().unwrap().live += 1;
+    let (built_sender, built) = std::sync::mpsc::channel::<()>();
     thread::spawn(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (item.run)(sock.clone())));
+        let built: Box<dyn FnOnce() + Send> = Box::new(move || { let _ = built_sender.send(()); });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (item.run)(sock.clone(), built)));
         let result = match result { Ok(result) => result, Err(_) => Err(std::io::Error::other("extension panicked")) };
         if let Err(err) = &result { eprintln!("{}: {}", item.name, err); let _ = pig_sdk::report_load_failure(&sock); }
         let (state, cond) = &*shared;
@@ -364,6 +422,7 @@ fn start(item: Item, sock: String, shared: Shared) {
         if result.is_err() { state.failed = true; }
         cond.notify_all();
     });
+    built
 }
 
 `
@@ -379,7 +438,10 @@ const rustRunnerMain = `    let shared: Shared = Arc::new((Mutex::new(State::def
             Err(_) => { eprintln!("{} not set for {}", item.env, item.name); process::exit(1); }
         };
         started += 1;
-        start(item, sock, shared.clone());
+        // The host accepts the members in order and serves a connection only after the members before it. A factory that calls the host before it returns (a
+        // subscription on the event bus) waits for that service, so a later member must not take the factory turn before an earlier one: it would hold the turn
+        // while the host waits for the earlier member's connection.
+        let _ = start(item, sock, shared.clone()).recv();
     }
     {
         let shared = shared.clone();
@@ -443,7 +505,7 @@ func CurrentRustPackedCellEntry(cacheRoot, key string, extensions []RustExtensio
 	for _, extension := range normalized {
 		lockCandidates = append(lockCandidates, RustSDKPathOverride(extension.Root))
 	}
-	lockCandidates = append(lockCandidates, stagedSDKRoots("sdk-rs")...)
+	lockCandidates = append(lockCandidates, stagedSDKRoots("rust")...)
 	return pigsdklock.WithBuildEntryCandidates(context.Background(), lockCandidates, func() (string, bool, error) {
 		sdkRoot, err := findRustSDKRoot(normalized)
 		if err != nil {

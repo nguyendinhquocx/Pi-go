@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 
@@ -25,6 +26,8 @@ import (
 	piglet "github.com/MichaelKinsy/PiG/coding/piglet"
 	"github.com/MichaelKinsy/PiG/coding/piglet/artifact"
 	"github.com/MichaelKinsy/PiG/coding/piglet/signature"
+	"github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/frontendpack"
 )
 
 //go:embed piglet.yaml
@@ -52,10 +55,58 @@ func parse(data []byte) *piglet.Piglet {
 	if err != nil || p == nil {
 		return nil
 	}
-	if p.Model == nil && p.SystemPrompt == nil && len(p.Extensions) == 0 && len(p.Skills) == 0 && p.BuiltinTools == nil && p.Discovery == nil {
+	// pig additive (D92): a strip list alone defines a Piglet Binary's agent.
+	if p.Model == nil && p.SystemPrompt == nil && len(p.Extensions) == 0 && len(p.Skills) == 0 && p.BuiltinTools == nil && p.Discovery == nil && p.ContextFiles == "" && p.Strip.IsEmpty() {
 		return nil
 	}
 	return p
+}
+
+// OverlayBase returns the baked Piglet as the base of an overlay when this Piglet Binary accepts one (every Piglet
+// Binary does unless its Piglet set build.closed), and nil otherwise, including for stock pig. The flag is part of the baked
+// Piglet, so the digest the record and the signed manifest name covers it.
+//
+// pig additive (D202): a Piglet Binary accepts overlay Piglets unless built closed.
+func OverlayBase() *piglet.OverlayBase {
+	if !IsPigletBinary() {
+		return nil
+	}
+	p, err := piglet.ParseBytes(pigletYAML)
+	if err != nil || closed(p) {
+		return nil
+	}
+	// The baked bytes carry no slots; the frontend member is compiled into the executable, so the base names it for extends.remove.slots.
+	if frontendpack.Fused() {
+		p.Slots = &piglet.Slots{Frontend: &piglet.SlotMember{Member: CompiledFrontendMember}}
+	}
+	return &piglet.OverlayBase{Piglet: p, Digest: "sha256:" + hex.EncodeToString(sha256Sum(pigletYAML))}
+}
+
+func closed(p *piglet.Piglet) bool { return p.Build != nil && p.Build.Closed }
+
+// Closed reports whether this executable is a Piglet Binary built with build.closed, or one whose baked Piglet cannot be read
+// (it then accepts nothing). Stock pig is not closed.
+//
+// pig additive (D202): `pig piglet show` names whether a Piglet Binary is closed.
+func Closed() bool {
+	if !IsPigletBinary() {
+		return false
+	}
+	p, err := piglet.ParseBytes(pigletYAML)
+	return err != nil || closed(p)
+}
+
+// CompiledFrontendMember is the member path the base of an overlay gives the frontend compiled into the Binary, which has no
+// directory at run time.
+const CompiledFrontendMember = "compiled-in"
+
+// Name returns the name of the Piglet baked into this Binary, or "" for stock pig.
+func Name() string {
+	record, err := DefaultClosure()
+	if err != nil || record == nil {
+		return ""
+	}
+	return record.Piglet
 }
 
 // DefaultClosure returns the Piglet resolution record baked into this binary,
@@ -83,56 +134,67 @@ func IsPigletBinary() bool {
 
 // Verify checks that the closure baked into a Piglet Binary is a valid,
 // untampered resolution record whose effective digest matches the baked
-// Piglet. Stock pig (no baked closure) verifies trivially. A built Piglet
-// Binary that fails these checks must not run: its recorded build identity or
-// its embedded Piglet has been altered.
-func Verify() error {
+// Piglet, and checks its signature. Stock pig (no baked closure) verifies
+// trivially. A built Piglet Binary that fails these checks must not run: its
+// recorded build identity or its embedded Piglet has been altered. A signed
+// Binary whose unchanged file passed before skips re-hashing its executable
+// bytes (see signature.CheckCached). cacheErr reports that a passing check
+// could not be remembered; the Binary still runs, and its next start checks
+// it in full again.
+func Verify() (cacheErr, err error) {
 	record, err := DefaultClosure()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if record == nil {
-		return nil
+		return nil, nil
 	}
 	if record.Kind != artifact.RecordKindResolution || record.Resolution == nil {
-		return fmt.Errorf("baked Piglet closure is not a resolution record")
+		return nil, fmt.Errorf("baked Piglet closure is not a resolution record")
 	}
 	if err := artifact.ValidateRecord(*record); err != nil {
-		return fmt.Errorf("baked Piglet closure failed verification: %w", err)
+		return nil, fmt.Errorf("baked Piglet closure failed verification: %w", err)
 	}
 	pigletDigest := "sha256:" + hex.EncodeToString(sha256Sum(pigletYAML))
 	if pigletDigest != record.Resolution.EffectiveDigest {
-		return fmt.Errorf("baked Piglet does not match its closure: Piglet digest %s, closure expects %s", pigletDigest, record.Resolution.EffectiveDigest)
+		return nil, fmt.Errorf("baked Piglet does not match its closure: Piglet digest %s, closure expects %s", pigletDigest, record.Resolution.EffectiveDigest)
 	}
-	_, err = SignatureStatus(record)
-	return err
+	return checkSignature(record)
 }
 
-// SignatureStatus checks this Piglet Binary's signature block against the
+// checkSignature checks this Piglet Binary's signature block against the
 // author's embedded signer keys and the user's Piglet trust store, offline.
-// An unsigned binary reports Signed=false with no error unless its author
-// embedded a signer or the user's policy requires a signature. A signed
-// manifest must also name this binary's own record, Piglet, target, and Pig
-// version.
+// An unsigned binary passes unless its author embedded a signer or the user's
+// policy requires a signature. A signed manifest must also name this binary's
+// own record, Piglet, target, and Pig version.
 // pig additive (D18): signed Piglet Binaries refuse to start when altered.
-func SignatureStatus(record *artifact.Record) (signature.Status, error) {
+func checkSignature(record *artifact.Record) (cacheErr, err error) {
 	embedded, err := signature.ParsePublicKeys(signersPEM)
 	if err != nil {
-		return signature.Status{}, fmt.Errorf("baked Piglet signer keys: %w", err)
+		return nil, fmt.Errorf("baked Piglet signer keys: %w", err)
 	}
 	trust, err := signature.LoadTrust(signature.TrustDir())
 	if err != nil {
-		return signature.Status{}, fmt.Errorf("Piglet trust store: %w", err)
+		return nil, fmt.Errorf("Piglet trust store: %w", err)
 	}
 	self, err := executable()
 	if err != nil {
-		return signature.Status{}, fmt.Errorf("locate this Piglet Binary to check its signature: %w", err)
+		return nil, fmt.Errorf("locate this Piglet Binary to check its signature: %w", err)
 	}
-	status, err := signature.Check(self, signature.Policy{Trust: trust, Embedded: embedded, RequireKnownSigner: true})
-	if err != nil || !status.Signed {
-		return status, err
+	// pig additive (D18): the verification cache spares an unchanged Binary the hash of its executable bytes; it is written only after every check passed.
+	check, err := signature.CheckCached(self, signature.Policy{Trust: trust, Embedded: embedded, RequireKnownSigner: true}, verifyCachePath())
+	if err != nil || !check.Status.Signed {
+		return nil, err
 	}
-	return status, matchManifest(status.Manifest, record)
+	if err := matchManifest(check.Status.Manifest, record); err != nil {
+		return nil, err
+	}
+	return check.Remember(), nil
+}
+
+// verifyCachePath is the per-user file that remembers passing startup checks.
+func verifyCachePath() string {
+	return filepath.Join(codingagent.StateDir("piglet-verify"), "verified.json")
 }
 
 // matchManifest binds the verified signed manifest to what this binary

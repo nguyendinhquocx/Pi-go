@@ -53,7 +53,7 @@ func TestPromptSectionMutationsAcrossSDKs(t *testing.T) {
 		}
 		assertPromptSections(t, *loaded)
 	})
-	for _, language := range []string{"go", "python", "rust", "node"} {
+	for _, language := range []string{"go", "python", "rust", "node", "lisp"} {
 		t.Run(language, func(t *testing.T) {
 			for _, placement := range []string{"isolated", "packed"} {
 				t.Run(placement, func(t *testing.T) {
@@ -98,7 +98,7 @@ func assertPromptSections(t *testing.T, ext extension.Extension) {
 	runner.AddErrorListener(func(err *extension.ExtensionError) { reported = append(reported, err.Error) })
 	for _, prompt := range []string{"ordinary", "error", "result"} {
 		sections := ai.OrderedSections{{Name: "z_base", Value: new("retained")}}
-		result, err := runner.EmitBeforeAgentStart(t.Context(), prompt, nil, "base", extension.BuildSystemPromptOptions{Sections: &sections})
+		result, err := runner.EmitBeforeAgentStart(t.Context(), extension.UserPromptTrigger(prompt, nil), extension.BuildSystemPromptOptions{Sections: &sections})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -164,15 +164,29 @@ def new_extension():
  e.on_event("before_agent_start",handler)
  return e
 `, name)
+	case "lisp":
+		path = filepath.Join(cfg.Source, name+".lisp")
+		source = fmt.Sprintf(`(defpackage %q (:use "COMMON-LISP"))
+(in-package %q)
+(defun new-extension ()
+  (let ((e (pig:make-extension %q)))
+    (pig:on e "before_agent_start"
+      (lambda (ctx data) (declare (ignore ctx))
+        (setf (gethash "plan_mode" (pig:jget (pig:jget data "systemPromptOptions") "sections")) "Plan only.")
+        (cond ((equal (pig:jget data "prompt") "error") (error "section failure"))
+              ((equal (pig:jget data "prompt") "result") (pig:obj "systemPrompt" "Exact prompt.")))))
+    e))
+`, name, name, name)
 	case "rust":
 		path = filepath.Join(cfg.Source, "src", "lib.rs")
 		source = fmt.Sprintf(`use pig_sdk::{Extension,Schema};
 pub fn new_extension()->Extension {
  let mut e=Extension::new(%q);
- e.on_event_result("before_agent_start",false,|_,data| {
-  data["systemPromptOptions"]["sections"]["plan_mode"]=Schema::String("Plan only.".into());
-  if data["prompt"]=="error" {return Err("section failure".into())}
-  if data["prompt"]=="result" {let mut result=Schema::Object(Default::default());result["systemPrompt"]=Schema::String("Exact prompt.".into());return Ok(Some(result))};Ok(None)
+ e.on_before_agent_start(|_,event| {
+  event.edit_system_prompt_options(|options| options["sections"]["plan_mode"]=Schema::String("Plan only.".into()));
+  let prompt=&event.payload()["prompt"];
+  if prompt=="error" {return Err("section failure".into())}
+  if prompt=="result" {let mut result=Schema::Object(Default::default());result["systemPrompt"]=Schema::String("Exact prompt.".into());return Ok(Some(result))};Ok(None)
  });
  e
 }`, name)

@@ -1,6 +1,6 @@
 # Message types
 
-PiG uses one message format in session files, in JSON and RPC events, and in the Go SDK. This page defines the messages and the content blocks inside them. The JSON field names match Pi 1.0.3, except that PiG does not yet carry the `nestedCalls` record that Pi 1.0.3 adds to tool result messages.
+PiG uses one message format in session files, in JSON and RPC events, and in the Go SDK. This page defines the messages and the content blocks inside them. The JSON field names match Pi 1.5.0 ([Pi's message types reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/message-types.md)).
 
 Every message has a `role` field that names its type. A message `timestamp` is a Unix time in milliseconds. Session entries use ISO 8601 timestamps instead. See [session file format](/docs/latest/session-format).
 
@@ -74,7 +74,7 @@ Go type: `ai.ToolCall`.
 Assistant messages always carry `usage`. A tool result carries `usage` only when the tool made its own model calls.
 
 ```json
-{"input":1200,"output":340,"cacheRead":800,"cacheWrite":0,"totalTokens":2340,"cost":{"input":0.0012,"output":0.0034,"cacheRead":0.0002,"cacheWrite":0,"total":0.0048}}
+{"input":1200,"output":340,"cacheRead":800,"cacheWrite":0,"totalTokens":2340,"cost":{"input":0.0012,"output":0.0034,"cacheRead":0.0002,"cacheWrite":0,"total":0.0048,"totalFromProvider":false}}
 ```
 
 | Field | Type | Meaning |
@@ -86,7 +86,7 @@ Assistant messages always carry `usage`. A tool result carries `usage` only when
 | `cacheWrite1h` | number, optional | The part of `cacheWrite` stored with one-hour retention. |
 | `reasoning` | number, optional | Reasoning tokens. They are already part of `output`, so do not add them again. |
 | `totalTokens` | number | Total tokens. |
-| `cost` | object | Cost of `input`, `output`, `cacheRead` and `cacheWrite`, and the `total`. |
+| `cost` | object | Cost of `input`, `output`, `cacheRead` and `cacheWrite`, and the `total`. `totalFromProvider` is `true` when `total` is the billed cost the provider reported and `false` when it is an estimate from the model's catalog rates. A usage recorded before the field existed has no `totalFromProvider`, which also means `false`. |
 
 Tool-result usage counts toward session statistics. It is not part of the usage of the main model call.
 
@@ -101,7 +101,7 @@ These four roles are the messages a provider understands.
 A system message sets the instructions and the tool set from its position in the transcript onward.
 
 ```json
-{"role":"system","content":"","sections":{"preamble":"You are an expert coding assistant..."},"timestamp":1768485600000}
+{"role":"system","content":"","sections":{"preamble":"You are a coding assistant..."},"timestamp":1768485600000}
 ```
 
 | Field | Type | Meaning |
@@ -112,8 +112,6 @@ A system message sets the instructions and the tool set from its position in the
 | `toolsRemoved` | array, optional | `{"name": ...}` references to tools that stop being available here. |
 
 The first system message declares the starting prompt and tools. Replay the later ones in order to get the current state.
-
-Pi's `message-types.md` also lists a `replace` field. The Pi 1.0.3 source does not define that field, and PiG does not read or write it.
 
 Go type: `ai.SystemMessage`.
 
@@ -150,6 +148,7 @@ Go type: `agent.UserMessage`, or `ai.UserMessage` for a provider request.
 | `errorMessage` | string, optional | The error text when `stopReason` is `error` or `aborted`. |
 | `rawStopReason` | string, optional | The provider's own stop reason. |
 | `endTurn` | boolean, optional | Whether the provider marked the end of its turn. |
+| `durationMs` | number, optional | Milliseconds from the request start until the response ended, measured with a monotonic clock for every provider. Absent in older messages and for deferred results fetched later. |
 
 `stopReason` is one of these values:
 
@@ -180,7 +179,9 @@ Go type: `agent.AssistantMessage`, or `ai.AssistantMessage` for a provider reque
 | `content` | array | Text and image blocks that the model sees. |
 | `details` | any, optional | Tool-specific data for renderers and extensions. The model does not see it. |
 | `usage` | object, optional | Model usage of the tool itself. |
+| `nestedCalls` | object, optional | The calls this tool made to other tools, for example from a codemode script: `calls`, each with `id`, `name`, `status` (`ok`, `error` or `unfinished`), and optional `arguments`, `argumentsBytes`, `durationMs` and `error`; and `complete`, which is `false` when calls were dropped, arguments were omitted or calls had not finished. The record is kept in the session; the model does not see it. |
 | `isError` | boolean | Whether the tool failed. |
+| `durationMs` | number, optional | Milliseconds the tool's `execute()` took, measured with a monotonic clock and excluding hooks. Absent in older messages and for a call that did not run. |
 
 Go type: `agent.ToolResultMessage`.
 
@@ -221,7 +222,7 @@ An extension creates a custom message when it sends a message into the session.
 | `display` | boolean | Whether the terminal UI shows the message. |
 | `details` | any, optional | Extension data. The model does not see it. |
 
-PiG sends a custom message to the model when its `content` is a string. Pi also sends a custom message whose `content` is an array of blocks. PiG currently leaves such a message out of the model request.
+PiG sends a custom message to the model as a user message. String `content` becomes one text block, and an array of text and image blocks passes through unchanged, as in Pi.
 
 ### Branch summary
 

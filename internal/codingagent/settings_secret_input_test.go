@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -14,23 +15,23 @@ import (
 )
 
 func TestMaskSecretInputSettingsRoundTrip(t *testing.T) {
-	var item *settingItem
-	for _, candidate := range settingsItems() {
-		if candidate.id == "mask-secret-input" {
-			item = &candidate
-			break
-		}
-	}
-	if item == nil {
-		t.Fatal("/settings has no Mask secret input setting")
-	}
-	if item.label != "Mask secret input" || item.get(Settings{}) != "true" || !strings.Contains(item.desc, "Pi") || !strings.Contains(item.desc, "false") {
+	item := settingsSelectorRow(t, SettingsConfig{MaskSecretInput: true}, "mask-secret-input")
+	if item.Label != "Mask secret input" || item.CurrentValue != "true" || !strings.Contains(item.Description, "Pi") || !strings.Contains(item.Description, "false") {
 		t.Fatalf("setting metadata = %+v", item)
 	}
 	for _, value := range []string{"false", "true"} {
 		sm := NewSettingsManager(t.TempDir(), t.TempDir())
-		if err := sm.UpdateGlobal(func(s *Settings) { item.apply(s, value) }); err != nil {
-			t.Fatal(err)
+		var reported []bool
+		list := NewSettingsSelectorComponent(SettingsConfig{MaskSecretInput: value == "false"}, SettingsCallbacks{OnMaskSecretInputChange: func(enabled bool) {
+			reported = append(reported, enabled)
+			if err := sm.SetMaskSecretInput(enabled); err != nil {
+				t.Fatal(err)
+			}
+		}}).GetSettingsList()
+		list.SelectItem("mask-secret-input")
+		list.HandleInput("\r")
+		if len(reported) != 1 || strconv.FormatBool(reported[0]) != value {
+			t.Fatalf("cycling reported %v, want [%s]", reported, value)
 		}
 		s := sm.Get()
 		encoded, err := json.Marshal(s)
@@ -44,11 +45,11 @@ func TestMaskSecretInputSettingsRoundTrip(t *testing.T) {
 		if err := json.Unmarshal(encoded, &restored); err != nil {
 			t.Fatal(err)
 		}
-		if item.get(restored) != value {
+		if strconv.FormatBool(restored.GetMaskSecretInput()) != value {
 			t.Fatal("setting did not round trip")
 		}
 		sm.Reload()
-		if item.get(sm.Get()) != value {
+		if strconv.FormatBool(sm.Get().GetMaskSecretInput()) != value {
 			t.Fatal("setting was not persisted")
 		}
 	}
@@ -57,16 +58,15 @@ func TestMaskSecretInputSettingsRoundTrip(t *testing.T) {
 func TestMaskSecretInputSettingsMenuAppliesToNextDialog(t *testing.T) {
 	m := newPostLoginTestMode(t)
 	sc := m.buildSlashContext(t.Context())
-	sc.ShowSettingsList = func(items []tui.SettingItem, onChange func(id, value string) string) {
-		for _, item := range items {
-			if item.ID == "mask-secret-input" {
-				if shown := onChange(item.ID, "false"); shown != "false" {
-					t.Errorf("menu shows %q after the change, want false", shown)
-				}
-				return
+	sc.ShowSettingsSelector = func(build func(done func()) *SettingsSelectorComponent) {
+		list := build(func() {}).GetSettingsList()
+		list.SelectItem("mask-secret-input")
+		list.HandleInput("\r")
+		for _, item := range list.Items() {
+			if item.ID == "mask-secret-input" && item.CurrentValue != "false" {
+				t.Errorf("menu shows %q after the change, want false", item.CurrentValue)
 			}
 		}
-		t.Fatal("setting absent from /settings")
 	}
 	if err := settingsHandler(sc); err != nil {
 		t.Fatal(err)
@@ -96,7 +96,7 @@ func TestMaskedLoginErrorDoesNotEnterFramesOrSession(t *testing.T) {
 	if strings.Contains(frame, secret) || !strings.Contains(frame, "••••••••abcd") {
 		t.Fatal("authentication error was not redacted")
 	}
-	data, err := json.Marshal(inner.Entries())
+	data, err := json.Marshal(inner.GetEntries())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,5 +186,32 @@ func TestLoginMaskSettingReachesStandardDialog(t *testing.T) {
 	}
 	if !strings.Contains(frame, key) || strings.Contains(frame, "Input hidden") {
 		t.Fatal("false did not restore Pi input rendering")
+	}
+}
+
+// Pi's settings-selector.ts lists 33 rows on a terminal without inline images; PiG omits "share-destination" (D64) and adds "mask-secret-input" (D80), so the counts coincide and the roster differs by exactly those two ids.
+func TestSettingsRosterDiffersFromPiOnlyByD64AndD80(t *testing.T) {
+	piRoster := []string{"autocompact", "auto-resize-images", "block-images", "skill-commands", "show-hardware-cursor", "editor-padding", "output-padding", "autocomplete-max-visible", "clear-on-shrink", "terminal-progress", "steering-mode", "follow-up-mode", "transport", "share-destination", "http-idle-timeout", "cache-warming-mode", "hide-thinking", "mermaid-rendering", "cache-miss-notices", "collapse-changelog", "quiet-startup", "install-telemetry", "default-project-trust", "double-escape-action", "tree-filter-mode", "warnings", "model-thinking", "tui-mode", "fullscreen-exit-output", "fullscreen-scrollbar", "fullscreen-copy-on-select", "fullscreen-wheel-scroll-lines", "theme"}
+	var got []string
+	for _, item := range NewSettingsSelectorComponent(SettingsConfig{}, SettingsCallbacks{}).GetSettingsList().Items() {
+		if item.ID != "show-images" && item.ID != "image-width-cells" { // the two rows only an image-capable terminal adds
+			got = append(got, item.ID)
+		}
+	}
+	var want []string
+	for _, id := range piRoster {
+		if id == "share-destination" {
+			continue // D64
+		}
+		want = append(want, id)
+		if id == "tree-filter-mode" {
+			want = append(want, "mask-secret-input") // D80
+		}
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("roster = %v\nwant     %v", got, want)
+	}
+	if len(piRoster) != 33 || len(got) != 33 {
+		t.Fatalf("counts: pi %d, pig %d, want 33 each", len(piRoster), len(got))
 	}
 }

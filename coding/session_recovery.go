@@ -58,21 +58,20 @@ func (s *Session) refreshReplacementContext() {
 }
 
 func (s *Session) refreshProjectedContext(preserveInstructionBaseline bool) {
-	projection := s.inner.BuildSessionProjection()
+	// The agent's transcript shares the messages of the kept projection, as the requests do: the history is held once, not once for the agent and once for the projection.
+	projection := s.inner.BuildSessionProjectionView()
 	ids := make(map[any]string, len(projection.Messages))
 	for _, entry := range projection.Entries {
 		for _, message := range entry.Messages {
 			if key := messageIdentity(message); key != nil {
-				ids[key] = entry.SourceEntry.Base.ID
+				ids[key] = entry.SourceEntry.Base().ID
 			}
 		}
 	}
 	s.entryIDsMu.Lock()
 	// Projection creates new message objects. Preserve the observed turn's IDs only until post-run recovery consumes it.
-	observed := append([]agent.AgentMessage{{Assistant: s.lastAssistantMessage}}, s.lastAssistantToolResults...)
-	for _, message := range observed {
-		key := messageIdentity(message)
-		if id, found := s.entryIDsByMessage[key]; key != nil && found {
+	if key := messageIdentity(agent.AgentMessage{Assistant: s.lastAssistantMessage}); key != nil {
+		if id, found := s.entryIDsByMessage[key]; found {
 			ids[key] = id
 		}
 	}
@@ -110,12 +109,13 @@ func (s *Session) findPersistedMessageEntryID(message agent.AgentMessage) (strin
 		return id, true
 	}
 	if message.ToolResult != nil {
-		projection := s.inner.BuildSessionProjection()
+		// The newest projected entries are the turn's own: the kept projection extends by each append, so the lookup reads them without projecting the history, and a match ends the walk.
+		projection := s.inner.BuildSessionProjectionView()
 		for _, entry := range slices.Backward(projection.Entries) {
 			for _, projected := range entry.Messages {
 				if projected.ToolResult != nil && projected.ToolResult.ToolCallID == message.ToolResult.ToolCallID {
-					s.rememberMessageEntry(message, entry.SourceEntry.Base.ID)
-					return entry.SourceEntry.Base.ID, true
+					s.rememberMessageEntry(message, entry.SourceEntry.Base().ID)
+					return entry.SourceEntry.Base().ID, true
 				}
 			}
 		}
@@ -126,7 +126,7 @@ func (s *Session) findPersistedMessageEntryID(message agent.AgentMessage) (strin
 	if messageIndex < 0 {
 		return "", false
 	}
-	projection := s.inner.BuildSessionProjection()
+	projection := s.inner.BuildSessionProjectionView()
 	// Restoring a transcript without a system entry prepends the current
 	// baseline. It has no persisted entry and shifts projected positions.
 	messages := s.agent.Messages()
@@ -143,8 +143,8 @@ func (s *Session) findPersistedMessageEntryID(message agent.AgentMessage) (strin
 				if projected.Role() != message.Role() {
 					return "", false
 				}
-				s.rememberMessageEntry(message, entry.SourceEntry.Base.ID)
-				return entry.SourceEntry.Base.ID, true
+				s.rememberMessageEntry(message, entry.SourceEntry.Base().ID)
+				return entry.SourceEntry.Base().ID, true
 			}
 			projectedIndex++
 		}
@@ -165,9 +165,49 @@ var errUnresolvedRecoveryTarget = errors.New("Cannot persist recovery omission b
 
 // omitRecoveryAttempt durably omits a failed final attempt and its tool
 // results from model context with context_edit entries, keeping them in raw
-// history (agent-session.ts _omitRecoveryAttempt).
-func (s *Session) omitRecoveryAttempt(message *agent.AssistantMessage, toolResults []agent.AgentMessage) error {
-	targets := append([]agent.AgentMessage{{Assistant: message}}, toolResults...)
+// history (agent-session.ts _omitRecoveryAttempt). The tool results are found
+// in the agent transcript itself, so the pair stays together whether the
+// attempt comes from the current run or a resumed session (Pi #11227): an
+// unpaired result fails the next request.
+func (s *Session) omitRecoveryAttempt(message *agent.AssistantMessage) error {
+	toolCallIDs := make(map[string]struct{})
+	for _, block := range message.Content {
+		if call, ok := block.(ai.ToolCall); ok {
+			toolCallIDs[call.ID] = struct{}{}
+		}
+	}
+	// A context edit replaces the projected copy, so match it by source entry as well.
+	entryID, entryFound := s.findPersistedMessageEntryID(agent.AgentMessage{Assistant: message})
+	messages := s.agent.Messages()
+	index := slices.IndexFunc(messages, func(m agent.AgentMessage) bool {
+		if m.Assistant == message {
+			return true
+		}
+		if !entryFound {
+			return false
+		}
+		key := messageIdentity(m)
+		if key == nil {
+			return false
+		}
+		s.entryIDsMu.Lock()
+		id, found := s.entryIDsByMessage[key]
+		s.entryIDsMu.Unlock()
+		return found && id == entryID
+	})
+	targets := []agent.AgentMessage{{Assistant: message}}
+	if index >= 0 {
+		for _, m := range messages[index+1:] {
+			if m.Assistant != nil {
+				break
+			}
+			if m.ToolResult != nil {
+				if _, paired := toolCallIDs[m.ToolResult.ToolCallID]; paired {
+					targets = append(targets, m)
+				}
+			}
+		}
+	}
 	targetIDs := make([]string, len(targets))
 	for i, target := range targets {
 		id, found := s.findPersistedMessageEntryID(target)
@@ -184,7 +224,7 @@ func (s *Session) omitRecoveryAttempt(message *agent.AssistantMessage, toolResul
 		if err != nil {
 			return err
 		}
-		if entry, ok := s.inner.EntryByID(editID); ok {
+		if entry, ok := s.inner.GetEntry(editID); ok {
 			s.emitOrderedEvent(agent.EntryAppendedEvent{Entry: entry.Raw()})
 		}
 	}
@@ -197,7 +237,7 @@ func (s *Session) runPostAgentRuns(ctx context.Context, messages []agent.AgentMe
 	return s.runPostAgentRunsWith(ctx, messages, runErr, func(ctx context.Context) ([]agent.AgentMessage, error) {
 		s.mu.Unlock()
 		defer s.mu.Lock()
-		return s.agent.Continue(ctx)
+		return s.agent.ContinueMessages(ctx)
 	})
 }
 
@@ -230,8 +270,8 @@ func (s *Session) runPostAgentRunsWith(ctx context.Context, messages []agent.Age
 // low-level run and reports whether the agent should continue
 // (agent-session.ts _handlePostAgentRun).
 func (s *Session) handlePostAgentRun(ctx context.Context) (bool, error) {
-	message, toolResults := s.lastAssistantMessage, s.lastAssistantToolResults
-	s.lastAssistantMessage, s.lastAssistantToolResults = nil, nil
+	message := s.lastAssistantMessage
+	s.lastAssistantMessage = nil
 	if s.agentRunAborted(ctx) {
 		s.finishCancelledRetry()
 		return false, nil
@@ -261,7 +301,7 @@ func (s *Session) handlePostAgentRun(ctx context.Context) (bool, error) {
 			s.emitEvent(agent.AutoRetryEndEvent{Success: false, Attempt: int(attempt), FinalError: message.ErrorMessage})
 		}
 	}
-	compacted, err := s.checkCompaction(ctx, message, true, toolResults)
+	compacted, err := s.checkCompaction(ctx, message, true)
 	if err != nil {
 		return false, err
 	}
@@ -280,7 +320,7 @@ func (s *Session) prepareRetry(ctx context.Context, message *agent.AssistantMess
 	schedule := s.retrySchedule
 	s.retryMu.Unlock()
 	wait, err := s.retryPrefix(schedule, func() (*sessionRetryWait, error) {
-		cfg := s.services.SettingsManager().GetRetrySettings()
+		cfg := s.SettingsManager().GetRetrySettings()
 		if !cfg.Enabled || s.agentRunAborted(ctx) {
 			return nil, nil
 		}
@@ -289,7 +329,7 @@ func (s *Session) prepareRetry(ctx context.Context, message *agent.AssistantMess
 			s.retryAttempt.Add(-1)
 			return nil, nil
 		}
-		delayMs := ai.RetryDelayMs(cfg.BaseDelayMs, &cfg.MaxDelayMs, attempt)
+		delayMs := ai.RetryDelayMs(ai.RetryPolicy{BaseDelayMs: cfg.BaseDelayMs, MaxAgentDelayMs: &cfg.MaxAgentDelayMs}, attempt)
 		errorMessage := message.ErrorMessage
 		if errorMessage == "" {
 			errorMessage = "Unknown error"
@@ -301,7 +341,7 @@ func (s *Session) prepareRetry(ctx context.Context, message *agent.AssistantMess
 		s.retryCancel = wait
 		s.retryMu.Unlock()
 		s.emitEvent(agent.AutoRetryStartEvent{Attempt: attempt, MaxAttempts: cfg.MaxRetries, DelayMs: delayMs, ErrorMessage: errorMessage})
-		if err := s.omitRecoveryAttempt(message, nil); err != nil {
+		if err := s.omitRecoveryAttempt(message); err != nil {
 			cancel()
 			s.retryMu.Lock()
 			if s.retryCancel == wait {
@@ -397,21 +437,14 @@ func (s *Session) contextWindow() int {
 }
 
 func (s *Session) currentBranch() []icodingagent.SessionEntry {
-	if leaf := s.inner.LeafID(); leaf != nil {
-		return s.inner.Branch(*leaf)
-	}
-	return nil
+	return s.inner.GetContextBranch()
 }
 
 // compactionSettings returns the compaction settings for the current model,
 // with its compaction.modelOverrides entry applied (upstream
 // getCompactionSettings(this.model)).
 func (s *Session) compactionSettings() (compaction.CompactionSettings, error) {
-	provider, modelID := "", ""
-	if model := s.Model(); model != nil {
-		provider, modelID = providerID(model), model.ID
-	}
-	cfg, err := s.services.SettingsManager().GetModelCompactionSettings(provider, modelID)
+	cfg, err := s.SettingsManager().GetCompactionSettings(s.Model())
 	if err != nil {
 		return compaction.CompactionSettings{}, err
 	}

@@ -17,21 +17,29 @@ import (
 	"testing"
 )
 
-func TestArchStr(t *testing.T) {
-	tests := []struct {
-		in   string
-		want string
-	}{
-		{"arm64", "aarch64"},
-		{"aarch64", "aarch64"},
-		{"amd64", "x86_64"},
-		{"x64", "x86_64"},
-		{"x86_64", "x86_64"},
-		{"riscv64", "riscv64"}, // unknown passes through
+func TestReleaseTarget(t *testing.T) {
+	tests := []struct{ plat, arch, want string }{
+		{"linux", "arm64", "aarch64-unknown-linux-musl.tar.gz"},
+		{"linux", "aarch64", "aarch64-unknown-linux-musl.tar.gz"},
+		{"linux", "x64", "x86_64-unknown-linux-musl.tar.gz"},
+		{"linux", "amd64", "x86_64-unknown-linux-musl.tar.gz"},
+		{"darwin", "arm64", "aarch64-apple-darwin.tar.gz"},
+		{"darwin", "x64", "x86_64-apple-darwin.tar.gz"},
+		{"win32", "x64", "x86_64-pc-windows-msvc.zip"},
+		{"windows", "arm64", "aarch64-pc-windows-msvc.zip"},
+		// tools-manager.ts getReleaseTarget maps only x64 and arm64: ARM32, ia32 and riscv64 never fall back to an
+		// x86-64 archive (Pi #11209).
+		{"linux", "arm", ""},
+		{"linux", "ia32", ""},
+		{"linux", "386", ""},
+		{"linux", "riscv64", ""},
+		{"win32", "ia32", ""},
+		{"freebsd", "x64", ""},
+		{"android", "arm64", ""},
 	}
 	for _, tt := range tests {
-		if got := archStr(tt.in); got != tt.want {
-			t.Errorf("archStr(%q) = %q, want %q", tt.in, got, tt.want)
+		if got := releaseTarget(tt.plat, tt.arch); got != tt.want {
+			t.Errorf("releaseTarget(%q, %q) = %q, want %q", tt.plat, tt.arch, got, tt.want)
 		}
 	}
 }
@@ -43,27 +51,24 @@ func TestToolsTable_AssetNames(t *testing.T) {
 		// fd
 		{"fd", "darwin", "arm64", "fd-v9.0.0-aarch64-apple-darwin.tar.gz"},
 		{"fd", "darwin", "x64", "fd-v9.0.0-x86_64-apple-darwin.tar.gz"},
-		{"fd", "linux", "arm64", "fd-v9.0.0-aarch64-unknown-linux-gnu.tar.gz"},
-		{"fd", "linux", "x64", "fd-v9.0.0-x86_64-unknown-linux-gnu.tar.gz"},
+		// Upstream selects the musl archive for every Linux architecture of both tools.
+		{"fd", "linux", "arm64", "fd-v9.0.0-aarch64-unknown-linux-musl.tar.gz"},
+		{"fd", "linux", "x64", "fd-v9.0.0-x86_64-unknown-linux-musl.tar.gz"},
 		{"fd", "win32", "x64", "fd-v9.0.0-x86_64-pc-windows-msvc.zip"},
 		{"fd", "win32", "arm64", "fd-v9.0.0-aarch64-pc-windows-msvc.zip"},
 		// rg
 		{"rg", "darwin", "arm64", "ripgrep-14.0.0-aarch64-apple-darwin.tar.gz"},
 		{"rg", "linux", "x64", "ripgrep-14.0.0-x86_64-unknown-linux-musl.tar.gz"},
-		{"rg", "linux", "arm64", "ripgrep-14.0.0-aarch64-unknown-linux-gnu.tar.gz"},
+		{"rg", "linux", "arm64", "ripgrep-14.0.0-aarch64-unknown-linux-musl.tar.gz"},
 		{"rg", "win32", "x64", "ripgrep-14.0.0-x86_64-pc-windows-msvc.zip"},
 	}
 	versions := map[string]string{"fd": "9.0.0", "rg": "14.0.0"}
 	for _, c := range cases {
 		cfg := toolsTable[c.tool]
-		got := cfg.GetAssetName(versions[c.tool], c.plat, c.arch)
+		got := cfg.GetAssetName(versions[c.tool], releaseTarget(c.plat, c.arch))
 		if got != c.want {
 			t.Errorf("%s/%s/%s: got %q, want %q", c.tool, c.plat, c.arch, got, c.want)
 		}
-	}
-	// Unsupported platform returns "".
-	if got := toolsTable["fd"].GetAssetName("9.0.0", "freebsd", "x64"); got != "" {
-		t.Errorf("fd/freebsd: got %q, want empty", got)
 	}
 }
 
@@ -84,6 +89,24 @@ func TestIsOfflineModeEnabled(t *testing.T) {
 			t.Errorf("%s=no should not enable offline mode", key)
 		}
 		t.Setenv(key, "")
+	}
+}
+
+// tools-manager.ts isOfflineModeEnabled compares PI_OFFLINE exactly: "1", or "true"/"yes" in any case after toLowerCase. Whitespace-padded values and
+// characters that only fold to ASCII under Unicode simple folding (U+017F) do not enable offline mode.
+func TestIsOfflineModeEnabledComparesExactly(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{"1", true}, {"true", true}, {"TRUE", true}, {"Yes", true}, {"yes", true},
+		{" 1", false}, {"1 ", false}, {"\ttrue", false}, {"yes\n", false}, {"\u00a0yes", false}, {"0", false}, {"2", false}, {"\u017fes", false}, {"yeS", true}, {"", false},
+	} {
+		t.Setenv("PIG_OFFLINE", "")
+		t.Setenv("PI_OFFLINE", tc.value)
+		if got := IsOfflineModeEnabled(); got != tc.want {
+			t.Errorf("PI_OFFLINE=%q: IsOfflineModeEnabled() = %v, want %v", tc.value, got, tc.want)
+		}
 	}
 }
 
@@ -352,7 +375,9 @@ func TestDownloadTool_DarwinX64FdPin(t *testing.T) {
 	// 10.3.0, not whatever GitHub reports as latest.
 	var requestedAsset string
 	mux := http.NewServeMux()
+	latestLookups := 0
 	mux.HandleFunc("/sharkdp/fd/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		latestLookups++
 		http.Redirect(w, r, "/sharkdp/fd/releases/tag/v999.0.0", http.StatusFound)
 	})
 	mux.HandleFunc("/sharkdp/fd/releases/download/", func(w http.ResponseWriter, r *http.Request) {
@@ -371,6 +396,10 @@ func TestDownloadTool_DarwinX64FdPin(t *testing.T) {
 	_, err := tm.downloadTool(context.Background(), "fd")
 	if err != nil {
 		t.Fatalf("downloadTool: %v", err)
+	}
+	// Upstream skips the version lookup for the pinned release (tools-manager.ts downloadTool).
+	if latestLookups != 0 {
+		t.Errorf("latest-release lookups = %d, want 0 (darwin/x64 fd is pinned)", latestLookups)
 	}
 	want := "fd-v10.3.0-x86_64-apple-darwin.tar.gz"
 	if requestedAsset != want {

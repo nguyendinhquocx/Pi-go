@@ -1,6 +1,7 @@
 package mcpext_test
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -153,7 +154,8 @@ func TestMCPConfigValidatesTheOAuthCallbackURLScopeAndClientName(t *testing.T) {
 		"metadata":{"url":"https://a.example/mcp","oauth":{"authServerMetadataUrl":"https://idp.example/m"}},
 		"plainMetadata":{"url":"https://a.example/mcp","oauth":{"authServerMetadataUrl":"http://idp.example/m"}},
 		"cimd":{"url":"https://a.example/mcp","oauth":{"clientRegistration":"cimd","callbackUrl":"http://localhost/callback"}},
-		"badRegistration":{"url":"https://a.example/mcp","oauth":{"clientRegistration":"auto"}},
+		"auto":{"url":"https://a.example/mcp","oauth":{"clientRegistration":"auto","clientName":"x"}},
+		"badRegistration":{"url":"https://a.example/mcp","oauth":{"clientRegistration":"oidc"}},
 		"cimdClient":{"url":"https://a.example/mcp","oauth":{"clientRegistration":"cimd","clientId":"x"}},
 		"cimdPath":{"url":"https://a.example/mcp","oauth":{"clientRegistration":"cimd","callbackUrl":"http://127.0.0.1/cb"}},
 		"cimdDots":{"url":"https://a.example/mcp","oauth":{"clientRegistration":"cimd","callbackUrl":"http://127.0.0.1/a/../callback"}},
@@ -165,14 +167,14 @@ func TestMCPConfigValidatesTheOAuthCallbackURLScopeAndClientName(t *testing.T) {
 		names = append(names, s.Name)
 	}
 	// cimdDots and cimdIPv6 are PiG additions: `new URL()` removes dot segments, and IPv6 loopback is rejected.
-	jsonEqual(t, names, `["ok","ipv6","same","named","metadata","cimd","cimdDots"]`)
+	jsonEqual(t, names, `["ok","ipv6","same","named","metadata","cimd","auto","cimdDots"]`)
 	wants := []string{
 		`server "remote": oauth.callbackUrl must be an http URI on localhost`,
 		`server "both": oauth.callbackUrl and oauth.callbackPort name different ports`,
 		`server "scope": oauth.scope must be a string`,
 		`server "unnamed": oauth.clientName must be a non-empty string`,
 		`server "plainMetadata": oauth.authServerMetadataUrl must be an https URL`,
-		`server "badRegistration": oauth.clientRegistration must be "dcr" or "cimd"`,
+		`server "badRegistration": oauth.clientRegistration must be "auto", "dcr", or "cimd"`,
 		`server "cimdClient": oauth.clientRegistration "cimd" cannot be combined`,
 		`server "cimdPath": oauth.clientRegistration "cimd" requires oauth.callbackUrl`,
 		`server "cimdIPv6": oauth.clientRegistration "cimd" requires oauth.callbackUrl`,
@@ -213,6 +215,41 @@ func TestMCPConfigResolvesPerToolExposureFromExactNamesThenPatternsInOrder(t *te
 	if got := extension.GetMcpToolExposure(only, "get_file_x"); got != extension.McpExposureCodemode {
 		t.Errorf("exposure of get_file_x = %s, want codemode", got)
 	}
+}
+
+// mcp-extension.test.ts "reads and edits mcp.json files that start with a UTF-8 BOM" (#11191).
+func TestMCPConfigReadsAndEditsMcpJSONFilesThatStartWithAUTF8BOM(t *testing.T) {
+	paths := setupConfig(t, `{}`, `{}`)
+	global := filepath.Join(paths.AgentDir, "mcp.json")
+	project := filepath.Join(paths.Cwd, ".pi", "mcp.json")
+	if err := os.WriteFile(global, []byte("\uFEFF{\"mcpServers\":{\"demo\":{\"command\":\"echo\",\"enabled\":false}}}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(project, []byte("\uFEFF{\"mcpServers\":{\"local\":{\"command\":\"local-cmd\"}}}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded := mcpext.LoadMcpConfig(withTrust(paths, true))
+	if len(loaded.Errors) != 0 {
+		t.Fatalf("errors = %q, want none", loaded.Errors)
+	}
+	var got [][2]string
+	for _, s := range loaded.Servers {
+		got = append(got, [2]string{s.Name, s.Scope})
+	}
+	if want := [][2]string{{"demo", "global"}, {"local", "project"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("servers = %v, want %v", got, want)
+	}
+
+	replaced, err := mcpext.AddMcpServerConfig(global, "other", extension.McpServerConfig{Command: "other-cmd"})
+	if err != nil || replaced {
+		t.Fatalf("AddMcpServerConfig = %v, %v; want false, nil", replaced, err)
+	}
+	data, err := os.ReadFile(global)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jsonEqual(t, json.RawMessage(data), `{"mcpServers":{"demo":{"command":"echo","enabled":false},"other":{"command":"other-cmd"}}}`)
 }
 
 // mcp-extension.test.ts "rejects server names that differ only in - and _" (#10239): they share a namespace.
@@ -263,6 +300,7 @@ func TestMCPConfigValidatesProviderAuthAndAcceptsItOnlyInTheGlobalMcpJSON(t *tes
 }
 
 // .upstream/v1.0.1/packages/coding-agent/test/mcp-extension.test.ts:89 (#10277)
+// Pi: packages/coding-agent/src/extensions/mcp/config.ts:71 (LoadedMcpConfig.projectConfig).
 func TestMCPConfigLetsProjectEntriesOverrideEnabledAndExposureOfGlobalServers(t *testing.T) {
 	paths := setupConfig(t,
 		`{"mcpServers":{"tools":{"command":"x","env":{"TOKEN":"secret"}}}}`,

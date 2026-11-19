@@ -43,6 +43,10 @@ func (p *scriptedProvider) Close() error { return nil }
 func (p *scriptedProvider) Stream(ctx context.Context, request ai.TranscriptContext, options ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
 	p.mu.Lock()
 	messages := request.Messages()
+	// A real provider repairs the tool flow the agent loop asks for (D48) before it converts the request.
+	if options.RepairToolFlow {
+		messages = ai.RepairToolFlow(messages)
+	}
 	raw, _ := json.Marshal(messages)
 	p.requests = append(p.requests, string(raw))
 	index := len(p.requests) - 1
@@ -56,6 +60,13 @@ func (p *scriptedProvider) Stream(ctx context.Context, request ai.TranscriptCont
 	}
 	if p.streamDeltas {
 		return streamScriptedMessageWithDeltas(ctx, request, options, message)
+	}
+	// Pi's faux provider (faux.ts streamWithDeltas) ends a request whose signal is already aborted with the response's fields, no content,
+	// stopReason "aborted" and "Request was aborted".
+	if ctx.Err() != nil {
+		aborted := *message
+		aborted.Content, aborted.StopReason, aborted.ErrorMessage, aborted.Timestamp = nil, ai.StopReasonAborted, "Request was aborted", time.Now().UnixMilli()
+		return newSessionTestStream(ai.ErrorEvent{Reason: ai.StopReasonAborted, Error: &aborted}), nil
 	}
 	if p.estimateUsage != nil {
 		p.estimateUsage(request, options, message)
@@ -104,6 +115,7 @@ type harnessOptions struct {
 	settings            string
 	contextWindow       int
 	maxTokens           int
+	inputLimits         *ai.ModelInputLimits
 	tools               []agent.AgentTool
 	extension           extension.Extension
 	// extensions are loaded after extension, in order.
@@ -113,6 +125,12 @@ type harnessOptions struct {
 	runtime *extension.ExtensionRuntime
 	// sessionManager is the in-memory session an emptySessionManager harness opens instead of a new one (the suite harness's options.sessionManager), so a second harness resumes the first one's transcript.
 	sessionManager *icodingagent.Session
+	// allowedTools and excludedTools are the Session's `--tools` and `--exclude-tools` entries (names or patterns).
+	allowedTools, excludedTools map[string]struct{}
+	// compatStream streams through the model's provider, as the suite harness's Agent does with pi-ai/compat's streamSimple
+	// (test/suite/harness.ts createHarness streamFn), not through the model runtime: the faux provider reports a run aborted before its
+	// request as aborted, where the runtime's request setup rejects it with the signal's reason (lazy.ts lazyStream).
+	compatStream bool
 }
 
 type recoveryHarness struct {
@@ -125,7 +143,8 @@ type recoveryHarness struct {
 
 func newRecoveryHarness(t *testing.T, opts harnessOptions, responses ...scriptedResponse) *recoveryHarness {
 	t.Helper()
-	home := t.TempDir()
+	// Home and cwd are short temp directories, as upstream test/suite/harness.ts createTempDir makes (tmpdir()/pi-suite-<time>-<random>). The system prompt names the cwd and the docs bundle under PIG_HOME, and the faux provider counts their tokens, so t.TempDir's test-name paths pushed the tight compaction suites over their context window when TMPDIR was long.
+	home := suiteTempDir(t, "pig-home-")
 	t.Setenv("PIG_HOME", home)
 	agentDir := filepath.Join(home, "agent")
 	if err := os.MkdirAll(agentDir, 0o755); err != nil {
@@ -138,14 +157,12 @@ func newRecoveryHarness(t *testing.T, opts harnessOptions, responses ...scripted
 	if err := os.WriteFile(filepath.Join(agentDir, "settings.json"), []byte(settings), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	services, err := NewServices(ServicesOptions{CWD: t.TempDir(), AgentDir: agentDir})
+	services, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: suiteTempDir(t, "pi-suite-"), AgentDir: agentDir})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if opts.withConfiguredAuth == nil || *opts.withConfiguredAuth {
-		if err := services.Auth().Set("faux", ai.Credential{Type: ai.CredentialAPIKey, Key: "faux-key"}); err != nil {
-			t.Fatal(err)
-		}
+		configureFauxAuth(t, services)
 	}
 	// Services owns the model background work that reads and writes the agent dir; Cleanup runs it after the Session closes.
 	t.Cleanup(services.Close)
@@ -154,7 +171,7 @@ func newRecoveryHarness(t *testing.T, opts harnessOptions, responses ...scripted
 	if contextWindow == 0 {
 		contextWindow = 128_000
 	}
-	model := &ai.Model{ID: "faux-1", DisplayName: "faux-1", Provider: provider, Capabilities: ai.ModelCapabilities{ContextWindow: contextWindow, MaxOutputTokens: opts.maxTokens}}
+	model := &ai.Model{ID: "faux-1", DisplayName: "faux-1", Provider: provider, Capabilities: ai.ModelCapabilities{ContextWindow: contextWindow, MaxOutputTokens: opts.maxTokens}, InputLimits: opts.inputLimits}
 	var runner *inproc.Runner
 	if opts.extension.Handlers != nil || len(opts.extensions) > 0 {
 		loaded := opts.extensions
@@ -163,7 +180,7 @@ func newRecoveryHarness(t *testing.T, opts harnessOptions, responses ...scripted
 		}
 		runner = inproc.NewRunner(loaded, t.TempDir(), opts.runtime)
 	}
-	options := SessionOptions{Model: model, SkipBuiltinTools: !opts.defaultTools, Tools: opts.tools, Runner: runner, SystemPromptResources: opts.resources}
+	options := SessionOptions{Model: model, SkipBuiltinTools: !opts.defaultTools, Tools: opts.tools, Runner: runner, SystemPromptResources: opts.resources, AllowedTools: opts.allowedTools, ExcludedTools: opts.excludedTools}
 	if opts.emptySessionManager {
 		options.existing = opts.sessionManager
 		if options.existing == nil {
@@ -174,14 +191,20 @@ func newRecoveryHarness(t *testing.T, opts harnessOptions, responses ...scripted
 	if err != nil {
 		t.Fatal(err)
 	}
+	if opts.compatStream {
+		session.Agent().SetStreamFunction(func(ctx context.Context, model *ai.Model, transcript ai.TranscriptContext, options ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
+			return model.Provider.Stream(ctx, transcript, options)
+		})
+	}
 	if opts.emptySessionManager {
 		// A supplied in-memory manager is not a clone; bind its fresh reference runner explicitly.
 		session.bindExtensionCommandActions(runner)
 	}
 	h := &recoveryHarness{session: session, provider: provider, done: make(chan struct{})}
+	eventsCh := session.Events()
 	go func() {
 		defer close(h.done)
-		for event := range session.Events() {
+		for event := range eventsCh {
 			if AcknowledgeEvent(event) {
 				continue
 			}
@@ -195,6 +218,16 @@ func newRecoveryHarness(t *testing.T, opts harnessOptions, responses ...scripted
 		<-h.done
 	})
 	return h
+}
+
+func suiteTempDir(t *testing.T, prefix string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }
 
 // settle waits until the Session's ordered agent_settled event is published.
@@ -219,8 +252,8 @@ func (h *recoveryHarness) settle(t *testing.T) []agent.AgentEvent {
 
 func (h *recoveryHarness) entries(entryType string) []icodingagent.SessionEntry {
 	var out []icodingagent.SessionEntry
-	for _, entry := range h.session.Inner().Entries() {
-		if entry.Base.Type == entryType {
+	for _, entry := range h.session.Inner().GetEntries() {
+		if entry.Base().Type == entryType {
 			out = append(out, entry)
 		}
 	}
@@ -246,9 +279,9 @@ func messageEntryIDs(t *testing.T, h *recoveryHarness, match func(*agent.Assista
 	t.Helper()
 	var ids []string
 	for _, entry := range h.entries("message") {
-		message, ok := entry.AsMessage()
+		message, ok := entry.(icodingagent.MessageEntry)
 		if ok && message.Message.Assistant != nil && match(message.Message.Assistant) {
-			ids = append(ids, entry.Base.ID)
+			ids = append(ids, entry.Base().ID)
 		}
 	}
 	return ids
@@ -274,8 +307,8 @@ func summaryFromPreparation(summary string) extension.Extension {
 			if err := json.Unmarshal(raw, &prep); err != nil {
 				return nil, err
 			}
-			return extension.SessionBeforeCompactResult{Compaction: map[string]any{
-				"summary": summary, "firstKeptEntryId": prep.FirstKeptEntryID, "tokensBefore": prep.TokensBefore,
+			return extension.SessionBeforeCompactResult{Compaction: &extension.CompactionResult{
+				Summary: summary, FirstKeptEntryID: prep.FirstKeptEntryID, TokensBefore: prep.TokensBefore,
 			}}, nil
 		}},
 	}}
@@ -302,7 +335,7 @@ func TestBoundaryDoesNotTriggerThresholdCompactionFromPostEditUsageCapturedBefor
 	h.session.RefreshContext()
 	errorMessage := &agent.AssistantMessage{Role: agent.RoleAssistant, Provider: "faux", ModelID: "faux-1", StopReason: ai.StopReasonError, ErrorMessage: "invalid_api_key", Timestamp: time.Now().UnixMilli() + 1_000}
 
-	if continueRun, err := h.session.checkCompaction(context.Background(), errorMessage, true, nil); err != nil || continueRun {
+	if continueRun, err := h.session.checkCompaction(context.Background(), errorMessage, true); err != nil || continueRun {
 		t.Fatalf("checkCompaction = %v, %v", continueRun, err)
 	}
 	if n := len(h.entries("compaction")); n != 1 {
@@ -547,5 +580,48 @@ func TestQueuedUserMessageResetsRecoveryBudget(t *testing.T) {
 	}
 	if h.session.overflowRecoveryAttempted.Load() {
 		t.Fatal("new user message retained the previous recovery budget")
+	}
+}
+
+// Port of packages/coding-agent/test/suite/regressions/11227-recovery-omits-tool-results.test.ts
+// (https://github.com/earendil-works/pi/issues/11227): pre-prompt recovery of a resumed length
+// stop omits the truncated call together with the result that answered it.
+func TestPrePromptRecoveryOfAResumedLengthStopOmitsTheTruncatedCallAndItsResult(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{
+		settings:      `{"compaction":{"enabled":true}}`,
+		contextWindow: 100_000, maxTokens: 1_000,
+		extension: summaryFromPreparation("summary"),
+	}, fauxReply("done", ai.StopReasonStop, 0))
+	inner := h.session.Inner()
+	now := time.Now().UnixMilli()
+	if _, err := inner.AppendMessage(agent.AgentMessage{User: &agent.UserMessage{Role: agent.RoleUser, Content: ai.UserContentBlocks{ai.TextContent{Text: "check status"}}, Timestamp: now - 1000}}); err != nil {
+		t.Fatal(err)
+	}
+	truncated := &agent.AssistantMessage{Role: agent.RoleAssistant,
+		Content:  []ai.AssistantContentBlock{ai.ToolCall{ID: "call_truncated", Name: "bash", Arguments: ai.JsonObject{"command": "echo"}}},
+		Provider: "faux", ModelID: "faux-1", StopReason: ai.StopReasonLength, Timestamp: now - 500,
+		Usage: &ai.Usage{Input: 100, Output: 16, TotalTokens: 116}}
+	if _, err := inner.AppendMessage(agent.AgentMessage{Assistant: truncated}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inner.AppendMessage(agent.AgentMessage{ToolResult: &agent.ToolResultMessage{Role: "toolResult", ToolCallID: "call_truncated", ToolName: "bash", IsError: true,
+		Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "Not executed: output token limit reached."}}, Timestamp: now - 400}}); err != nil {
+		t.Fatal(err)
+	}
+	h.session.RefreshContext()
+
+	if _, err := h.session.Send(context.Background(), "continue"); err != nil {
+		t.Fatal(err)
+	}
+	h.settle(t)
+
+	h.provider.mu.Lock()
+	requests := append([]string(nil), h.provider.requests...)
+	h.provider.mu.Unlock()
+	if len(requests) != 1 {
+		t.Fatalf("model calls = %d, want 1", len(requests))
+	}
+	if strings.Contains(requests[0], `"role":"toolResult"`) || strings.Contains(requests[0], `"stopReason":"length"`) {
+		t.Fatalf("request still carries the truncated call or its result: %s", requests[0])
 	}
 }

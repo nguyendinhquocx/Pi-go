@@ -118,6 +118,14 @@ func TestModelsRuntimeBasicUpstream(t *testing.T) {
 			t.Fatalf("long=%+v", long)
 		}
 	})
+	// .upstream/v1.4.0+74f46864/packages/ai/test/models-runtime.test.ts:162
+	t.Run("marks catalog-derived totals as not provider-reported", func(t *testing.T) {
+		usage := Usage{Input: 1000000, TotalTokens: 1000000, Cost: UsageCost{Total: 9, TotalFromProvider: new(true)}}
+		CalculateCost(modelsRuntimeModel("openai", "gpt-5.6-sol"), &usage)
+		if usage.Cost.TotalFromProvider == nil || *usage.Cost.TotalFromProvider {
+			t.Fatalf("totalFromProvider = %v, want false", usage.Cost.TotalFromProvider)
+		}
+	})
 	// .upstream/v0.87.1/packages/ai/test/models-runtime.test.ts:162
 	t.Run("registers, replaces, and deletes providers", func(t *testing.T) {
 		models := CreateModels()
@@ -246,6 +254,15 @@ func TestModelsRuntimeBasicUpstream(t *testing.T) {
 	t.Run("produces an error stream for unknown providers instead of throwing", func(t *testing.T) {
 		result := CreateModels().CompleteSimple(t.Context(), modelsRuntimeModel("ghost", "model-a"), modelsRuntimeContext())
 		if result.StopReason != StopReasonError || !strings.Contains(result.ErrorMessage, "Unknown provider: ghost") {
+			t.Fatalf("result=%+v", result)
+		}
+	})
+	// models.ts:873 (no models-runtime.test.ts case): a provider whose auth resolves to nothing settles the request as an auth ModelsError.
+	t.Run("produces an error stream for a provider that is not configured", func(t *testing.T) {
+		models := CreateModels()
+		models.SetProvider(modelsRuntimeProvider(modelsRuntimeProviderInput{id: "p1", auth: &ProviderAuth{APIKey: modelsRuntimeEnvKey("")}}))
+		result := models.CompleteSimple(t.Context(), modelsRuntimeModel("p1", "model-a"), modelsRuntimeContext())
+		if result.StopReason != StopReasonError || result.ErrorMessage != "Provider is not configured: p1" {
 			t.Fatalf("result=%+v", result)
 		}
 	})

@@ -16,8 +16,6 @@ func DefineExtension(extension durable.Extension) *durable.Extension {
 }
 
 // DefineTool types a tool; the Harness validates arguments against Parameters before Execute.
-//
-//go:fix inline
 func DefineTool(tool durable.ToolRegistration) *durable.ToolRegistration {
 	return new(tool)
 }
@@ -44,10 +42,17 @@ func Hook[I, S, R, H any](task durable.Task[I, S, R, H], handlers H) durable.Hoo
 
 // WrapTool wraps the tool named like tool wherever the wrapping extension is selected.
 func WrapTool(tool *durable.ToolRegistration, wrapper func(tool *durable.ToolRegistration) *durable.ToolRegistration) durable.Wrap {
-	return durable.Wrap{Tool: tool.Name, WrapTool: wrapper}
+	return durable.ToolWrap{Tool: tool.Name, Wrap: wrapper}
 }
 
 // WrapSection wraps the section key wherever the wrapping extension is selected.
 func WrapSection(key string, wrapper func(section *durable.PromptSection) *durable.PromptSection) durable.Wrap {
-	return durable.Wrap{Section: key, WrapSection: wrapper}
+	return durable.SectionWrap{Section: key, Wrap: wrapper}
+}
+
+// RunEndTaskOf is a task an afterRun hook asks for, its input typed by the task (spec §8.3). The input is checked and
+// copied as JSON when the generation prepares the request, so a broken one is rejected there, against the hook's
+// extension.
+func RunEndTaskOf[I, S, R, H any](task durable.Task[I, S, R, H], input I) RunEndTask {
+	return RunEndTask{Task: task.Erased(), Input: input}
 }

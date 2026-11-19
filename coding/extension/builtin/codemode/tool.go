@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/MichaelKinsy/PiG/agent"
 	sandbox "github.com/MichaelKinsy/PiG/codemode"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
@@ -21,6 +20,14 @@ type Options struct {
 	// GetSettings returns the effective settings, read on every use: `codemode.mode` and `codemode.inlineBudget`.
 	// Nil means the defaults (mode `on`, the default budget).
 	GetSettings func() extension.Settings
+	// Mode overrides the `codemode.mode` setting: [ModeOn] or [ModeOnly]. Empty reads the setting.
+	//
+	// Ports packages/coding-agent/src/extensions/codemode/index.ts (CodemodeExtensionOptions.mode).
+	Mode string
+	// InlineBudget overrides the `codemode.inlineBudget` setting. Nil reads the setting.
+	//
+	// Ports packages/coding-agent/src/extensions/codemode/index.ts (CodemodeExtensionOptions.inlineBudget).
+	InlineBudget *int
 	// CacheDir holds wazero's on-disk compilation cache for the sandbox module; empty compiles in memory.
 	CacheDir string
 	// Models declares and serves the `models` namespace of the tool [Definition] (createCodemodeToolDefinition's
@@ -38,6 +45,9 @@ const (
 )
 
 func (o Options) mode() string {
+	if o.Mode == ModeOn || o.Mode == ModeOnly {
+		return o.Mode
+	}
 	if o.GetSettings != nil {
 		if codemode, ok := o.GetSettings()["codemode"].(map[string]any); ok && codemode["mode"] == ModeOnly {
 			return ModeOnly
@@ -47,10 +57,14 @@ func (o Options) mode() string {
 }
 
 func (o Options) inlineBudget() *int {
+	if o.InlineBudget != nil {
+		return o.InlineBudget
+	}
 	if o.GetSettings != nil {
 		if codemode, ok := o.GetSettings()["codemode"].(map[string]any); ok {
 			if budget, ok := codemode["inlineBudget"].(float64); ok && !math.IsInf(budget, 0) && !math.IsNaN(budget) && budget >= 0 {
-				value := int(budget)
+				// A budget beyond the int range still holds every tool section.
+				value := int(min(budget, math.MaxInt32))
 				return &value
 			}
 		}
@@ -63,63 +77,154 @@ const promptSnippet = "Run JavaScript that calls other tools"
 
 var promptGuidelines = []string{"Use codemode to batch independent tool calls (Promise.allSettled), chain them, or filter large output, instead of many separate calls."}
 
-// inputSchema is upstream's codemodeSchema.
-var inputSchema = json.RawMessage(`{"type":"object","properties":{"code":{"description":"Raw JavaScript source.","type":"string"}},"required":["code"]}`)
+// inputSchema is upstream's codemodeSchema in TypeBox's key order (type, required, properties; type before description): the order reaches the model's tool declaration and the validation messages.
+var inputSchema = json.RawMessage(`{"type":"object","required":["code"],"properties":{"code":{"type":"string","description":"Raw JavaScript source."}}}`)
 
-// describeOutput is what a script call resolves to, in one line: `a string`, the field names of an object
-// (`{ output, exit_code, full_output_path? }`), or the rendered type for anything else.
+// describeFields is the field names of an object schema, `{ output, exit_code, full_output_path? }`, with the fields of
+// object-typed fields depth levels deep: `{ content, structuredContent?: { results } }`. It reports false for other
+// schemas.
 //
-// Ports packages/coding-agent/src/extensions/codemode/tool.ts (describeOutput).
-func describeOutput(schema json.RawMessage) string {
-	rendered := sandbox.RenderToolOutputType(schema)
-	if rendered == "string" {
-		return "a string"
+// Ports packages/coding-agent/src/extensions/codemode/tool.ts (describeFields).
+func describeFields(schema json.RawMessage, depth int) (string, bool) {
+	object := objectOf(schema)
+	if object == nil {
+		return "", false
 	}
-	if object := objectOf(schema); object != nil && sandbox.McpStructuredContentSchema(schema) == nil {
-		// upstream: `typeof properties === "object"` also holds for an array, whose keys are its indexes.
-		if typ, _ := object.Get("type"); string(typ) == `"object"` && (isRecord(field(schema, "properties")) || jsonKind(field(schema, "properties")) == '[') {
-			required := map[string]bool{}
-			var names []json.RawMessage
-			if json.Unmarshal(field(schema, "required"), &names) == nil {
-				for _, name := range names {
-					if value, ok := stringArg(name); ok {
-						required[value] = true
-					}
-				}
+	// upstream: `typeof properties === "object"` also holds for an array, whose keys are its indexes.
+	if typ, _ := object.Get("type"); string(typ) != `"object"` {
+		return "", false
+	}
+	properties := field(schema, "properties")
+	var keys []string
+	var values []json.RawMessage
+	switch {
+	case isRecord(properties):
+		props := objectOf(properties)
+		keys = props.Keys()
+		for _, key := range keys {
+			value, _ := props.Get(key)
+			values = append(values, value)
+		}
+	case jsonKind(properties) == '[':
+		_ = json.Unmarshal(properties, &values)
+		for i := range values {
+			keys = append(keys, strconv.Itoa(i))
+		}
+	default:
+		return "", false
+	}
+	required := map[string]bool{}
+	var names []json.RawMessage
+	if json.Unmarshal(field(schema, "required"), &names) == nil {
+		for _, name := range names {
+			if value, ok := stringArg(name); ok {
+				required[value] = true
 			}
-			var keys []string
-			if properties := objectOf(field(schema, "properties")); properties != nil {
-				keys = properties.Keys()
-			} else {
-				var items []json.RawMessage
-				_ = json.Unmarshal(field(schema, "properties"), &items)
-				for i := range items {
-					keys = append(keys, strconv.Itoa(i))
-				}
-			}
-			fields := make([]string, 0, len(keys))
-			for _, name := range keys {
-				if required[name] {
-					fields = append(fields, name)
-				} else {
-					fields = append(fields, name+"?")
-				}
-			}
-			return "`{ " + strings.Join(fields, ", ") + " }`"
 		}
 	}
-	return "`" + jsWhitespace.ReplaceAllString(rendered, " ") + "`"
+	fields := make([]string, len(keys))
+	for i, name := range keys {
+		optional := "?"
+		if required[name] {
+			optional = ""
+		}
+		field := name + optional
+		if constValue, ok := constOf(values[i]); ok {
+			field = strings.Join([]string{field, constValue}, ": ")
+		} else if depth > 0 {
+			if nested, ok := describeFields(values[i], depth-1); ok {
+				field = strings.Join([]string{field, nested}, ": ")
+			}
+		}
+		fields[i] = field
+	}
+	return "{ " + strings.Join(fields, ", ") + " }", true
 }
 
-// jsWhitespace is JavaScript's `\s+`.
-var jsWhitespace = lazyregexp.New(`[\t\n\v\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]+`)
+// constOf is the JSON text of a field schema's `const`, which describeFields shows in place of the field's fields:
+// `{ action: "start", id }`. It reports false for a schema without `const`.
+func constOf(schema json.RawMessage) (string, bool) {
+	object := objectOf(schema)
+	if object == nil {
+		return "", false
+	}
+	value, ok := object.Get("const")
+	if !ok {
+		return "", false
+	}
+	// objectOf canonicalizes its input, so the member is already JSON.stringify of the parsed value.
+	return string(value), true
+}
+
+// describeOutput is what a script call resolves to, in one line: `a string`, the field names of an object (see
+// describeFields), the field names of each object in a union (see describeUnionFields), the rendered type when it fits on one
+// line, or a pointer to describeTool() for anything longer. The full type of a large schema would otherwise be sent with every
+// request (#11501).
+//
+// Ports packages/coding-agent/src/extensions/codemode/tool.ts (describeOutput).
+func describeOutput(name string, schema json.RawMessage) (string, error) {
+	rendered, err := sandbox.RenderToolOutputType(schema)
+	if err != nil {
+		return "", err
+	}
+	if rendered == "string" {
+		return "a string", nil
+	}
+	fields, ok := describeFields(schema, 1)
+	if !ok {
+		fields, ok = describeUnionFields(schema)
+	}
+	if ok {
+		return "`" + fields + "`", nil
+	}
+	if !strings.Contains(rendered, "\n") {
+		return "`" + rendered + "`", nil
+	}
+	quoted, err := jsstring.MarshalJSON(name)
+	if err != nil {
+		return "", err
+	}
+	return "a value; `await describeTool(" + string(quoted) + ")` shows its type", nil
+}
+
+// describeUnionFields is the field names of each variant of an `anyOf`/`oneOf` whose variants are all objects, joined by ` | `.
+// It reports false for other schemas.
+//
+// Ports packages/coding-agent/src/extensions/codemode/tool.ts (describeUnionFields).
+func describeUnionFields(schema json.RawMessage) (string, bool) {
+	object := objectOf(schema)
+	if object == nil {
+		return "", false
+	}
+	variants, ok := object.Get("anyOf")
+	if !ok || variants == nil {
+		variants, ok = object.Get("oneOf")
+	}
+	var values []json.RawMessage
+	if !ok || jsonKind(variants) != '[' || json.Unmarshal(variants, &values) != nil || len(values) == 0 {
+		return "", false
+	}
+	described := make([]string, len(values))
+	for i, variant := range values {
+		fields, ok := describeFields(variant, 0)
+		if !ok {
+			return "", false
+		}
+		described[i] = fields
+	}
+	return strings.Join(described, " | "), true
+}
 
 // describeScriptCall is a declared tool's description followed by how scripts call it and what the call resolves to.
 // The arguments are the tool's declared parameters, so they are not repeated.
 //
 // Ports packages/coding-agent/src/extensions/codemode/tool.ts (describeScriptCall).
-func describeScriptCall(tool extension.AgentTool) string {
-	return jsstring.Trim(tool.Description) + "\n\nCodemode: `tools." + sandbox.ToCodemodeIdentifier(tool.Name) + "(args)` resolves to " + describeOutput(toDeclaration(tool).OutputSchema) + "."
+func describeScriptCall(tool extension.AgentTool) (string, error) {
+	output, err := describeOutput(tool.Name, toDeclaration(tool, nil).OutputSchema)
+	if err != nil {
+		return "", err
+	}
+	return jsstring.Trim(tool.Description) + "\n\nCodemode: `tools." + sandbox.ToCodemodeIdentifier(tool.Name) + "(args)` resolves to " + output + ".", nil
 }
 
 // prepareLoadout is how the tool presents tools that are both declared and callable from scripts:
@@ -127,6 +232,8 @@ func describeScriptCall(tool extension.AgentTool) string {
 //     without `direct` exposure.
 //   - `only`: the codemode description lists every callable tool, and requests leave out the declarations of active
 //     `direct` tools.
+//
+// Listed tools carry their prompt guidelines, which the system prompt only has for declared tools.
 //
 // Listing by exposure, not by the active set, keeps the codemode description unchanged when `tool_search` loads a
 // tool, so loads do not redeclare codemode.
@@ -144,7 +251,12 @@ func prepareLoadout(loadout extension.ToolLoadout, options Options) *extension.T
 	if mode == ModeOn {
 		for _, tool := range loadout.Declared {
 			if callableNames[tool.Name] {
-				descriptions[tool.Name] = describeScriptCall(tool)
+				description, err := describeScriptCall(tool)
+				if err != nil {
+					// upstream: prepareLoadout throws; the session reports it as a prepare_loadout extension error (extension.ToolPrepareLoadoutFunc).
+					panic(err)
+				}
+				descriptions[tool.Name] = description
 			}
 		}
 	}
@@ -162,12 +274,21 @@ func prepareLoadout(loadout extension.ToolLoadout, options Options) *extension.T
 			deferred[tool.Name] = true
 		}
 	}
+	// Listed tools carry their prompt guidelines, which the system prompt only has for declared tools.
+	guidelines := map[string][]string{}
+	for _, tool := range listed {
+		guidelines[tool.Name] = loadout.GetPromptGuidelines(tool.Name)
+	}
 	budget := options.inlineBudget()
 	if budget == nil {
 		defaultBudget := DefaultInlineBudget
 		budget = &defaultBudget
 	}
-	descriptions[ToolName] = CreateDescription(listed, DescriptionOptions{Models: options.Models, Namespaces: namespaces, Deferred: deferred, InlineBudget: budget})
+	description, err := CreateDescription(listed, DescriptionOptions{Models: options.Models, Namespaces: namespaces, Guidelines: guidelines, Deferred: deferred, InlineBudget: budget})
+	if err != nil {
+		panic(err) // upstream: see above, a thrown prepareLoadout.
+	}
+	descriptions[ToolName] = description
 	hidden := []string{}
 	if mode == ModeOnly {
 		declared := map[string]bool{}
@@ -187,10 +308,12 @@ func prepareLoadout(loadout extension.ToolLoadout, options Options) *extension.T
 //
 // Ports packages/coding-agent/src/extensions/codemode/tool.ts (createCodemodeToolDefinition).
 func Definition(options Options) extension.ToolDefinition {
+	// No tools are listed, so no schema reference is decoded and rendering cannot fail.
+	description, _ := CreateDescription(nil, DescriptionOptions{Models: options.Models})
 	return extension.ToolDefinition{
 		Name:             ToolName,
 		Label:            ToolName,
-		Description:      CreateDescription(nil, DescriptionOptions{Models: options.Models}),
+		Description:      description,
 		PromptSnippet:    promptSnippet,
 		PromptGuidelines: promptGuidelines,
 		Parameters:       inputSchema,
@@ -199,12 +322,12 @@ func Definition(options Options) extension.ToolDefinition {
 		PrepareLoadout: func(loadout extension.ToolLoadout) *extension.ToolLoadoutChanges {
 			return prepareLoadout(loadout, options)
 		},
+		ReachesTools: scriptReach,
 		// Capable models write the script as raw text instead of a JSON-escaped string.
 		ConstrainedSampling: constrainedSampling(),
 		// The sandbox loads on the first call, not at startup.
 		Execute: func(ctx context.Context, toolCallID string, params json.RawMessage, onUpdate extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
-			update, _ := onUpdate.(agent.ToolUpdateCallback)
-			return Execute(ctx, toolCallID, params, update, options)
+			return Execute(ctx, toolCallID, params, onUpdate, options)
 		},
 		// upstream: tool.ts createCodemodeToolDefinition spreads codemodeRenderers into the definition.
 		RenderCall:   codingagent.CodemodeRenderers.RenderCall,
@@ -212,22 +335,51 @@ func Definition(options Options) extension.ToolDefinition {
 	}
 }
 
+// discoveryGlobalNames names the script globals that list or look up tools and namespaces, which the script may then call
+// by any name.
+var discoveryGlobalNames = lazyregexp.New(`\b(searchTools|describeNamespace|describeTool|ALL_TOOLS)\b`)
+
+// scriptWords are the words of a script's source (JavaScript's `\w+`).
+var scriptWords = lazyregexp.New(`\w+`)
+
+// scriptReach is the tools a script may call (ToolDefinition.ReachesTools): every tool when it uses a discovery global,
+// else the words of its source, so `tools.mcp__docs__search` and `tools["mcp__docs__" + name]` both name the
+// `mcp__docs` namespace.
+//
+// Ports packages/coding-agent/src/extensions/codemode/tool.ts (getScriptReach).
+func scriptReach(input json.RawMessage) extension.ToolReach {
+	var args struct {
+		Code json.RawMessage `json:"code"`
+	}
+	var code string
+	if json.Unmarshal(input, &args) != nil || json.Unmarshal(args.Code, &code) != nil {
+		return extension.ToolReach{}
+	}
+	if discoveryGlobalNames.MatchString(code) {
+		return extension.ToolReach{All: true}
+	}
+	return extension.ToolReach{Words: scriptWords.FindAllString(code, -1)}
+}
+
 func constrainedSampling() json.RawMessage {
 	data, _ := json.Marshal(map[string]any{"type": "grammar", "variants": map[string]string{"openai_lark": sandbox.CodemodeSourceGrammar}})
 	return data
 }
 
-// Extension is the `builtin:codemode` extension: the tool registered inactive. Activate it with `--tools`, the
-// `defaultTools` setting or `setActiveTools()`.
+// CreateCodemodeExtension is the factory of the `builtin:codemode` extension: it registers the tool inactive. Activate it with `--tools`,
+// the `defaultTools` setting or `setActiveTools()`. The tool reads `codemode.mode` and `codemode.inlineBudget` through the API's
+// GetSettings on every use, unless the options override them (upstream's readMode and readInlineBudget).
 //
 // Ports packages/coding-agent/src/extensions/codemode/index.ts (createCodemodeExtension).
-func Extension(options Options) (extension.Extension, error) {
-	options.Models = !options.DisableModels
-	definition := Definition(options)
-	inactive := false
-	definition.DefaultActive = &inactive
-	return extension.Extension{
-		Tools:     map[string]extension.RegisteredTool{ToolName: {Definition: definition}},
-		ToolOrder: []string{ToolName},
-	}, nil
+func CreateCodemodeExtension(options Options) extension.ExtensionFactory {
+	return func(pi extension.API) error {
+		o := options
+		o.Models = !o.DisableModels
+		o.GetSettings = pi.GetSettings
+		definition := Definition(o)
+		inactive := false
+		definition.DefaultActive = &inactive
+		pi.RegisterTool(definition)
+		return nil
+	}
 }

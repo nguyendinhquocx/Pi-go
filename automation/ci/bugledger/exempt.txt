@@ -1,0 +1,29 @@
+# Fix-titled commits since 0.4.1 that change files outside tests and documents but are not bugs in a release.
+# "<commit> <category>: <reason>" counts the commit under its category on the public bug ledger page.
+# "<commit> see <commit>" joins the commit to the ledger entry that lists the second commit, for a follow-up of the same bug.
+# A new fix-titled commit prefers a "Bug-Ledger: exempt <category>: <reason>" or "Bug-Ledger: see <commit>" trailer in its own message; this file covers commits that were made before the ledger existed.
+0f0f46269b Repair of a merge between development branches: restored error classes and a test option the merge dropped
+c274c3aad6 Repair of a merge between development branches: compile and lint fallout of a merge
+9e0b2d12e9 Repair of a merge between development branches: compile fallout of a merge
+6a5b2b5236 Repair of a merge between development branches: conflicting key tables and a duplicated test
+b1c1bcf955 Repair of a merge between development branches: an interface the merge changed
+620a75d9a0 Repair of a merge between development branches: a field the merge duplicated
+1900b4c17f Repair of a merge between development branches: duplicate declarations after a merge
+42b51d78ac Repair of a merge between development branches: test fallout of a merge
+884b85520b Failure found by the integration build of unreleased work: test fixtures and declarations
+3a48c3f903 Failure found by the integration build of unreleased work: lint, mapping and ratchet checks
+fb6263b95d Review follow-up to unreleased work: corrections to a batch not yet released
+1eb814e5d0 Review follow-up to unreleased work: header cleanup
+f680b9591a see a81ec0dc55
+75c06b6556 see 433d232815
+6bfc7f1afc Fix reverted before release: DashScope quota retry (D123) was removed again by owner sign-off in 49938a5421
+bfc03c667c see b1cea06458
+9ba7e7f29f test-only: lint cleanup and test-invariant updates that merge the SDK cars (no product behaviour)
+9286e75ef1 Review follow-up to unreleased work: places the arrival-order start in the request scope (no behaviour change), drops one omitempty that conflated an empty operations list with an absent one, and adds tests for the emptydrop claims
+4935bcbfcc see 958e80d99f
+f3fd868442 see ab1d07097c
+33c8d77650 Follow-up to unreleased work: regenerates the embedded SDK copies of the unreleased ownThinkingRuns feature (D214) and extends the failed-factory probe, no product behaviour
+286c78da6d Repair of a merge between development branches: gofmt of a one-line accessor and a changelog sentence after a merge, no product behaviour
+ee03bf520b Follow-up to unreleased work: commits the vendored node_modules of the Chord plugins Node evaluator that the .gitignore hid (701 generated files), no product behaviour
+# f26dfe2355 corrects f06ba8fd15, which hid the symptom of the same bug (its trailer names f06ba8fd15 back): the entry is the correction's.
+f06ba8fd15 see f26dfe2355

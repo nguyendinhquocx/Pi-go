@@ -1,10 +1,11 @@
 // Pi 0.87.1 actual main-screen renderer; fixture terminal operations match tui-render.test.ts's BoundedWriteTerminal.
+import { PI_PACKAGE_VERSION } from "./pi-version.mjs";
 import assert from 'node:assert/strict';
 import { readFileSync, realpathSync, mkdtempSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
 const root = process.env.PI_PACKAGE_ROOT ?? realpathSync('extensions/sdk-ts/node_modules/@earendil-works/pi-coding-agent');
-assert.equal(JSON.parse(readFileSync(join(root,'package.json'),'utf8')).version,'1.0.3');
+assert.equal(JSON.parse(readFileSync(join(root,'package.json'),'utf8')).version,PI_PACKAGE_VERSION);
 const dist=join(root,'node_modules/@earendil-works/pi-tui/dist');
 const {TuiMainScreen}=await import(pathToFileURL(join(dist,'tui-main-screen.js')).href);
 const {setCapabilities}=await import(pathToFileURL(join(dist,'terminal-image.js')).href);
@@ -20,6 +21,8 @@ const cases=[
  ['image-reserved-growth',5,[image,''],[image,'',''],false],
  ['cleanup-without-advertised-support',10,[image],['plain'],true],
  ['stable-deletion-order',10,['\x1b_Ga=T,i=9;A\x1b\\','\x1b_Ga=T,i=2;B\x1b\\','\x1b_Ga=T,i=9;A\x1b\\'],['plain'],true],
+ ['osc133-first-render',24,null,['\x1b]133;A\x07prompt','\x1b]133;B\x07\x1b]133;C\x07output'],false],
+ ['osc133-differential',24,['\x1b]133;A\x07prompt','\x1b]133;B\x07\x1b]133;C\x07output'],['\x1b]133;A\x07prompt','\x1b]133;B\x07\x1b]133;C\x07output','\x1b]133;A\x1b\\reply','\x1b]133;B\x1b\\\x1b]133;C\x1b\\done'],false],
 ];
 for(const [name,height,before,after,force] of cases){
  const term=terminal(height),ui=new TuiMainScreen(term),c=component(before);ui.addChild(c);

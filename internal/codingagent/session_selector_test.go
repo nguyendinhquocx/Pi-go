@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
 
 func TestParseSearchQuery(t *testing.T) {
@@ -36,9 +38,13 @@ func TestFilterAndSortSessions(t *testing.T) {
 	if len(got) != 1 || got[0].ID != "2" {
 		t.Fatalf("phrase filter got=%v", got)
 	}
-	got = filterAndSortSessions(sessions, `lgin`, sessionSortRelevance)
-	if len(got) == 0 || got[0].ID != "1" && got[0].ID != "3" {
+	// Scattered characters match the name or the directory, never the message text (Pi #11220).
+	got = filterAndSortSessions(sessions, `gma`, sessionSortRelevance)
+	if len(got) != 1 || got[0].ID != "3" {
 		t.Fatalf("fuzzy filter got=%v", got)
+	}
+	if got = filterAndSortSessions(sessions, `lgin`, sessionSortRelevance); len(got) != 0 {
+		t.Fatalf("scattered characters of the message text matched: %v", got)
 	}
 	got = filterAndSortSessions(sessions, `login`, sessionSortRecent)
 	if len(got) != 2 || got[0].ID != "3" && got[0].ID != "1" {
@@ -49,7 +55,7 @@ func TestFilterAndSortSessions(t *testing.T) {
 func TestBuildAndFlattenSessionTree(t *testing.T) {
 	now := time.Now()
 	root := SessionInfo{Path: "/tmp/root.jsonl", Modified: now, Name: "root"}
-	child := SessionInfo{Path: "/tmp/child.jsonl", ParentSession: "/tmp/root.jsonl", Modified: now.Add(-time.Hour), Name: "child"}
+	child := SessionInfo{Path: "/tmp/child.jsonl", ParentSessionPath: "/tmp/root.jsonl", Modified: now.Add(-time.Hour), Name: "child"}
 	other := SessionInfo{Path: "/tmp/other.jsonl", Modified: now.Add(-2 * time.Hour), Name: "other"}
 	flat := flattenSessionTree(buildSessionTree([]SessionInfo{child, other, root}))
 	if len(flat) != 3 {
@@ -199,12 +205,13 @@ func TestSessionSelectorRenderRenameModeUsesBareInputSurface(t *testing.T) {
 		func() ([]SessionInfo, error) {
 			return []SessionInfo{{Path: "/tmp/a.jsonl", Name: "alpha", Modified: now}}, nil
 		},
-		nil,
+		func(string, string) error { return nil },
 		nil,
 		"/tmp/current.jsonl",
 		DefaultKeybindingsManager(),
 	)
-	sel.renameMode = true
+	sel.enterRenameMode()
+	sel.renameInput.Focused = false // keep the hardware-cursor marker out of the byte comparison
 	sel.renameInput.SetText("alpha")
 
 	lines := sel.Render(60)
@@ -213,7 +220,7 @@ func TestSessionSelectorRenderRenameModeUsesBareInputSurface(t *testing.T) {
 		t.Fatalf("rename render missing title:\n%s", joined)
 	}
 	// Pi Input.setValue retains the initial cursor before the first character.
-	if !strings.Contains(joined, "> \x1b[7ma\x1b[27mlpha") {
+	if !strings.Contains(joined, "> "+widthx.RenderFakeCursor("a")+"lpha") {
 		t.Fatalf("rename render missing bare input line:\n%s", joined)
 	}
 	if strings.Contains(joined, "Enter: confirm  Esc: cancel") {

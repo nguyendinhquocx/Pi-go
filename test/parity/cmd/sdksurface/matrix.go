@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -20,9 +21,9 @@ const (
 )
 
 // sdks are the matrix columns, in order.
-var sdks = []string{"node", "go", "rust", "python"}
+var sdks = []string{"node", "go", "rust", "python", "lisp"}
 
-var sdkTitle = map[string]string{"node": "Node runtime", "go": "Go", "rust": "Rust", "python": "Python"}
+var sdkTitle = map[string]string{"node": "Node runtime", "go": "Go", "rust": "Rust", "python": "Python", "lisp": "Lisp"}
 
 const (
 	statusImplemented = "implemented"
@@ -39,18 +40,34 @@ type rowSpec struct {
 	Go     string `toml:"go"`
 	Rust   string `toml:"rust"`
 	Python string `toml:"python"`
+	// Lisp names pig:<symbol> or pig:<function>(<keyword>) for a keyword or optional parameter of an exported function.
+	Lisp string `toml:"lisp"`
 	// Stand-in reasons. Partial applies to every SDK whose own reason is empty.
 	Partial       string `toml:"partial"`
 	NodePartial   string `toml:"node_partial"`
 	GoPartial     string `toml:"go_partial"`
 	RustPartial   string `toml:"rust_partial"`
 	PythonPartial string `toml:"python_partial"`
+	LispPartial   string `toml:"lisp_partial"`
 	// Wire names the host decoding a value crosses: "extension.Type.jsonName"
 	// or "subprocess.Type.jsonName" (a JSON field of that host Go type),
 	// "literal:name" (a string or JSON field name the host, its interactive UI or
 	// its RPC/print modes read), or "none".
 	Wire string `toml:"wire"`
+	// Section makes the row a PiG-only surface that Pi has no
+	// counterpart for, listed under a heading made from the section name with Decl as
+	// its declaration; its cells need explicit symbols.
+	Section string `toml:"section"`
+	Decl    string `toml:"decl"`
+	// Implemented marks an additive surface the extension implements and the host calls (a component's event handler): no fixture
+	// accesses such a member, so a fixture that defines it reaches it (exerciseTokens).
+	Implemented bool `toml:"implemented"`
 }
+
+// kindPig is a PiG-only surface named by the map.
+const kindPig = "pig"
+
+func isPigRow(r matrixRow) bool { return r.Kind == kindPig }
 
 func (s rowSpec) symbols(sdk string) string {
 	switch sdk {
@@ -60,12 +77,14 @@ func (s rowSpec) symbols(sdk string) string {
 		return s.Go
 	case "rust":
 		return s.Rust
+	case "lisp":
+		return s.Lisp
 	}
 	return s.Python
 }
 
 func (s rowSpec) partial(sdk string) string {
-	own := map[string]string{"node": s.NodePartial, "go": s.GoPartial, "rust": s.RustPartial, "python": s.PythonPartial}[sdk]
+	own := map[string]string{"node": s.NodePartial, "go": s.GoPartial, "rust": s.RustPartial, "python": s.PythonPartial, "lisp": s.LispPartial}[sdk]
 	if own != "" {
 		return own
 	}
@@ -120,6 +139,7 @@ type matrix struct {
 	rows       []matrixRow
 	exceptions []exceptionSpec
 	unused     []string // map keys naming no surface
+	syms       *sdkSymbols
 }
 
 // sdkSymbols holds every runtime's detected symbols and the host's decoding
@@ -131,6 +151,43 @@ type sdkSymbols struct {
 	// consumers are the host packages that read values the subprocess host
 	// passes through opaquely (the interactive UI and the RPC/print modes).
 	consumers []*goPackage
+}
+
+// addKitSymbols adds each SDK's component kit module (D107) to its symbols,
+// qualified by the module: kit.Name in Go and Python, kit::Name in Rust. A
+// module that does not exist yet adds nothing.
+func addKitSymbols(root string, goSyms, rs, py symbolSet) error {
+	exists := func(path string) bool {
+		_, err := os.Stat(filepath.Join(root, path))
+		return err == nil
+	}
+	add := func(to, from symbolSet, prefix string) {
+		for sym := range from {
+			to[prefix+sym] = true
+		}
+	}
+	if dir := "extensions/sdk/kit"; exists(dir) {
+		pkg, err := parseGoPackage(filepath.Join(root, dir))
+		if err != nil {
+			return fmt.Errorf("go kit: %w", err)
+		}
+		add(goSyms, pkg.symbols, "kit.")
+	}
+	if dir := "extensions/sdk-rs/src/kit"; exists(dir) {
+		syms, err := parseRust(filepath.Join(root, dir))
+		if err != nil {
+			return fmt.Errorf("rust kit: %w", err)
+		}
+		add(rs, syms, "kit::")
+	}
+	if file := "extensions/sdk-py/pig_sdk/kit.py"; exists(file) {
+		syms, err := parsePythonFiles([]string{filepath.Join(root, file)})
+		if err != nil {
+			return fmt.Errorf("python kit: %w", err)
+		}
+		add(py, syms, "kit.")
+	}
+	return nil
 }
 
 func loadSymbols(root string, probe *probeResult) (*sdkSymbols, error) {
@@ -146,10 +203,21 @@ func loadSymbols(root string, probe *probeResult) (*sdkSymbols, error) {
 	if err != nil {
 		return nil, fmt.Errorf("python sdk: %w", err)
 	}
+	lisp, err := parseLisp(filepath.Join(root, "extensions/sdk-lisp/src/package.lisp"))
+	if err != nil {
+		return nil, fmt.Errorf("lisp sdk: %w", err)
+	}
+	if err := addKitSymbols(root, goSDK.symbols, rs, py); err != nil {
+		return nil, err
+	}
+	if err := addSubpackageSymbols(root, goSDK.symbols, rs, py); err != nil {
+		return nil, err
+	}
 	// The Node runtime's objects come from the runtime probe; the properties
 	// it reads from an extension's definitions (tool, command, flag objects)
-	// come from its source.
-	node, err := parseNodeReads([]string{filepath.Join(root, "coding/extension/host/subprocess/runtime-node/runtime.mjs")})
+	// and its components (the view walk, D107) come from its source.
+	runtimeNode := filepath.Join(root, "coding/extension/host/subprocess/runtime-node")
+	node, err := parseNodeReads([]string{filepath.Join(runtimeNode, "runtime.mjs"), filepath.Join(runtimeNode, "view-walk.mjs")})
 	if err != nil {
 		return nil, fmt.Errorf("node runtime: %w", err)
 	}
@@ -160,12 +228,18 @@ func loadSymbols(root string, probe *probeResult) (*sdkSymbols, error) {
 	if err != nil {
 		return nil, fmt.Errorf("coding/extension: %w", err)
 	}
+	if err := ext.resolveAliases(root, "github.com/MichaelKinsy/PiG"); err != nil {
+		return nil, fmt.Errorf("coding/extension: %w", err)
+	}
 	host, err := parseGoPackage(filepath.Join(root, "coding/extension/host/subprocess"))
 	if err != nil {
 		return nil, fmt.Errorf("subprocess host: %w", err)
 	}
+	if err := host.resolveAliases(root, "github.com/MichaelKinsy/PiG"); err != nil {
+		return nil, fmt.Errorf("subprocess host: %w", err)
+	}
 	var consumers []*goPackage
-	for _, dir := range []string{"internal/codingagent", "cmd/pig"} {
+	for _, dir := range []string{"internal/codingagent", "coding/cli"} {
 		pkg, err := parseGoPackage(filepath.Join(root, dir))
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", dir, err)
@@ -173,7 +247,7 @@ func loadSymbols(root string, probe *probeResult) (*sdkSymbols, error) {
 		consumers = append(consumers, pkg)
 	}
 	return &sdkSymbols{
-		bySDK:     map[string]symbolSet{"node": node, "go": goSDK.symbols, "rust": rs, "python": py},
+		bySDK:     map[string]symbolSet{"node": node, "go": goSDK.symbols, "rust": rs, "python": py, "lisp": lisp},
 		extension: ext,
 		host:      host,
 		consumers: consumers,
@@ -217,7 +291,7 @@ func buildMatrix(root string) (*matrix, error) {
 		}
 		specs[s.Key] = s
 	}
-	m := &matrix{exceptions: ef.Exceptions}
+	m := &matrix{exceptions: ef.Exceptions, syms: syms}
 	known := map[string]bool{}
 	for _, r := range surface {
 		if known[r.Key] {
@@ -232,9 +306,26 @@ func buildMatrix(root string) (*matrix, error) {
 		m.rows = append(m.rows, mr)
 	}
 	for _, s := range mf.Rows {
+		if s.Section != "" {
+			if known[s.Key] {
+				return nil, fmt.Errorf("%s: %q is an upstream surface and cannot set a section", mapPath, s.Key)
+			}
+			continue
+		}
 		if !known[s.Key] {
 			m.unused = append(m.unused, s.Key)
 		}
+	}
+	for _, s := range mf.Rows {
+		if s.Section == "" {
+			continue
+		}
+		r := surfaceRow{Group: "PiG additive: " + s.Section, Key: s.Key, Decl: s.Decl, Kind: kindPig, Implemented: s.Implemented}
+		mr := matrixRow{surfaceRow: r, Cells: map[string]cell{}, Exception: map[string]string{}}
+		for _, sdk := range sdks {
+			mr.Cells[sdk] = classify(r, s, sdk, syms)
+		}
+		m.rows = append(m.rows, mr)
 	}
 	m.rows = append(m.rows, packageRows(packages, probe)...)
 	for i := range m.rows {
@@ -288,7 +379,7 @@ func classify(r surfaceRow, spec rowSpec, sdk string, syms *sdkSymbols) cell {
 func hostEmits(event string, ext *goPackage) bool {
 	want := "api.on" + strings.ReplaceAll(event, "_", "")
 	for sym := range ext.symbols {
-		if strings.ToLower(sym) == want {
+		if strings.EqualFold(sym, want) {
 			return true
 		}
 	}
@@ -370,11 +461,13 @@ func defaultSymbols(r surfaceRow, sdk string) []string {
 			return []string{"api.on"}
 		case "go":
 			return goNames("Event" + pascalWords(r.Event))
+		case "lisp":
+			return []string{"pig:on"}
 		default:
 			return []string{"EVENT_" + strings.ToUpper(r.Event)}
 		}
 	case kindPayload, kindResult:
-		return map[string][]string{"node": {"api.on"}, "go": {"EventFunc"}, "rust": {"EventHandler"}, "python": {"Extension.on_event"}}[sdk]
+		return map[string][]string{"node": {"api.on"}, "go": {"EventFunc"}, "rust": {"EventHandler"}, "python": {"Extension.on_event"}, "lisp": {"pig:on"}}[sdk]
 	}
 	qualify := func(goTypes, rsTypes, pyTypes []string) []string {
 		var out []string
@@ -400,6 +493,48 @@ func defaultSymbols(r surfaceRow, sdk string) []string {
 		}
 		return out
 	}
+	// lisp spells a member as a function of the pig package: prefix-name, with the -p of a predicate and without a get- of a getter.
+	lisp := func(prefixes ...string) []string {
+		k := strings.ReplaceAll(s, "_", "-")
+		var out []string
+		for _, prefix := range prefixes {
+			out = append(out, "pig:"+prefix+k, "pig:"+prefix+k+"-p")
+			for _, word := range []string{"is-", "has-", "get-"} {
+				if rest, ok := strings.CutPrefix(k, word); ok {
+					out = append(out, "pig:"+prefix+rest+"-p")
+					if word == "get-" {
+						out = append(out, "pig:"+prefix+rest)
+					}
+				}
+			}
+		}
+		return out
+	}
+	if sdk == "lisp" {
+		switch r.Root {
+		case "pi":
+			return lisp("", "ctx-")
+		case "events":
+			return lisp("events-", "event-bus-", "ctx-events-")
+		case "ctx", "replacedCtx", "ui":
+			return lisp("ctx-")
+		case "footerData":
+			return lisp("footer-")
+		case "theme":
+			return lisp("theme-")
+		case "sessionManager":
+			return lisp("session-", "ctx-")
+		case "modelRegistry":
+			return lisp("registry-")
+		case "tool":
+			return []string{"pig:register-tool(" + strings.ReplaceAll(s, "_", "-") + ")"}
+		case "toolRender":
+			return lisp("tool-render-context-")
+		case "command":
+			return []string{"pig:command(" + strings.ReplaceAll(s, "_", "-") + ")"}
+		}
+		return nil
+	}
 	switch r.Root {
 	case "pi":
 		if sdk == "node" {
@@ -421,6 +556,11 @@ func defaultSymbols(r surfaceRow, sdk string) []string {
 			return []string{"RuntimeUI." + n}
 		}
 		return qualify([]string{"Context"}, []string{"Context"}, []string{"Context"})
+	case "footerData":
+		if sdk == "node" {
+			return []string{"FooterDataProvider." + n}
+		}
+		return qualify([]string{"FooterData"}, []string{"FooterData"}, []string{"FooterData"})
 	case "theme":
 		if sdk == "node" {
 			return []string{"ThemeShim." + n}
@@ -430,7 +570,7 @@ func defaultSymbols(r surfaceRow, sdk string) []string {
 		if sdk == "node" {
 			return []string{"RuntimeSessionManager." + n}
 		}
-		return qualify([]string{"SessionManager", "Context"}, []string{"SessionManager", "Context"}, []string{"SessionManager", "Context"})
+		return qualify([]string{"ReadonlySessionManager", "Context"}, []string{"ReadonlySessionManager", "Context"}, []string{"ReadonlySessionManager", "Context"})
 	case "modelRegistry":
 		if sdk == "node" {
 			return []string{"RuntimeModelRegistry." + n}
@@ -609,13 +749,15 @@ func (m *matrix) prefixCoversMissing(e exceptionSpec) bool {
 
 // ── Rendering ───────────────────────────────────────────────────────────────
 
-func (m *matrix) counts() map[string]map[string]int {
+// counts tallies the cells of the extension API rows, or of the PiG additive
+// rows when pig is set.
+func (m *matrix) counts(pig bool) map[string]map[string]int {
 	out := map[string]map[string]int{}
 	for _, sdk := range sdks {
 		out[sdk] = map[string]int{}
 	}
 	for _, r := range m.rows {
-		if isPackageRow(r) {
+		if isPackageRow(r) || isPigRow(r) != pig {
 			continue
 		}
 		for _, sdk := range sdks {
@@ -637,13 +779,14 @@ func (m *matrix) render() []byte {
 	w("Every extension-facing surface of Pi %s's extension API, and how each PiG extension runtime realizes it. ", coding.UpstreamVersion)
 	w("The rows come from Pi's `packages/coding-agent/src/core/extensions/types.ts` and the declarations it re-exports or exposes through its members ")
 	w("(`EventBus`, `ExecOptions`/`ExecResult`, `CacheWarmingDecisionEvent`, `ReadonlySessionManager`, `ModelRegistry`, `Theme`, `AgentToolResult`), read from `.upstream/v%s`.\n\n", coding.UpstreamVersion)
-	w("A cell's status comes from the runtime itself: the Go SDK's exported identifiers, the Rust SDK's `pub` items and the Python SDK's classes, members and parameters, read from their source, and the Node runtime's objects, read by instantiating the runtime in Node (`test/parity/cmd/sdksurface/probe.mjs`), plus the properties it reads from an extension's definitions. ")
+	w("A cell's status comes from the runtime itself: the Go SDK's exported identifiers, the Rust SDK's `pub` items, the Python SDK's classes, members and parameters and the Lisp SDK's exported symbols and the keyword and optional parameters of its exported functions, read from their source, and the Node runtime's objects, read by instantiating the runtime in Node (`test/parity/cmd/sdksurface/probe.mjs`), plus the properties it reads from an extension's definitions. ")
 	w("[`%s`](../%s) names the symbol where a language's naming differs from the default rule and says why a realization is a stand-in; a named symbol that does not exist is `missing`. ", mapPath, mapPath)
-	w("Payload, result and option fields that cross the subprocess wire are also checked against the host's Go decoding type, so a field an SDK sends but the host drops is `missing`.\n\n")
+	w("Payload, result and option fields that cross the subprocess wire are also checked against the host's Go decoding type, so a field an SDK sends but the host drops is `missing`. ")
+	w("The PiG additive sections list surfaces PiG adds where Pi has none, such as the component kit (D107); the map names each one's symbols, and its cells are classified the same way.\n\n")
 	w("- `implemented`: the symbol and any checked wire fields exist; this is not behavioral proof. See `docs/extension-api-parity.md` and the conformance tests.\n")
 	w("- `stand-in/partial`: the symbol exists; the note says what differs and why.\n")
 	w("- `missing`: no symbol. Each missing cell is listed in [`%s`](../%s) with its reviewed reason, and `go test ./test/parity/cmd/sdksurface` fails on any other.\n\n", exceptionsPath, exceptionsPath)
-	w("The package sections list every runtime export of the modules Pi serves to extensions (`pi-coding-agent`, `pi-tui`, `pi-ai`, `pi-ai/compat`, `pi-ai/providers/all`, `pi-agent-core`), from the compiler-derived inventory of Pi's `.d.ts` files (`test/parity/interfaces/upstream-v%s.json`), and every public instance member of each exported class represented by that inventory. Static factories and overload-specific reachability are outside this probe. ", coding.UpstreamVersion)
+	w("The package sections list every runtime export of the modules Pi serves to extensions (`pi-coding-agent`, `pi-tui`, `pi-ai`, `pi-ai/compat`, `pi-ai/models`, `pi-ai/providers/all`, `pi-agent-core`), from the compiler-derived inventory of Pi's `.d.ts` files (`test/parity/interfaces/upstream-v%s.json`), and every public instance member of each exported class represented by that inventory. Static factories and overload-specific reachability are outside this probe. ", coding.UpstreamVersion)
 	w("Only the Node runtime imports these modules. The probe loads each module the runtime serves and classifies every value by where its code lives, using the V8 inspector's function locations:\n\n")
 	w("- `Pi's own code`: the function originates in the vendored pinned modules or their dependencies; host import rewrites can still affect behavior (D73).\n")
 	w("- `bridged`: PiG's implementation in the extension runtime, a line-for-line port or a host bridge, locked by the D73 tests (`TestNodeRuntimeShimsExportEveryPinnedPiValue`, `TestPiTuiComponentsMatchThePinnedPackage`, `TestPiAiUtilitiesMatchThePinnedPackage`, `TestPiThemeHelpersMatchThePinnedPackage`).\n")
@@ -653,19 +796,32 @@ func (m *matrix) render() []byte {
 
 	w("## Summary\n\n")
 	api, pkg := 0, 0
+	pig := 0
 	for _, r := range m.rows {
-		if isPackageRow(r) {
+		switch {
+		case isPackageRow(r):
 			pkg++
-		} else {
+		case isPigRow(r):
+			pig++
+		default:
 			api++
 		}
 	}
 	w("%d extension API surfaces:\n\n", api)
 	w("| Runtime | implemented | stand-in/partial | missing (all with a reviewed exception) |\n|---|---|---|---|\n")
-	counts := m.counts()
+	counts := m.counts(false)
 	for _, sdk := range sdks {
 		c := counts[sdk]
 		w("| %s | %d | %d | %d |\n", sdkTitle[sdk], c[statusImplemented], c[statusPartial], c[statusMissing])
+	}
+	if pig > 0 {
+		w("\n%d PiG-only surfaces:\n\n", pig)
+		w("| Runtime | implemented | stand-in/partial | missing (all with a reviewed exception) |\n|---|---|---|---|\n")
+		counts := m.counts(true)
+		for _, sdk := range sdks {
+			c := counts[sdk]
+			w("| %s | %d | %d | %d |\n", sdkTitle[sdk], c[statusImplemented], c[statusPartial], c[statusMissing])
+		}
 	}
 	w("\n%d package exports and class members, Node runtime:\n\n", pkg)
 	w("| Module | Pi's own code | bridged | stand-in | missing (all with a reviewed exception) |\n|---|---|---|---|---|\n")
@@ -683,10 +839,13 @@ func (m *matrix) render() []byte {
 	for i, r := range m.rows {
 		if i == 0 || r.Group != m.rows[i-1].Group {
 			w("## %s\n\n", r.Group)
-			if isPackageRow(r) {
+			switch {
+			case isPackageRow(r):
 				w("| Export | Pi declaration | Node runtime |\n|---|---|---|\n")
-			} else {
-				w("| Surface | Pi declaration | Node runtime | Go | Rust | Python |\n|---|---|---|---|---|---|\n")
+			case isPigRow(r):
+				w("| Surface | PiG declaration | Node runtime | Go | Rust | Python | Lisp |\n|---|---|---|---|---|---|---|\n")
+			default:
+				w("| Surface | Pi declaration | Node runtime | Go | Rust | Python | Lisp |\n|---|---|---|---|---|---|---|\n")
 			}
 		}
 		w("| `%s` | `%s` |", escapeCell(r.Key), escapeCell(r.Decl))

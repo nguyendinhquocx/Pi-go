@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
 // SPDX-License-Identifier: MIT
 
 // Package modulehash computes the Go publication hashes of tracked module files.
@@ -23,7 +22,9 @@ import (
 // TrackedFiles lists Git-tracked paths relative to dir. Outside a Git checkout,
 // it lists all files: a release source archive is already tracked-only.
 func TrackedFiles(dir string) ([]string, error) {
+	//nolint:gosec // G204 (class a): program is literal git; args are -C of a computed module directory and fixed rev-parse --show-toplevel.
 	if err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Run(); err == nil {
+		//nolint:gosec // G204 (class a): program is literal git; args are -C of the same computed module directory and fixed ls-files -z -- .
 		out, err := exec.Command("git", "-C", dir, "ls-files", "-z", "--", ".").Output()
 		if err != nil {
 			return nil, fmt.Errorf("list tracked files: %w", err)
@@ -76,19 +77,29 @@ type overlayInfo struct {
 
 func (f overlayInfo) Size() int64 { return f.size }
 
-// Hashes returns the module zip and go.mod h1 hashes using Go's module zip rules.
-// Overlay keys are slash-separated paths relative to root; only tracked files
-// participate, with working-tree bytes unless an overlay supplies planned bytes.
-func Hashes(root, dir string, mod module.Version, overlay map[string][]byte) (zipHash, modHash string, err error) {
+// ModuleFiles lists the tracked files of the module at root/dir as module zip inputs, with the overlay semantics of Hashes. The list includes files that Go's zip rules later omit, such as nested modules; modzip.CheckFiles and modzip.Create apply those rules.
+func ModuleFiles(root, dir string, overlay map[string][]byte) ([]modzip.File, error) {
 	moduleDir := filepath.Join(root, filepath.FromSlash(dir))
 	paths, err := TrackedFiles(moduleDir)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 	files := make([]modzip.File, 0, len(paths))
 	for _, rel := range paths {
 		data, ok := overlay[filepath.ToSlash(filepath.Join(dir, rel))]
 		files = append(files, diskFile{rel: rel, abs: filepath.Join(moduleDir, filepath.FromSlash(rel)), data: data, overlaid: ok})
+	}
+	return files, nil
+}
+
+// Hashes returns the module zip and go.mod h1 hashes using Go's module zip rules.
+// Overlay keys are slash-separated paths relative to root; only tracked files
+// participate, with working-tree bytes unless an overlay supplies planned bytes.
+func Hashes(root, dir string, mod module.Version, overlay map[string][]byte) (zipHash, modHash string, err error) {
+	moduleDir := filepath.Join(root, filepath.FromSlash(dir))
+	files, err := ModuleFiles(root, dir, overlay)
+	if err != nil {
+		return "", "", err
 	}
 	out, err := os.CreateTemp("", "pig-module-*.zip")
 	if err != nil {

@@ -1,5 +1,7 @@
 package ai
 
+// pi: packages/ai/src/providers/anthropic.ts
+
 // Ports .upstream/current/packages/ai/test/anthropic-auth-token.test.ts and
 // anthropic-tool-name-normalization.test.ts as serialized-request tests. The
 // upstream tool-name suite runs against the live API; here a local server
@@ -149,6 +151,24 @@ func systemTexts(body map[string]any) []string {
 		texts = append(texts, block["text"].(string))
 	}
 	return texts
+}
+
+// anthropic-auth-token.test.ts "Anthropic auth token env": the provider's API-key resolver reads
+// ANTHROPIC_AUTH_TOKEN as a bearer Authorization header and keeps ANTHROPIC_OAUTH_TOKEN as OAuth-shaped API auth.
+func TestAnthropicAuthTokenEnvResolution(t *testing.T) {
+	t.Run("resolves ANTHROPIC_AUTH_TOKEN as a bearer Authorization header", func(t *testing.T) {
+		result := resolveAnthropicWithEnv(t, map[string]string{"ANTHROPIC_AUTH_TOKEN": "auth-token", "ANTHROPIC_OAUTH_TOKEN": "oauth-token", "ANTHROPIC_API_KEY": "api-key"})
+		if result == nil || result.Source != AnthropicAuthTokenEnv || result.Auth.APIKey != "" || len(result.Env) != 0 ||
+			len(result.Auth.Headers) != 1 || result.Auth.Headers["Authorization"] == nil || *result.Auth.Headers["Authorization"] != "Bearer auth-token" {
+			t.Fatalf("result = %+v", result)
+		}
+	})
+	t.Run("preserves ANTHROPIC_OAUTH_TOKEN as OAuth-shaped API auth", func(t *testing.T) {
+		result := resolveAnthropicWithEnv(t, map[string]string{"ANTHROPIC_OAUTH_TOKEN": "oauth-token", "ANTHROPIC_API_KEY": "api-key"})
+		if result == nil || result.Source != AnthropicOAuthTokenEnv || result.Auth.APIKey != "oauth-token" || len(result.Auth.Headers) != 0 || len(result.Env) != 0 {
+			t.Fatalf("result = %+v", result)
+		}
+	})
 }
 
 // TestAnthropicRequestAuthShapes serializes one request per auth source and
@@ -350,24 +370,36 @@ func TestAnthropicBetaHeaderMergeRules(t *testing.T) {
 		{
 			name: "thinking on a budget-thinking model adds interleaved thinking",
 			cfg:  AnthropicConfig{APIKey: "anthropic-key", Model: "claude-haiku-4-5"},
-			opts: StreamOptions{Thinking: ThinkingHigh},
+			opts: StreamOptions{Thinking: ThinkingLevelHigh},
 			want: new("interleaved-thinking-2025-05-14"),
 		},
 		{
 			name: "OAuth betas lead the computed list",
 			cfg:  AnthropicConfig{APIKey: "sk-ant-oat-test", Model: "claude-haiku-4-5"},
-			opts: StreamOptions{Thinking: ThinkingHigh},
+			opts: StreamOptions{Thinking: ThinkingLevelHigh},
 			want: new("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14"),
+		},
+		{
+			// anthropic-messages.ts:1108-1115 getBetaFeatures: (options.interleavedThinking ?? true) gates the interleaved-thinking beta.
+			name: "interleavedThinking false omits interleaved thinking",
+			cfg:  AnthropicConfig{APIKey: "anthropic-key", Model: "claude-haiku-4-5"},
+			opts: StreamOptions{Thinking: ThinkingLevelHigh, InterleavedThinking: new(false)},
+		},
+		{
+			name: "interleavedThinking true keeps interleaved thinking",
+			cfg:  AnthropicConfig{APIKey: "anthropic-key", Model: "claude-haiku-4-5"},
+			opts: StreamOptions{Thinking: ThinkingLevelHigh, InterleavedThinking: new(true)},
+			want: new("interleaved-thinking-2025-05-14"),
 		},
 		{
 			name: "thinking off omits interleaved thinking",
 			cfg:  AnthropicConfig{APIKey: "anthropic-key", Model: "claude-haiku-4-5"},
-			opts: StreamOptions{Thinking: ThinkingOff},
+			opts: StreamOptions{Thinking: ""},
 		},
 		{
 			name: "non-reasoning model omits interleaved thinking",
 			cfg:  AnthropicConfig{APIKey: "anthropic-key"},
-			opts: StreamOptions{Thinking: ThinkingHigh},
+			opts: StreamOptions{Thinking: ThinkingLevelHigh},
 		},
 		{
 			name: "tools without eager input streaming add fine-grained tool streaming",
@@ -427,11 +459,12 @@ func TestAnthropicOnPayloadReplacesBetas(t *testing.T) {
 	}
 }
 
-// TestAnthropicClientUserAgent covers mergeClientHeaders key order: the
-// seeded User-Agent key defaults to PiUserAgent() (D65) and takes an
-// exact-case request value in place, so the OAuth identity's lowercase
-// user-agent key, assigned later, wins over it (Q3: OAuth requests keep
-// claude-cli/2.1.280 regardless of a configured header).
+// TestAnthropicClientUserAgent covers createClient's header merge: an API-key
+// request seeds User-Agent from the client identity (D65) below the model and
+// request headers, and an OAuth request sends the Claude Code identity
+// (claude-cli/2.1.280, Q3) instead of the client identity. The identity's
+// user-agent key is the lowest source, so a configured header of any case
+// replaces it, as under Pi 1.3.0 adc5fa9f.
 func TestAnthropicClientUserAgent(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -439,11 +472,11 @@ func TestAnthropicClientUserAgent(t *testing.T) {
 		headers ProviderHeaders
 		want    string
 	}{
-		{name: "api key defaults to PiUserAgent", apiKey: "kimi-key", want: PiUserAgent()},
+		{name: "api key defaults to the identity User-Agent", apiKey: "kimi-key", want: FormatUserAgent(nil)},
 		{name: "oauth identity defaults to the Claude Code identity", apiKey: "sk-ant-oat-test", want: "claude-cli/2.1.280"},
 		// anthropic-auth-token.test.ts: lets explicit headers override the default Anthropic Messages User-Agent.
 		{name: "api key keeps a request User-Agent", apiKey: "kimi-key", headers: ProviderHeaders{"User-Agent": new("custom-client")}, want: "custom-client"},
-		{name: "oauth identity outranks an exact-case User-Agent", apiKey: "sk-ant-oat-test", headers: ProviderHeaders{"User-Agent": new("custom-client")}, want: "claude-cli/2.1.280"},
+		{name: "an exact-case User-Agent replaces the oauth identity", apiKey: "sk-ant-oat-test", headers: ProviderHeaders{"User-Agent": new("custom-client")}, want: "custom-client"},
 		{name: "a lowercase user-agent overrides the oauth identity", apiKey: "sk-ant-oat-test", headers: ProviderHeaders{"user-agent": new("custom-client")}, want: "custom-client"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -592,12 +625,12 @@ func TestAnthropicHistoryToolNames(t *testing.T) {
 			AssistantMessage{
 				Content: []AssistantContentBlock{
 					ThinkingContent{Thinking: "plan", ThinkingSignature: "stale-signature"},
-					ToolCall{ID: "call_1|fc_1", Name: "read", Arguments: JsonObject{"path": "a"}},
+					ToolCall{ID: "call_1-fc_1", Name: "read", Arguments: JsonObject{"path": "a"}},
 					ToolCall{ID: "call_2", Name: "ls", Arguments: JsonObject{}},
 				},
 				API: APIAnthropicMessages, Provider: "anthropic", Model: "claude-test", StopReason: StopReasonToolUse,
 			},
-			ToolResultMessage{ToolCallID: "call_1|fc_1", ToolName: "read", Content: []ToolResultMessageContent{TextContent{Text: "a"}}},
+			ToolResultMessage{ToolCallID: "call_1-fc_1", ToolName: "read", Content: []ToolResultMessageContent{TextContent{Text: "a"}}},
 			ToolResultMessage{ToolCallID: "call_2", ToolName: "ls", Content: []ToolResultMessageContent{TextContent{Text: "b"}}},
 		},
 		Tools: []ToolSchema{{Name: "read", Parameters: map[string]any{"type": "object"}}, {Name: "ls", Parameters: map[string]any{"type": "object"}}},
@@ -607,8 +640,9 @@ func TestAnthropicHistoryToolNames(t *testing.T) {
 		apiKey string
 		want   []string
 	}{
-		{"oauth", "sk-ant-oat-test", []string{"Read#call_1_fc_1", "ls#call_2"}},
-		{"api key", "sk-ant-api03-test", []string{"read#call_1_fc_1", "ls#call_2"}},
+		// The calls belong to this model, so transformMessages keeps their ids and convertMessages writes `id: block.id` (anthropic-messages.ts). The id uses only characters the Messages API accepts (the request-validity guard rejects a request the API would).
+		{"oauth", "sk-ant-oat-test", []string{"Read#call_1-fc_1", "ls#call_2"}},
+		{"api key", "sk-ant-api03-test", []string{"read#call_1-fc_1", "ls#call_2"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clearAnthropicAuthEnv(t)
@@ -627,7 +661,8 @@ func TestAnthropicHistoryToolNames(t *testing.T) {
 			}))
 			defer server.Close()
 			provider := NewAnthropicProvider(AnthropicConfig{APIKey: tc.apiKey, Model: "claude-test", BaseURL: server.URL})
-			stream, err := provider.Stream(context.Background(), NormalizeContext(history), StreamOptions{})
+			// The history keeps `call_1|fc_1` as given, as Pi does for this model's own calls, although the API rejects that id: an invalid request on purpose.
+			stream, err := provider.Stream(invalidRequest(t), NormalizeContext(history), StreamOptions{})
 			if err != nil {
 				t.Fatalf("Stream: %v", err)
 			}

@@ -1,9 +1,13 @@
 package subprocess
 
 import (
+	"bytes"
+	"compress/gzip"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/mod/modfile"
@@ -15,11 +19,22 @@ import (
 // A standalone may import the staged SDK through its legacy module path, including SDK self-imports.
 func TestLegacyStandaloneBuildsStagedSDKSubpackages(t *testing.T) {
 	root := t.TempDir()
-	sdkDir := filepath.Join(root, "state", "pigsdk", "sdk")
+	sdkDir := stagedSDKDir(t, root, "go")
 	for _, name := range sdk.BundledFiles() {
 		data, err := sdk.Source.ReadFile(name)
 		if err != nil {
 			t.Fatal(err)
+		}
+		// An embedded name under .gz/ holds the gzip of the file under the rest of the name, without .gz.
+		if stripped, compressed := strings.CutPrefix(name, ".gz/"); compressed {
+			reader, err := gzip.NewReader(bytes.NewReader(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if data, err = io.ReadAll(reader); err != nil {
+				t.Fatal(err)
+			}
+			name = strings.TrimSuffix(stripped, ".gz")
 		}
 		path := filepath.Join(sdkDir, name)
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -56,7 +71,7 @@ func main() { e := sdk.New("standalone"); e.Command("probe", "alive", func(sdk.C
 			if err != nil {
 				t.Fatal(err)
 			}
-			if string(before) != string(after) {
+			if !bytes.Equal(before, after) {
 				t.Fatal("authored go.mod changed")
 			}
 			transient, err := filepath.Glob(filepath.Join(src, ".pig-build-*"))

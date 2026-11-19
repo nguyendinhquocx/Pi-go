@@ -3,42 +3,23 @@ package codingagent
 // Ports packages/coding-agent/src/core/provider-composer.ts.
 
 import (
+	"container/heap"
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"slices"
 	"sync"
 
 	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
 )
 
-// ExtensionOAuthConfig adapts the legacy provider-registration callbacks to native provider auth.
-type ExtensionOAuthConfig struct {
-	Name           string
-	IsSubscription bool
-	Login          func(context.Context, ai.OAuthLoginCallbacks) (ai.Credential, error)
-	RefreshToken   func(context.Context, ai.Credential) (ai.Credential, error)
-	GetAPIKey      func(ai.Credential) string
-	ModifyModels   func([]*ai.Model, ai.Credential) []*ai.Model
-}
+// ExtensionOAuthConfig is the extension host's OAuth configuration for a registered provider (provider-composer.ts ExtensionOAuthConfig).
+type ExtensionOAuthConfig = extension.ExtensionOAuthConfig
 
-// ProviderConfigInput is the core registration input; Models nil preserves the base catalog and an empty slice replaces it.
-type ProviderConfigInput struct {
-	Name         string
-	BaseURL      string
-	APIKey       string
-	API          ai.API
-	StreamSimple ai.ModelsStreamFunction
-	Headers      map[string]string
-	AuthHeader   *bool
-	OAuth        *ExtensionOAuthConfig
-	// Models are chat, image and classifier model definitions; a model without a type is a chat model.
-	Models []ai.AnyModel
-	// Images and Classifiers are the implementations of the image and classifier models Models declares.
-	Images        ai.ProviderImageAPIMap
-	Classifiers   ai.ProviderClassifierMap
-	RefreshModels func(ai.RefreshModelsContext) ([]ai.AnyModel, error)
-}
+// ProviderConfigInput is the core registration input (provider-composer.ts:91 ProviderConfigInput).
+type ProviderConfigInput = extension.ProviderConfigInput
 
 // chatModelsOf keeps the chat models of a mixed list.
 func chatModelsOf(models []ai.AnyModel) []*ai.Model {
@@ -54,34 +35,37 @@ func chatModelsOf(models []ai.AnyModel) []*ai.Model {
 // NativeModelEntry lowers native model data to the configured backend representation without resolving credentials.
 func NativeModelEntry(model *ai.Model) ModelEntry {
 	cost := model.CostRates()
-	return ModelEntry{ProviderID: model.ProviderMeta.ProviderID, ModelID: model.ID, DisplayName: model.DisplayName, API: string(model.ProviderMeta.API), BaseURL: model.ProviderMeta.BaseURL, Reasoning: model.ProviderMeta.Reasoning || model.Capabilities.MaxThinking != "", Input: slices.Clone(model.Input), ContextWindow: model.Capabilities.ContextWindow, MaxTokens: model.Capabilities.MaxOutputTokens, InputCost: cost.Input, OutputCost: cost.Output, CacheReadCost: cost.CacheRead, CacheWriteCost: cost.CacheWrite, CostTiers: slices.Clone(cost.Tiers), ModelHeaders: maps.Clone(model.ProviderMeta.Headers), Headers: maps.Clone(model.ProviderMeta.Headers), Compat: mergeCompat((*providerCompat)(model.ProviderMeta.Compat), nil), ThinkingLevelMap: cloneThinkingLevelMap(model.ThinkingLevelMap), SamplingParams: maps.Clone(model.SamplingParams), SamplingParamsByThinkingLevel: cloneSamplingParamsByThinkingLevel(model.SamplingParamsByThinkingLevel), PromptCache: maps.Clone(model.PromptCache), InputLimits: model.InputLimits.Clone()}
+	return ModelEntry{Type: model.Type, CatalogRecord: ai.CatalogRecordOf(model), ProviderID: model.ProviderMeta.ProviderID, ModelID: model.ID, DisplayName: model.DisplayName, API: string(model.ProviderMeta.API), BaseURL: model.ProviderMeta.BaseURL, Reasoning: model.ProviderMeta.Reasoning || model.Capabilities.MaxThinking != "", Input: slices.Clone(model.Input), ContextWindow: model.Capabilities.ContextWindow, MaxTokens: model.Capabilities.MaxOutputTokens, InputCost: cost.Input, OutputCost: cost.Output, CacheReadCost: cost.CacheRead, CacheWriteCost: cost.CacheWrite, CostTiers: slices.Clone(cost.Tiers), ModelHeaders: maps.Clone(model.ProviderMeta.Headers), Headers: maps.Clone(model.ProviderMeta.Headers), Compat: mergeCompat((*providerCompat)(model.ProviderMeta.Compat), nil), ThinkingLevelMap: cloneThinkingLevelMap(model.ThinkingLevelMap), SamplingParams: maps.Clone(model.SamplingParams), SamplingParamsByThinkingLevel: cloneSamplingParamsByThinkingLevel(model.SamplingParamsByThinkingLevel), PromptCache: maps.Clone(model.PromptCache), InputLimits: model.InputLimits.Clone()}
 }
 
 func nativeModelFromEntry(entry ModelEntry) *ai.Model {
-	generated := ai.GeneratedModel{ID: entry.ModelID, Provider: entry.ProviderID, DisplayName: entry.DisplayName, API: ai.API(entry.API), BaseURL: entry.BaseURL, Headers: entry.ModelHeaders, Compat: entry.Compat, Reasoning: entry.Reasoning, Capabilities: entry.Input, ContextWindow: entry.ContextWindow, MaxOutputTokens: entry.MaxTokens, InputCostPerMTokens: entry.InputCost, OutputCostPerMTokens: entry.OutputCost, CacheReadCost: entry.CacheReadCost, CacheWriteCost: entry.CacheWriteCost, Tiers: entry.CostTiers, ThinkingLevelMap: entry.ThinkingLevelMap, SamplingParams: entry.SamplingParams, PromptCache: entry.PromptCache, InputLimits: entry.InputLimits}
+	generated := ai.GeneratedModel{Record: entry.CatalogRecord, ID: entry.ModelID, Provider: entry.ProviderID, DisplayName: entry.DisplayName, API: ai.API(entry.API), BaseURL: entry.BaseURL, Headers: entry.ModelHeaders, Compat: entry.Compat, Reasoning: entry.Reasoning, Capabilities: entry.Input, ContextWindow: entry.ContextWindow, MaxOutputTokens: entry.MaxTokens, InputCostPerMTokens: entry.InputCost, OutputCostPerMTokens: entry.OutputCost, CacheReadCost: entry.CacheReadCost, CacheWriteCost: entry.CacheWriteCost, Tiers: entry.CostTiers, ThinkingLevelMap: entry.ThinkingLevelMap, SamplingParams: entry.SamplingParams, PromptCache: entry.PromptCache, InputLimits: entry.InputLimits}
 	model := generated.ToModel()
+	model.Type = entry.Type
 	model.Capabilities = generated.ToCapabilities()
 	model.SamplingParamsByThinkingLevel = cloneSamplingParamsByThinkingLevel(entry.SamplingParamsByThinkingLevel)
 	return model
 }
 
-func applyNativeExtensionModels(id string, base []*ai.Model, anyDefinitions []ai.AnyModel, extension ProviderConfigInput) ([]*ai.Model, error) {
+func applyNativeExtensionModels(id string, base []*ai.Model, anyDefinitions []ai.AnyModel, extension ProviderConfigInput, carrier bool) ([]*ai.Model, error) {
 	definitions := chatModelsOf(anyDefinitions)
 	models := make([]*ai.Model, 0, len(definitions))
+	baseIndex := newNativeModelIndex(base)
 	for _, definition := range definitions {
 		model := new(*definition)
 		model.ProviderMeta.ProviderID = id
 		model.ProviderMeta.API = ai.API(firstModelValue(string(model.ProviderMeta.API), string(extension.API)))
 		model.ProviderMeta.BaseURL = firstModelValue(model.ProviderMeta.BaseURL, extension.BaseURL)
-		defaults := findNativeModelDefaults(base, model.ID, model.ProviderMeta.API)
+		defaults := baseIndex.find(model.ID, model.ProviderMeta.API)
 		if defaults != nil {
 			model.ProviderMeta.API = ai.API(firstModelValue(string(model.ProviderMeta.API), string(defaults.ProviderMeta.API)))
 			model.ProviderMeta.BaseURL = firstModelValue(model.ProviderMeta.BaseURL, defaults.ProviderMeta.BaseURL)
 		}
 		if model.ProviderMeta.API == "" {
-			return nil, fmt.Errorf(`Provider %s, model %s: no "api" specified. Set at provider or model level.`, id, model.ID)
+			// provider-composer.ts extensionModelFromDefinition:286 words this differently from the models.json check.
+			return nil, fmt.Errorf(`Provider %s, model %s: no "api" specified. Set it at model level or provider level.`, id, model.ID)
 		}
-		if model.ProviderMeta.BaseURL == "" {
+		if model.ProviderMeta.BaseURL == "" && !carrier {
 			return nil, fmt.Errorf(`Provider %s: "baseUrl" is required when defining custom models.`, id)
 		}
 		// upstream: packages/coding-agent/src/core/provider-composer.ts:applyExtension sets headers: undefined; request headers come from ModelRuntime.getAuth.
@@ -91,28 +75,110 @@ func applyNativeExtensionModels(id string, base []*ai.Model, anyDefinitions []ai
 	return models, nil
 }
 
-func findNativeModelDefaults(models []*ai.Model, id string, api ai.API) *ai.Model {
-	for _, model := range models {
-		if model.ID == id {
-			return model
+// nativeModelIndex answers findModelDefaults (provider-composer.ts) for a model list without scanning it for every lookup: the model with
+// the id (the first of any duplicates), else the first model with the api, else the first openai-completions model, else the first model.
+// replace and add keep the answers those scans would give after the list changes.
+type nativeModelIndex struct {
+	models []*ai.Model
+	byID   map[string]int
+	// byAPI holds, per api, candidate indexes of models with that api as a min-heap. An entry whose model has since changed api is
+	// dropped when it surfaces, so the top valid entry is the first model with the api.
+	byAPI map[ai.API]*nativeIndexHeap
+}
+
+type nativeIndexHeap []int
+
+func (h nativeIndexHeap) Len() int           { return len(h) }
+func (h nativeIndexHeap) Less(i, j int) bool { return h[i] < h[j] }
+func (h nativeIndexHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *nativeIndexHeap) Push(x any)        { *h = append(*h, x.(int)) }
+func (h *nativeIndexHeap) Pop() any {
+	old := *h
+	last := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return last
+}
+
+// newNativeModelIndex indexes models, which the index keeps and updates in place through replace and add.
+func newNativeModelIndex(models []*ai.Model) *nativeModelIndex {
+	index := &nativeModelIndex{models: models, byID: make(map[string]int, len(models)), byAPI: map[ai.API]*nativeIndexHeap{}}
+	for i, model := range models {
+		if _, seen := index.byID[model.ID]; !seen {
+			index.byID[model.ID] = i
 		}
-	}
-	if api != "" {
-		for _, model := range models {
-			if model.ProviderMeta.API == api {
-				return model
-			}
+		// Ascending indexes appended in order are already a valid min-heap.
+		h := index.byAPI[model.ProviderMeta.API]
+		if h == nil {
+			h = &nativeIndexHeap{}
+			index.byAPI[model.ProviderMeta.API] = h
 		}
+		*h = append(*h, i)
 	}
-	for _, model := range models {
-		if model.ProviderMeta.API == ai.APIOpenAICompletions {
-			return model
+	return index
+}
+
+func (n *nativeModelIndex) push(i int, api ai.API) {
+	h := n.byAPI[api]
+	if h == nil {
+		h = &nativeIndexHeap{}
+		n.byAPI[api] = h
+	}
+	heap.Push(h, i)
+}
+
+func (n *nativeModelIndex) firstWithAPI(api ai.API) *ai.Model {
+	h := n.byAPI[api]
+	if h == nil {
+		return nil
+	}
+	for h.Len() > 0 {
+		if i := (*h)[0]; n.models[i].ProviderMeta.API == api {
+			return n.models[i]
 		}
-	}
-	if len(models) > 0 {
-		return models[0]
+		heap.Pop(h)
 	}
 	return nil
+}
+
+// find is provider-composer.ts findModelDefaults over the current models.
+func (n *nativeModelIndex) find(id string, api ai.API) *ai.Model {
+	if i, ok := n.byID[id]; ok {
+		return n.models[i]
+	}
+	if api != "" {
+		if model := n.firstWithAPI(api); model != nil {
+			return model
+		}
+	}
+	if model := n.firstWithAPI(ai.APIOpenAICompletions); model != nil {
+		return model
+	}
+	if len(n.models) > 0 {
+		return n.models[0]
+	}
+	return nil
+}
+
+// indexOf is the position of the first model with the id, or -1.
+func (n *nativeModelIndex) indexOf(id string) int {
+	if i, ok := n.byID[id]; ok {
+		return i
+	}
+	return -1
+}
+
+// replace puts model, which has the id of the model it replaces, at index i.
+func (n *nativeModelIndex) replace(i int, model *ai.Model) {
+	n.models[i] = model
+	n.push(i, model.ProviderMeta.API)
+}
+
+// add appends a model whose id no model has.
+func (n *nativeModelIndex) add(model *ai.Model) {
+	n.models = append(n.models, model)
+	i := len(n.models) - 1
+	n.byID[model.ID] = i
+	n.push(i, model.ProviderMeta.API)
 }
 
 // anyModelBaseURL reads the base URL of a model of any type.
@@ -141,6 +207,42 @@ func withBaseURL(model ai.AnyModel, baseURL string) ai.AnyModel {
 		return &copy
 	}
 	return model
+}
+
+// withModelsJSONCompat applies the models.json provider compat to a classifier model: classifier APIs read their own compat fields, such as how a
+// System One service takes images, so the provider-level fields overlay the model's (provider-composer.ts applyModelsJson).
+// Models of other types are returned unchanged.
+func withModelsJSONCompat(model ai.AnyModel, compat *providerCompat) ai.AnyModel {
+	classifier, ok := model.(*ai.ClassifierModel)
+	if !ok || compat == nil {
+		return model
+	}
+	merged := overlaySystemOneCompat(classifier.Compat, compat)
+	copy := *classifier
+	copy.Compat = &merged
+	return &copy
+}
+
+// overlaySystemOneCompat overlays the System One fields of a provider compat object (imageInput, sendImageOptInHeader, which
+// PiG keeps among a compat object's additional properties) on base.
+func overlaySystemOneCompat(base *ai.SystemOneCompat, compat *providerCompat) ai.SystemOneCompat {
+	merged := ai.SystemOneCompat{}
+	if base != nil {
+		merged = *base
+	}
+	if raw, ok := compat.Extra["imageInput"]; ok {
+		var imageInput string
+		if json.Unmarshal(raw, &imageInput) == nil {
+			merged.ImageInput = ai.SystemOneImageInput(imageInput)
+		}
+	}
+	if raw, ok := compat.Extra["sendImageOptInHeader"]; ok {
+		var send bool
+		if json.Unmarshal(raw, &send) == nil {
+			merged.SendImageOptInHeader = &send
+		}
+	}
+	return merged
 }
 
 // allProviderModels lists every model of a provider: its GetAllModels list, or its chat list (provider-composer.ts getAllProviderModels).
@@ -205,7 +307,7 @@ func anyModelAPI(model ai.AnyModel) string {
 }
 
 // extensionNonChatModel materializes an extension image or classifier definition (provider-composer.ts extensionModelFromDefinition).
-func extensionNonChatModel(id string, models []ai.AnyModel, extension ProviderConfigInput, definition ai.AnyModel) (ai.AnyModel, error) {
+func extensionNonChatModel(id string, models []ai.AnyModel, extension ProviderConfigInput, definition ai.AnyModel, carrier bool) (ai.AnyModel, error) {
 	defaults := findExtensionModelDefaults(models, definition)
 	api := anyModelAPI(definition)
 	if api == "" && defaults != nil {
@@ -218,7 +320,7 @@ func extensionNonChatModel(id string, models []ai.AnyModel, extension ProviderCo
 	if baseURL == "" && defaults != nil {
 		baseURL = anyModelBaseURL(defaults)
 	}
-	if baseURL == "" {
+	if baseURL == "" && !carrier {
 		return nil, fmt.Errorf(`Provider %s: "baseUrl" is required when defining custom models.`, id)
 	}
 	// upstream: provider-composer.ts extensionModelFromDefinition sets headers: undefined; request headers come from ModelRuntime.getAuth.
@@ -246,6 +348,25 @@ func (r *ModelRegistry) nativeModelConfig(id string) (providerConfig, bool) {
 }
 
 func (r *ModelRegistry) composeNativeProvider(base *ai.ModelsProvider, extension *ProviderConfigInput) (*ai.ModelsProvider, error) {
+	return r.composeProvider(base, extension, false)
+}
+
+// composeCarrierProvider composes the provider of a native Provider object the extension registered through a carrier (Pi's registerNativeProvider): extension holds the carrier's models and callbacks, not an extension's provider configuration. Pi composes such a provider untouched (model-runtime.ts composeProvider: `base` is the Provider object): its models keep the base URL they have, or none, and a provider-level base URL is only the refresh context's.
+func (r *ModelRegistry) composeCarrierProvider(base *ai.ModelsProvider, extension *ProviderConfigInput) (*ai.ModelsProvider, error) {
+	return r.composeProvider(base, extension, true)
+}
+
+func (r *ModelRegistry) composeProvider(base *ai.ModelsProvider, extension *ProviderConfigInput, carrier bool) (*ai.ModelsProvider, error) {
+	// modelExtension is what the models are composed from: a carrier's provider-level base URL never reaches its models.
+	var modelExtension *ProviderConfigInput
+	if extension != nil {
+		modelExtension = extension
+		if carrier && extension.BaseURL != "" {
+			stripped := *extension
+			stripped.BaseURL = ""
+			modelExtension = &stripped
+		}
+	}
 	config, configured := r.nativeModelConfig(base.ID)
 	if !configured && extension == nil {
 		return base, nil
@@ -268,24 +389,33 @@ func (r *ModelRegistry) composeNativeProvider(base *ai.ModelsProvider, extension
 				entry.Compat = mergeCompat((*providerCompat)(entry.Compat), config.Compat)
 				models[i] = nativeModelFromEntry(entry)
 			}
+			// The definitions replace or extend the list one by one, each looking up the list as the definitions before it left it;
+			// the index answers those lookups without a scan of the list per definition.
+			composed := newNativeModelIndex(models)
 			for _, definition := range config.Models {
 				entry := modelDefinitionEntry(base.ID, config, definition)
-				index := slices.IndexFunc(models, func(model *ai.Model) bool { return model.ID == definition.ID })
-				defaults := findNativeModelDefaults(models, definition.ID, ai.API(firstModelValue(definition.API, config.API)))
+				index := composed.indexOf(definition.ID)
+				defaults := composed.find(definition.ID, ai.API(firstModelValue(definition.API, config.API)))
 				if defaults != nil {
 					entry.API = firstModelValue(entry.API, string(defaults.ProviderMeta.API))
 					entry.BaseURL = firstModelValue(entry.BaseURL, defaults.ProviderMeta.BaseURL)
 				}
-				if entry.API == "" || entry.BaseURL == "" {
-					return nil, fmt.Errorf("Provider %s, model %s: api and baseUrl are required", base.ID, definition.ID)
+				// provider-composer.ts modelFromJson:216-223: the api is checked before the base URL; the base models above are the provider's
+				// current catalog, so an "oauth" provider whose catalog has no model to take them from fails here.
+				if entry.API == "" {
+					return nil, fmt.Errorf(`Provider %s, model %s: no "api" specified. Set at provider or model level.`, base.ID, definition.ID)
+				}
+				if entry.BaseURL == "" {
+					return nil, fmt.Errorf(`Provider %s: "baseUrl" is required when defining custom models.`, base.ID)
 				}
 				model := nativeModelFromEntry(entry)
 				if index >= 0 {
-					models[index] = model
+					composed.replace(index, model)
 				} else {
-					models = append(models, model)
+					composed.add(model)
 				}
 			}
+			models = composed.models
 		}
 		return models, nil
 	}
@@ -304,14 +434,14 @@ func (r *ModelRegistry) composeNativeProvider(base *ai.ModelsProvider, extension
 				definitions = dynamic
 			}
 			if definitions != nil {
-				models, err = applyNativeExtensionModels(base.ID, models, definitions, *extension)
+				models, err = applyNativeExtensionModels(base.ID, models, definitions, *modelExtension, carrier)
 				if err != nil {
 					return nil, err
 				}
-			} else if extension.BaseURL != "" {
+			} else if modelExtension.BaseURL != "" {
 				for i, model := range models {
 					copy := new(*model)
-					copy.ProviderMeta.BaseURL = extension.BaseURL
+					copy.ProviderMeta.BaseURL = modelExtension.BaseURL
 					models[i] = copy
 				}
 			}
@@ -337,7 +467,7 @@ func (r *ModelRegistry) composeNativeProvider(base *ai.ModelsProvider, extension
 		models = slices.Clone(models)
 		for i, model := range models {
 			if !ai.IsModelType(model, ai.ModelTypeChat) {
-				models[i] = withBaseURL(model, firstModelValue(config.BaseURL, anyModelBaseURL(model)))
+				models[i] = withModelsJSONCompat(withBaseURL(model, firstModelValue(config.BaseURL, anyModelBaseURL(model))), config.Compat)
 			}
 		}
 		return models, nil
@@ -374,7 +504,7 @@ func (r *ModelRegistry) composeNativeProvider(base *ai.ModelsProvider, extension
 					}
 					continue
 				}
-				model, err := extensionNonChatModel(base.ID, configuredAll, *extension, definition)
+				model, err := extensionNonChatModel(base.ID, configuredAll, *modelExtension, definition, carrier)
 				if err != nil {
 					return nil, err
 				}
@@ -395,7 +525,7 @@ func (r *ModelRegistry) composeNativeProvider(base *ai.ModelsProvider, extension
 					continue
 				}
 				if extension != nil {
-					model = withBaseURL(model, firstModelValue(extension.BaseURL, anyModelBaseURL(model)))
+					model = withBaseURL(model, firstModelValue(modelExtension.BaseURL, anyModelBaseURL(model)))
 				}
 				all = append(all, model)
 			}
@@ -452,6 +582,11 @@ func (r *ModelRegistry) composeNativeProvider(base *ai.ModelsProvider, extension
 		provider.Name = firstModelValue(extension.Name, provider.Name, oauthName)
 	}
 	provider.Name = firstModelValue(provider.Name, base.ID)
+	// provider-composer.ts composeModelProvider: baseUrl is the registration's, else models.json's, else the base provider's.
+	provider.BaseURL = firstModelValue(config.BaseURL, base.BaseURL)
+	if extension != nil {
+		provider.BaseURL = firstModelValue(extension.BaseURL, provider.BaseURL)
+	}
 	provider.GetModels = currentModels
 	provider.GetAllModels = currentAllModels
 	provider.Auth = ai.ProviderAuth{APIKey: composeAPIKeyAuth(base.ID, auth, authConfig), OAuth: composeOAuthAuth(base.ID, auth.OAuth, authConfig)}
@@ -478,7 +613,7 @@ func (r *ModelRegistry) composeNativeProvider(base *ai.ModelsProvider, extension
 				if err != nil {
 					return err
 				}
-				if _, err := applyNativeExtensionModels(base.ID, defaults, models, *extension); err != nil {
+				if _, err := applyNativeExtensionModels(base.ID, defaults, models, *modelExtension, carrier); err != nil {
 					return err
 				}
 				configuredAll, err := configuredAllModels()
@@ -489,7 +624,7 @@ func (r *ModelRegistry) composeNativeProvider(base *ai.ModelsProvider, extension
 					if ai.IsModelType(definition, ai.ModelTypeChat) {
 						continue
 					}
-					if _, err := extensionNonChatModel(base.ID, configuredAll, *extension, definition); err != nil {
+					if _, err := extensionNonChatModel(base.ID, configuredAll, *modelExtension, definition, carrier); err != nil {
 						return err
 					}
 				}

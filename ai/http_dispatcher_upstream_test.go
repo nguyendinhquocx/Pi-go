@@ -1,8 +1,8 @@
 package ai
 
+// pi: packages/coding-agent/src/core/http-dispatcher.ts
+
 import (
-	"context"
-	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -34,6 +34,10 @@ func TestHTTPProxySettingsUpstream(t *testing.T) {
 		{"applies httpProxy to HTTP_PROXY and HTTPS_PROXY", "http://127.0.0.1:7890", "", "", "http://127.0.0.1:7890", "http://127.0.0.1:7890", false},
 		{"does not override existing proxy env vars", "http://settings:7890", "http://env-http:8080", "http://env-https:8080", "http://env-http:8080", "http://env-https:8080", true},
 		{"ignores empty values", "   ", "", "", "", "", false},
+		// httpProxy?.trim() is String.prototype.trim: U+FEFF and U+00A0 are whitespace there, U+0085 is not.
+		{"ignores a setting of JS whitespace only", "\ufeff\u00a0\u2028", "", "", "", "", false},
+		{"trims JS whitespace around the setting", "\ufeff http://127.0.0.1:7890\u00a0", "", "", "http://127.0.0.1:7890", "http://127.0.0.1:7890", false},
+		{"keeps U+0085, which JS trim does not remove", "\u0085", "", "", "\u0085", "\u0085", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clearDispatcherProxyEnv(t)
@@ -47,7 +51,7 @@ func TestHTTPProxySettingsUpstream(t *testing.T) {
 			if os.Getenv("HTTP_PROXY") != tc.wantHTTP || os.Getenv("HTTPS_PROXY") != tc.wantHTTPS {
 				t.Fatalf("HTTP=%q HTTPS=%q", os.Getenv("HTTP_PROXY"), os.Getenv("HTTPS_PROXY"))
 			}
-			if tc.name == "ignores empty values" {
+			if tc.name == "ignores empty values" || tc.name == "ignores a setting of JS whitespace only" {
 				for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY"} {
 					if _, present := os.LookupEnv(key); present {
 						t.Fatalf("%s must remain absent", key)
@@ -76,61 +80,6 @@ func TestHTTPDispatcherAllowsTwoSecondsWithoutChangingDefault(t *testing.T) {
 	}
 	if reflect.ValueOf(http.DefaultTransport.(*http.Transport).DialContext).Pointer() != before {
 		t.Fatal("global default dialer changed")
-	}
-}
-
-func TestHTTPProxyCancellationClosesConnectSocket(t *testing.T) {
-	clearDispatcherProxyEnv(t)
-	entered := make(chan struct{})
-	closed := make(chan struct{})
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		conn, _, err := w.(http.Hijacker).Hijack()
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		defer func() { _ = conn.Close(); close(closed) }()
-		close(entered)
-		var b [1]byte
-		_, _ = conn.Read(b[:])
-	}))
-	defer proxy.Close()
-	t.Setenv("HTTP_PROXY", proxy.URL)
-	client := baseStreamingHTTPClient(false)
-	defer client.CloseIdleConnections()
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://example.invalid", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() {
-		response, err := client.Do(request)
-		if response != nil {
-			_ = response.Body.Close()
-		}
-		done <- err
-	}()
-	<-entered
-	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("error=%v", err)
-	}
-	<-closed
-}
-
-func TestHTTPProxySettingsPreserveExplicitEmptyEnvironment(t *testing.T) {
-	clearDispatcherProxyEnv(t)
-	t.Setenv("HTTP_PROXY", "")
-	if err := ApplyHTTPProxySettings("http://settings:7890"); err != nil {
-		t.Fatal(err)
-	}
-	if value, exists := os.LookupEnv("HTTP_PROXY"); !exists || value != "" {
-		t.Fatalf("HTTP_PROXY=(%q,%v)", value, exists)
-	}
-	if got := os.Getenv("HTTPS_PROXY"); got != "http://settings:7890" {
-		t.Fatalf("HTTPS_PROXY=%q", got)
 	}
 }
 

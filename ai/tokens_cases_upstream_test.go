@@ -41,13 +41,13 @@ func tokensUpstreamCases() []tokensUpstreamCase {
 		// .upstream/v0.87.1/packages/ai/test/tokens.test.ts:247
 		{"should include token stats when aborted mid-stream", "vercel-ai-gateway", "google/gemini-2.5-flash", "", false, "", false},
 		// .upstream/v0.87.1/packages/ai/test/tokens.test.ts:260
-		{"should include token stats when aborted mid-stream", "xiaomi", "mimo-v2.5-pro", "", false, "", false},
+		{"should include token stats when aborted mid-stream", "xiaomi", "mimo-v2.6-pro", "", false, "", false},
 		// .upstream/v0.87.1/packages/ai/test/tokens.test.ts:270
-		{"should include token stats when aborted mid-stream", "xiaomi-token-plan-cn", "mimo-v2.5-pro", "", false, "", false},
+		{"should include token stats when aborted mid-stream", "xiaomi-token-plan-cn", "mimo-v2.6-pro", "", false, "", false},
 		// .upstream/v0.87.1/packages/ai/test/tokens.test.ts:280
-		{"should include token stats when aborted mid-stream", "xiaomi-token-plan-ams", "mimo-v2.5-pro", "", false, "", false},
+		{"should include token stats when aborted mid-stream", "xiaomi-token-plan-ams", "mimo-v2.6-pro", "", false, "", false},
 		// .upstream/v0.87.1/packages/ai/test/tokens.test.ts:290
-		{"should include token stats when aborted mid-stream", "xiaomi-token-plan-sgp", "mimo-v2.5-pro", "", false, "", false},
+		{"should include token stats when aborted mid-stream", "xiaomi-token-plan-sgp", "mimo-v2.6-pro", "", false, "", false},
 		// .upstream/v0.87.1/packages/ai/test/tokens.test.ts:298
 		{"should include token stats when aborted mid-stream", "qwen-token-plan", "qwen3.7-max", "", false, "", false},
 		// .upstream/v0.87.1/packages/ai/test/tokens.test.ts:306
@@ -61,7 +61,7 @@ func tokensUpstreamCases() []tokensUpstreamCase {
 		// .upstream/v0.87.1/packages/ai/test/tokens.test.ts:345
 		{"claude-sonnet-4 - should include token stats when aborted mid-stream", "github-copilot", "claude-sonnet-4.6", "", true, "", false},
 		// .upstream/v0.87.1/packages/ai/test/tokens.test.ts:356
-		{"gpt-5.5 - should include token stats when aborted mid-stream", "openai-codex", "gpt-5.5", "", true, "", false},
+		{"gpt-6.1-sol - should include token stats when aborted mid-stream", "openai-codex", "gpt-6.1-sol", "", true, "", false},
 		// .upstream/v0.87.1/packages/ai/test/tokens.test.ts:369
 		{"should include token stats when aborted mid-stream", "amazon-bedrock", "global.anthropic.claude-sonnet-4-5-20250929-v1:0", "", false, "", false},
 	}

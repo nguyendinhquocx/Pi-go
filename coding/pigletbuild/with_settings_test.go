@@ -41,10 +41,11 @@ func TestBakePigletInlinesAgentShapeAndStripsBuildOrigins(t *testing.T) {
 		Skills:    []piglet.SkillEntry{{Name: "commit", Origins: []string{"local:" + skillDir}}},
 		Packages:  map[string]string{"base": "npm:@acme/base@1.0.0"},
 		Build:     &piglet.BuildSpec{OutputName: "pig-research"},
+		Slots:     &piglet.Slots{Frontend: &piglet.SlotMember{Member: "./tern"}},
 		Discovery: &piglet.Discovery{Skills: []string{"workspace"}},
 	}
 
-	encoded, err := bakePiglet(source, dir)
+	encoded, err := piglet.Bake(source, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,8 +68,8 @@ func TestBakePigletInlinesAgentShapeAndStripsBuildOrigins(t *testing.T) {
 	if len(got.Skills) != 1 || got.Skills[0].Name != "commit" || got.Skills[0].Description != "Commit style" || got.Skills[0].Content != "Use the repo commit format." || len(got.Skills[0].Origins) != 0 {
 		t.Errorf("skills = %+v", got.Skills)
 	}
-	if len(got.Packages) != 0 || got.Build != nil {
-		t.Errorf("build-only source survived: packages=%+v build=%+v", got.Packages, got.Build)
+	if len(got.Packages) != 0 || got.Build != nil || got.Slots != nil {
+		t.Errorf("build-only source survived: packages=%+v build=%+v slots=%+v", got.Packages, got.Build, got.Slots)
 	}
 	if got.Discovery == nil || !slices.Equal(got.Discovery.Skills, []string{"workspace"}) {
 		t.Errorf("discovery = %+v", got.Discovery)
@@ -76,9 +77,9 @@ func TestBakePigletInlinesAgentShapeAndStripsBuildOrigins(t *testing.T) {
 }
 
 func TestBakePigletRejectsBareSkillName(t *testing.T) {
-	_, err := bakePiglet(&piglet.Piglet{Name: "bad", Skills: []piglet.SkillEntry{{Name: "local-only"}}}, "")
+	_, err := piglet.Bake(&piglet.Piglet{Name: "bad", Skills: []piglet.SkillEntry{{Name: "local-only"}}}, "")
 	if err == nil {
-		t.Fatal("bakePiglet succeeded with bare skill name")
+		t.Fatal("piglet.Bake succeeded with bare skill name")
 	}
 }
 
@@ -114,7 +115,7 @@ func TestAC55BinaryBakePreservesPackageAliasesThroughResolution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	installresolver.SetMaterializer(func(_, source, _ string, _, _ io.Writer) (string, error) {
+	installresolver.SetMaterializer(func(_, source, _ string, _ installresolver.MaterializeOptions, _, _ io.Writer) (string, error) {
 		if source != resolvedPackageDir {
 			t.Fatalf("materializer source = %q, want %q", source, resolvedPackageDir)
 		}
@@ -147,7 +148,7 @@ func TestAC55BinaryBakePreservesPackageAliasesThroughResolution(t *testing.T) {
 		t.Fatalf("Package-backed resolution inputs = package:%+v extension:%+v skill:%+v", packageInput, extensionInput, skillInput)
 	}
 
-	encoded, err := bakePiglet(parsed, root)
+	encoded, err := piglet.Bake(parsed, root)
 	if err != nil {
 		t.Fatal(err)
 	}

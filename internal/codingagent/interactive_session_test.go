@@ -80,6 +80,12 @@ type sessionPair struct {
 
 func newSessionPair(t *testing.T, settings string, contextWindow int, onEvent func(*icodingagent.TestHarness, agent.AgentEvent), replies ...scriptedReply) *sessionPair {
 	t.Helper()
+	return newSessionPairWithTools(t, settings, contextWindow, onEvent, nil, replies...)
+}
+
+// newSessionPairWithTools is newSessionPair with tools the model can call.
+func newSessionPairWithTools(t *testing.T, settings string, contextWindow int, onEvent func(*icodingagent.TestHarness, agent.AgentEvent), tools []agent.AgentTool, replies ...scriptedReply) *sessionPair {
+	t.Helper()
 	home := t.TempDir()
 	t.Setenv("PIG_HOME", home)
 	agentDir := filepath.Join(home, "agent")
@@ -90,21 +96,21 @@ func newSessionPair(t *testing.T, settings string, contextWindow int, onEvent fu
 		t.Fatal(err)
 	}
 	cwd := t.TempDir()
-	services, err := coding.NewServices(coding.ServicesOptions{CWD: cwd, AgentDir: agentDir})
+	services, err := coding.CreateAgentSessionServices(coding.CreateAgentSessionServicesOptions{CWD: cwd, AgentDir: agentDir})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Pi prompt() requires usable auth for the model's provider before it runs.
-	if err := services.Auth().Set("faux", ai.Credential{Type: ai.CredentialAPIKey, Key: "faux-key"}); err != nil {
+	if err := configureFauxAuth(services, "faux-key"); err != nil {
 		t.Fatal(err)
 	}
 	provider := &scriptedProvider{replies: replies}
 	model := &ai.Model{ID: "faux-1", DisplayName: "faux-1", Provider: provider, Capabilities: ai.ModelCapabilities{ContextWindow: contextWindow}}
-	session, err := coding.NewSession(services, coding.SessionOptions{Model: model, SkipBuiltinTools: true})
+	session, err := coding.NewSession(services, coding.SessionOptions{Model: model, SkipBuiltinTools: true, Tools: tools})
 	if err != nil {
 		t.Fatal(err)
 	}
-	harness := icodingagent.NewTestHarness(t, icodingagent.InteractiveOptions{
+	harness := icodingagent.NewTestHarness(t, icodingagent.InteractiveModeOptions{
 		CWD: cwd, AgentDir: agentDir, Model: model,
 		SessionHandle: session, SettingsManager: services.SettingsManager(),
 	}, onEvent)
@@ -176,10 +182,10 @@ func TestInteractiveRetryThenOverflowCompactsAndRetries(t *testing.T) {
 	if got := len(pair.provider.requestLog()); got != 4 {
 		t.Fatalf("model requests = %d, want 4 (retry, overflow compaction, recovered retry)", got)
 	}
-	entries := pair.session.Inner().Entries()
+	entries := pair.session.Inner().GetEntries()
 	var compactions, omissions int
 	for _, entry := range entries {
-		switch entry.Base.Type {
+		switch entry.Base().Type {
 		case "compaction":
 			compactions++
 		case "context_edit":

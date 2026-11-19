@@ -1,5 +1,7 @@
 package codingagent
 
+// pi: packages/coding-agent/src/modes/interactive/components/trust-selector.ts
+
 import (
 	"io"
 	"os"
@@ -11,7 +13,7 @@ import (
 )
 
 type trustCaptureRenderer struct {
-	*tui.TUI
+	*tui.TuiMainScreen
 	capture func()
 }
 
@@ -36,10 +38,10 @@ func TestTrustSelectorProductionSavesParentWithoutActivatingIt(t *testing.T) {
 	input <- []byte("\n")
 	close(input)
 	session := NewSession("trust", cwd)
-	m := &InteractiveMode{opts: InteractiveOptions{AgentDir: agentDir, CWD: cwd, SettingsManager: settings, SessionHandle: &recordingCompactHandle{inner: session}}, editor: tui.NewEditor(), editorContainer: tui.NewContainer(), chatContainer: tui.NewContainer(), modalInputCh: input}
+	m := &InteractiveMode{opts: InteractiveModeOptions{AgentDir: agentDir, CWD: cwd, SettingsManager: settings, SessionHandle: &recordingCompactHandle{inner: session}}, editor: tui.NewEditor(), editorContainer: tui.NewContainer(), chatContainer: tui.NewContainer(), modalInputCh: input}
 	m.layout = tui.NewContainer(m.chatContainer, m.editorContainer)
 	var frames []string
-	m.tuiInst = &trustCaptureRenderer{TUI: tui.NewWithOutput(io.Discard, 220, 40), capture: func() { frames = append(frames, stripANSITest(strings.Join(m.editorContainer.Render(220), "\n"))) }}
+	m.tuiInst = &trustCaptureRenderer{TuiMainScreen: tui.NewWithOutput(io.Discard, 220, 40), capture: func() { frames = append(frames, stripANSITest(strings.Join(m.editorContainer.Render(220), "\n"))) }}
 	if err := trustHandler(m.buildSlashContext(t.Context())); err != nil {
 		t.Fatal(err)
 	}

@@ -1,4 +1,6 @@
 import { Container, getKeybindings, Input, Spacer, sliceByColumn, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, } from "../../../../../pi-tui.mjs";
+import { formatReadLineRange } from "../../../core/tools/render-utils.js";
+import { shortenHomePath } from "../../../utils/paths.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { formatKeyText, keyHint } from "./keybinding-hints.js";
@@ -784,24 +786,11 @@ class TreeList {
         return false;
     }
     formatToolCall(name, args) {
-        const shortenPath = (p) => {
-            const home = process.env.HOME || process.env.USERPROFILE || "";
-            if (home && p.startsWith(home))
-                return `~${p.slice(home.length)}`;
-            return p;
-        };
+        const shortenPath = (p) => shortenHomePath(p, process.env.HOME || process.env.USERPROFILE || "");
         switch (name) {
             case "read": {
                 const path = shortenPath(String(args.path || args.file_path || ""));
-                const offset = args.offset;
-                const limit = args.limit;
-                let display = path;
-                if (offset !== undefined || limit !== undefined) {
-                    const start = offset ?? 1;
-                    const end = limit !== undefined ? start + limit - 1 : "";
-                    display += `:${start}${end ? `-${end}` : ""}`;
-                }
-                return `[read: ${display}]`;
+                return `[read: ${path}${formatReadLineRange(args.offset, args.limit)}]`;
             }
             case "write": {
                 const path = shortenPath(String(args.path || args.file_path || ""));
@@ -1238,6 +1227,9 @@ export class TreeSelectorComponent extends Container {
         this.labelInputContainer.clear();
         this.treeContainer.clear();
         this.treeContainer.addChild(this.treeList);
+    }
+    get capturesViewportInput() {
+        return this.labelInput === null;
     }
     handleInput(keyData) {
         if (this.labelInput) {

@@ -1,14 +1,14 @@
+//go:build !pig_strip_node_extensions
+
 package subprocess
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
 )
@@ -92,13 +92,17 @@ func TestLoadAllPreparesConcurrentlyAndRunsFactoriesInPlanOrder(t *testing.T) {
 		return nil
 	}, func(string) {})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := buildContext(t)
 	defer cancel()
 	loaded, errs := host.LoadAll(ctx, configs)
 	if len(errs) != 0 {
 		t.Fatalf("load errors: %v", errs)
 	}
 
+	// The registry is asked after every extension loaded, in registration order.
+	if failures := applyQueuedRegistrations(host); len(failures) != 0 {
+		t.Fatalf("registration failures: %v", failures)
+	}
 	var planned []string
 	for _, cell := range PlanCells(configs, nil) {
 		planned = append(planned, cellExtNames(cell)...)
@@ -145,7 +149,7 @@ func TestLoadAllConcurrentStartReportsFailuresInPlanOrder(t *testing.T) {
 	}
 	host := NewHost(t.TempDir())
 	defer host.Shutdown("test done")
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := buildContext(t)
 	defer cancel()
 	loaded, errs := host.LoadAll(ctx, configs)
 	if len(loaded) != 1 || loaded[0].Name != "good" {

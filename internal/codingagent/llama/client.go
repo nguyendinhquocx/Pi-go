@@ -11,13 +11,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/MichaelKinsy/PiG/internal/jsnumber"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/nodeurl"
 )
 
 // Ports packages/coding-agent/src/extensions/llama/client.ts.
@@ -47,6 +49,25 @@ type LlamaModelInfoStatus struct {
 type LlamaModelArchitecture struct {
 	InputModalities  []string
 	OutputModalities []string
+	// inputText and outputText hold a modalities member the server sent as a string: JavaScript's includes then matches a substring.
+	inputText, outputText *string
+}
+
+// includesInput and includesOutput are `architecture.input_modalities?.includes(name)` and `output_modalities`: an element of a list, or a substring of
+// a string.
+func (a *LlamaModelArchitecture) includesInput(name string) bool {
+	return a != nil && modalitiesInclude(a.InputModalities, a.inputText, name)
+}
+
+func (a *LlamaModelArchitecture) includesOutput(name string) bool {
+	return a != nil && modalitiesInclude(a.OutputModalities, a.outputText, name)
+}
+
+func modalitiesInclude(list []string, text *string, name string) bool {
+	if text != nil {
+		return strings.Contains(*text, name)
+	}
+	return slices.Contains(list, name)
 }
 
 // LlamaModelMeta mirrors LlamaModelInfo.meta. Pointers keep an absent value
@@ -133,6 +154,12 @@ func decodeModelInfo(value any) (LlamaModelInfo, bool) {
 			info.Architecture = &LlamaModelArchitecture{
 				InputModalities:  stringList(architecture, "input_modalities"),
 				OutputModalities: stringList(architecture, "output_modalities"),
+			}
+			if text, ok := stringField(architecture, "input_modalities"); ok {
+				info.Architecture.inputText = &text
+			}
+			if text, ok := stringField(architecture, "output_modalities"); ok {
+				info.Architecture.outputText = &text
 			}
 		}
 	}
@@ -238,7 +265,7 @@ func parseDownloadProgress(data any) (LlamaProgress, bool) {
 // FormatBytes mirrors client.ts formatBytes.
 func FormatBytes(bytes float64) string {
 	if bytes < 1024 {
-		return jsNumberString(bytes) + " B"
+		return jsnumber.String(bytes) + " B"
 	}
 	units := []string{"KiB", "MiB", "GiB", "TiB"}
 	value := bytes / 1024
@@ -248,41 +275,25 @@ func FormatBytes(bytes float64) string {
 		unit = units[index]
 	}
 	if value >= 10 {
-		return jsToFixed(value, 1) + " " + unit
+		return jsstring.ToFixed(value, 1) + " " + unit
 	}
-	return jsToFixed(value, 2) + " " + unit
-}
-
-// jsNumberString mirrors template-literal number formatting for the byte
-// counts FormatBytes prints below 1 KiB.
-func jsNumberString(value float64) string {
-	return strconv.FormatFloat(value, 'f', -1, 64)
+	return jsstring.ToFixed(value, 2) + " " + unit
 }
 
 // NormalizeLlamaServerURL mirrors client.ts normalizeLlamaServerUrl.
 func NormalizeLlamaServerURL(value string) (string, error) {
-	parsed, err := url.Parse(strings.TrimFunc(value, isJSWhitespace))
-	if err != nil || parsed.Scheme == "" {
+	parsed, err := nodeurl.ParseURL(jsstring.Trim(value))
+	if err != nil {
 		return "", errors.New("Invalid URL")
 	}
-	scheme := strings.ToLower(parsed.Scheme)
-	if scheme != "http" && scheme != "https" {
+	if parsed.Protocol != "http:" && parsed.Protocol != "https:" {
 		return "", errors.New("Server URL must use http or https")
 	}
-	if parsed.Host == "" {
-		return "", errors.New("Invalid URL")
+	path := strings.TrimSuffix(strings.TrimRight(parsed.Pathname, "/"), "/v1")
+	if path == "" {
+		path = "/"
 	}
-	host := strings.ToLower(parsed.Host)
-	if port := parsed.Port(); (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
-		host = strings.TrimSuffix(host, ":"+port)
-	}
-	path := strings.TrimRight(parsed.EscapedPath(), "/")
-	path = strings.TrimSuffix(path, "/v1")
-	userinfo := ""
-	if parsed.User != nil {
-		userinfo = parsed.User.String() + "@"
-	}
-	return strings.TrimSuffix(scheme+"://"+userinfo+host+path, "/"), nil
+	return strings.TrimSuffix(parsed.WithoutHash().WithoutQuery().WithPathname(path), "/"), nil
 }
 
 // LlamaInferenceURL mirrors client.ts llamaInferenceUrl.
@@ -323,7 +334,7 @@ func (c *LlamaClient) request(ctx context.Context, method, path string, body any
 	var encoded []byte
 	if body != nil {
 		var err error
-		if encoded, err = json.Marshal(body); err != nil {
+		if encoded, err = jsstring.MarshalJSON(body); err != nil {
 			return nil, err
 		}
 		headers.Set("Content-Type", "application/json")
@@ -333,9 +344,47 @@ func (c *LlamaClient) request(ctx context.Context, method, path string, body any
 		return nil, err
 	}
 	if !response.ok() {
-		return nil, errors.New(errorMessage(response.payload, fmt.Sprintf("llama.cpp returned HTTP %d", response.status)))
+		return nil, &llamaHTTPError{status: response.status, payload: response.payload, message: errorMessage(response.payload, fmt.Sprintf("llama.cpp returned HTTP %d", response.status))}
 	}
 	return response.payload, nil
+}
+
+// llamaHTTPError is a non-2xx answer. Its text is Pi's: the server's error.message, else "llama.cpp returned HTTP <status>". The status and body stay for the one caller that asks
+// what kind of server answered (explainLlamaSwap).
+type llamaHTTPError struct {
+	status  int
+	payload any
+	message string
+}
+
+func (e *llamaHTTPError) Error() string { return e.message }
+
+// llamaSwapDocsURL is the "llama-swap" section of the llama.cpp page in the docs.
+const llamaSwapDocsURL = "https://github.com/MichaelKinsy/PiG/blob/main/docs/site/docs/llama-cpp.md#llama-swap"
+
+// explainLlamaSwap turns the 404 of /models/load or /models/unload into an explanation when the server is llama-swap. A 404 from a server that is not llama-swap keeps Pi's text.
+func (c *LlamaClient) explainLlamaSwap(ctx context.Context, err error) error {
+	var httpErr *llamaHTTPError
+	if !errors.As(err, &httpErr) || httpErr.status != http.StatusNotFound || !c.isLlamaSwap(ctx, httpErr.payload) {
+		return err
+	}
+	// pig divergence (D212): llama-swap has no /models/load or /models/unload, because it loads a model when a request names it; Pi's /llama ends in the bare "llama.cpp returned HTTP 404" and the user cannot tell why.
+	return fmt.Errorf("/llama cannot load or unload models on llama-swap: it loads a model when a request names it. Add llama-swap to models.json as an openai-completions provider with baseUrl %s/v1, then pick models with /model. See %s", c.ServerURL, llamaSwapDocsURL)
+}
+
+// isLlamaSwap reports whether the server that answered with payload is llama-swap: its error envelope names it in "src", or GET /running lists the running models as {"running": [...]}
+// (a llama.cpp router answers 404 there).
+func (c *LlamaClient) isLlamaSwap(ctx context.Context, payload any) bool {
+	if src, _ := stringField(payload, "src"); src == "llama-swap" {
+		return true
+	}
+	running, err := c.request(ctx, http.MethodGet, "/running", nil)
+	if err != nil {
+		return false
+	}
+	list, _ := objectField(running, "running")
+	_, isList := list.([]any)
+	return isList
 }
 
 // List mirrors LlamaClient.list.
@@ -385,13 +434,13 @@ func (c *LlamaClient) Props(ctx context.Context, model string) (LlamaServerProps
 // Load mirrors LlamaClient.load.
 func (c *LlamaClient) Load(ctx context.Context, model string) error {
 	_, err := c.request(ctx, http.MethodPost, "/models/load", map[string]string{"model": model})
-	return err
+	return c.explainLlamaSwap(ctx, err)
 }
 
 // Unload mirrors LlamaClient.unload.
 func (c *LlamaClient) Unload(ctx context.Context, model string) error {
 	_, err := c.request(ctx, http.MethodPost, "/models/unload", map[string]string{"model": model})
-	return err
+	return c.explainLlamaSwap(ctx, err)
 }
 
 // UnloadAndWait mirrors LlamaClient.unloadAndWait.
@@ -479,7 +528,7 @@ func dispatchFrames(buffer string, onEvent func(LlamaModelEvent)) string {
 		// upstream: coding-agent/src/extensions/llama/client.ts:LlamaModelEvent
 		for line := range strings.SplitSeq(frame, "\n") {
 			if rest, ok := strings.CutPrefix(line, "data:"); ok {
-				data = append(data, strings.TrimLeftFunc(rest, isJSWhitespace))
+				data = append(data, jsstring.TrimStart(rest))
 			}
 		}
 		joined := strings.Join(data, "\n")
@@ -621,7 +670,7 @@ func loadFailure(entry *LlamaModelInfo, eventError string) error {
 		}
 		return errors.New("Model failed to load")
 	}
-	return fmt.Errorf("Model exited with code %s", jsNumberString(*entry.Status.ExitCode))
+	return fmt.Errorf("Model exited with code %s", jsnumber.String(*entry.Status.ExitCode))
 }
 
 // DownloadAndWait mirrors LlamaClient.downloadAndWait.

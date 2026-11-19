@@ -1,5 +1,7 @@
 package toolsearch_test
 
+// pi: packages/coding-agent/src/extensions/tool-search/tool.ts
+
 import (
 	"encoding/json"
 	"reflect"
@@ -69,6 +71,24 @@ func TestBm25RankerRanksByTermRelevanceAndRespectsTheLimit(t *testing.T) {
 	}
 }
 
+// Ports tool-search.test.ts "ranks a tool first when the query is its name" (Pi #11331).
+func TestBm25RankerRanksAToolFirstWhenTheQueryIsItsName(t *testing.T) {
+	named := []toolsearch.Document{
+		toolsearch.CreateDocument(info("mcp__app__queue_read", "Read a queued message of this thread.", ""), nil),
+		toolsearch.CreateDocument(info("mcp__dev-app__thread_read", "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.", ""), nil),
+	}
+	ranker := toolsearch.NewBm25Ranker()
+	for _, query := range []string{"thread_read", "dev_app__thread_read", "mcp__dev-app__thread_read", "Thread_Read", "thread read"} {
+		if got, want := names(ranker.Rank(query, named, 1)), []string{"mcp__dev-app__thread_read"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("%q: %q, want %q", query, got, want)
+		}
+	}
+	// Partial names still rank by BM25.
+	if got, want := names(ranker.Rank("read", named, 1)), []string{"mcp__app__queue_read"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("read: %q, want %q", got, want)
+	}
+}
+
 func TestBm25RankerReturnsNothingForUnknownOrEmptyQueries(t *testing.T) {
 	ranker, documents := toolsearch.NewBm25Ranker(), rankerDocuments()
 	for _, query := range []string{"kubernetes", "the", "tickets"} { // "tickets": known v1 limit, no synonyms.
@@ -109,5 +129,18 @@ func TestBm25RankerIncludesTheNamespaceInstructionsInTheSearchText(t *testing.T)
 	got := toolsearch.NewBm25Ranker().Rank("kubernetes", []toolsearch.Document{document}, 8)
 	if len(got) != 1 || got[0].Name != "mcp__x__run" || got[0].Score <= 0 {
 		t.Fatalf("Rank = %+v", got)
+	}
+}
+
+// packages/coding-agent/src/extensions/tool-search/tool.ts:65-69: the plural folds have length floors: "ies" and the
+// "ches|shes|sses|xes|zes" endings fold above four characters, a bare trailing "s" above three and never after "ss".
+func TestTokenizeFoldsPluralsOnlyAboveTheirLengthFloors(t *testing.T) {
+	for term, want := range map[string]string{
+		"bus": "bus", "abs": "abs", "tabs": "tab", "axes": "axe", "ties": "tie",
+		"cries": "cry", "boxes": "box", "class": "class", "searches": "search", "issues": "issue",
+	} {
+		if got := toolsearch.Tokenize(term); len(got) != 1 || got[0] != want {
+			t.Errorf("Tokenize(%q) = %q, want [%q]", term, got, want)
+		}
 	}
 }

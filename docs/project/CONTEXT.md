@@ -1,5 +1,4 @@
 <!--
-SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
 SPDX-License-Identifier: MIT
 -->
 
@@ -13,7 +12,7 @@ Pi is the upstream TypeScript project at <https://github.com/earendil-works/pi>.
 
 ## PiG
 
-PiG is the Go implementation in this repository. The executable is `pig`. PiG follows the exact Pi release pinned in `internal/coding/pigversion/pigversion.go`.
+PiG is the Go implementation in this repository. The executable is `pig`. PiG follows the exact Pi build pinned in `.upstream/pin` (a release tag, or a pinned commit).
 
 ## Stock PiG
 
@@ -45,6 +44,10 @@ A Piglet release pins the exact Resource closure and executable component plan f
 ## Piglet Binary
 
 A Piglet Binary is a target-native PiG executable built for one immutable Piglet composition. It can contain fused Go extensions and prebuilt Go or Rust extension cells. External services, configuration, secrets, and interpreted runtimes remain external requirements unless the release states otherwise.
+
+## Piglet Image
+
+A Piglet Image is the planned OCI materialization of a Piglet and its runtime environment. It is not in this release. No PiG command produces one, and `pig piglet build --format image` fails.
 
 ## PiG Standard
 

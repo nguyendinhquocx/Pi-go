@@ -53,18 +53,12 @@ func main() {
 	if err := os.Setenv("CLOUDFLARE_GATEWAY_ID", "gate"); err != nil {
 		panic(err)
 	}
-	cloudflareURL, err := ai.ResolveCloudflareBaseURL("cloudflare-ai-gateway", ai.CloudflareAIGatewayCompatBaseURL, ai.ProviderEnv{
+	cloudflareModel := &ai.Model{ProviderMeta: ai.ProviderMetadata{BaseURL: ai.CloudflareAIGatewayCompatBaseURL}}
+	cloudflareURL := ai.ResolveCloudflareModel(cloudflareModel, ai.ProviderEnv{
 		"CLOUDFLARE_ACCOUNT_ID": "acct",
 		"CLOUDFLARE_GATEWAY_ID": "gate",
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	cloudflareUnresolvedURL, err := ai.ResolveCloudflareBaseURL("cloudflare-ai-gateway", ai.CloudflareAIGatewayCompatBaseURL, nil)
-	if err != nil {
-		panic(err)
-	}
+	}).ProviderMeta.BaseURL
+	cloudflareUnresolvedURL := ai.ResolveCloudflareModel(cloudflareModel, nil).ProviderMeta.BaseURL
 
 	cleanupOrder := []string{}
 	unregisterA := ai.RegisterSessionResourceCleanup(func(id string) { cleanupOrder = append(cleanupOrder, "a:"+id) })
@@ -156,7 +150,11 @@ func buildCatalogSnapshot() map[string]any {
 	byProvider := make(map[string]any, len(providers))
 	total := 0
 	for _, provider := range providers {
-		models := ai.ListModels(provider)
+		// D199 parity allowance: OpenRouter's :nitro and :floor variants are PiG's addition; Pi's catalog has none.
+		models := slices.DeleteFunc(ai.ListModels(provider), func(model ai.GeneratedModel) bool {
+			_, _, variant := ai.OpenRouterRoutingVariant(model.Provider, model.ID)
+			return variant
+		})
 		total += len(models)
 		apis := make(map[string]struct{})
 		imageInputCount := 0

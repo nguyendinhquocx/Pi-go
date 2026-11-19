@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -70,7 +71,7 @@ func TestAuthLegacyMigration(t *testing.T) {
 	if cred.Key != "sk-old" {
 		t.Errorf("key: want sk-old got %q", cred.Key)
 	}
-	if raw, err := os.ReadFile(path); err != nil || string(raw) != string(legacy) {
+	if raw, err := os.ReadFile(path); err != nil || !bytes.Equal(raw, legacy) {
 		t.Fatalf("read rewrote auth.json: %s, %v", raw, err)
 	}
 

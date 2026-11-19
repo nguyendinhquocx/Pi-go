@@ -1,5 +1,6 @@
 import { Box, Container, Markdown, Spacer, Text } from "../../../../../pi-tui.mjs";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
+import { keyHint, keyText } from "./keybinding-hints.js";
 /**
  * Component that renders a custom message entry from extensions.
  * Uses distinct styling to differentiate from user messages.
@@ -49,7 +50,7 @@ export class CustomMessageComponent extends Container {
         // Try custom renderer first - it handles its own styling
         if (this.customRenderer) {
             try {
-                const component = this.customRenderer(this.message, { expanded: this._expanded, outputPad: this.outputPad }, theme);
+                const component = this.customRenderer(this.message, { expanded: this._expanded, outputPad: this.outputPad, keyText, keyHint }, theme);
                 if (component) {
                     // Custom renderer provides its own styled component
                     this.customComponent = component;
@@ -64,6 +65,7 @@ export class CustomMessageComponent extends Container {
         // Default rendering uses our box
         this.addChild(this.box);
         this.box.clear();
+        this.box.setPaddingX(this.outputPad);
         // Default rendering: label + content
         const label = theme.fg("customMessageLabel", `\x1b[1m[${this.message.customType}]\x1b[22m`);
         this.box.addChild(new Text(label, 0, 0));

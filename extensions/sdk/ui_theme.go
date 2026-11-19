@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
 // SPDX-License-Identifier: MIT
 
 package sdk
@@ -10,6 +9,8 @@ import (
 	"maps"
 	"math"
 	"strings"
+
+	"github.com/MichaelKinsy/PiG/extensions/sdk/tui"
 )
 
 // UITheme is the host's active theme as extensions see it (upstream
@@ -27,6 +28,9 @@ type UITheme struct {
 	// SourcePath is upstream Theme.sourcePath: the file a custom theme was
 	// loaded from, empty for a built-in theme.
 	SourcePath string
+	// SourceInfo is upstream Theme.sourceInfo: where the resource loader found
+	// the theme, nil for a theme it did not load.
+	SourceInfo *SourceInfo
 
 	foregrounds map[string]string
 	backgrounds map[string]string
@@ -48,6 +52,7 @@ type themePalette struct {
 	Mode        any            `json:"mode"`
 	Appearance  any            `json:"appearance"`
 	Colors      map[string]any `json:"colors"`
+	SourceInfo  *SourceInfo    `json:"sourceInfo"`
 }
 
 // decodeUITheme builds a UITheme from a host palette, as ThemeShim.setPalette
@@ -78,6 +83,7 @@ func decodeUITheme(raw json.RawMessage) (UITheme, bool) {
 	if path, ok := palette.SourcePath.(string); ok {
 		theme.SourcePath = path
 	}
+	theme.SourceInfo = palette.SourceInfo
 	if mode, ok := palette.Mode.(string); ok && mode == "256color" {
 		theme.mode = mode
 	}
@@ -134,11 +140,11 @@ const faintOpening = "\x1b[2m"
 
 // Fg colors text with the foreground of token and resets the foreground, and
 // the faint attribute of a faint token (upstream Theme.fg, theme.ts:363). An
-// unknown token leaves text uncolored.
+// unknown token panics with upstream's "Unknown theme color: <token>" error (theme.ts:374), which the dispatcher reports as an extension error as a throw is; a theme without a palette leaves text uncolored.
 func (t UITheme) Fg(token, text string) string {
 	open := t.foregrounds[token]
 	if open == "" {
-		return text
+		return t.unknownOrUncolored(token, text)
 	}
 	if strings.HasSuffix(open, faintOpening) {
 		return open + text + "\x1b[22;39m"
@@ -147,20 +153,65 @@ func (t UITheme) Fg(token, text string) string {
 }
 
 // Bg colors text with the background of token and resets only the
-// background. An unknown token leaves text uncolored.
+// background. An unknown token panics like [UITheme.Fg].
 func (t UITheme) Bg(token, text string) string {
 	open := t.backgrounds[token]
 	if open == "" {
-		return text
+		return t.unknownOrUncolored(token, text)
 	}
 	return open + text + "\x1b[49m"
 }
 
-func (t UITheme) style(open, closing, text string) string {
-	if t.noModifiers {
+func (t UITheme) unknownOrUncolored(token, text string) string {
+	if len(t.foregrounds) == 0 && len(t.backgrounds) == 0 {
 		return text
 	}
+	panic(fmt.Errorf("Unknown theme color: %s", token))
+}
+
+// style is chalk's applyStyle for one modifier, which upstream Theme's bold,
+// italic, underline, inverse and strikethrough are (theme.ts:378-396; chalk
+// 6.0.0 source/index.js applyStyle, source/utilities.js): an empty text stays
+// empty, an inner close of the style re-opens it, and each line break (CR LF
+// kept together) is closed before and re-opened after.
+func (t UITheme) style(open, closing, text string) string {
+	if t.noModifiers || text == "" {
+		return text
+	}
+	if strings.Contains(text, "\x1b") {
+		text = strings.ReplaceAll(text, closing, closing+open)
+	}
+	if strings.Contains(text, "\n") {
+		text = encaseLineBreaks(text, closing, open)
+	}
 	return open + text + closing
+}
+
+// encaseLineBreaks is chalk's stringEncaseCRLFWithFirstIndex: prefix before
+// and postfix after every "\n", a preceding "\r" staying with it.
+func encaseLineBreaks(text, prefix, postfix string) string {
+	var out strings.Builder
+	out.Grow(len(text) + strings.Count(text, "\n")*(len(prefix)+len(postfix)))
+	end := 0
+	for index := strings.IndexByte(text, '\n'); index != -1; index = indexByteFrom(text, '\n', end) {
+		if index > 0 && text[index-1] == '\r' {
+			out.WriteString(text[end : index-1])
+			out.WriteString(prefix + "\r\n" + postfix)
+		} else {
+			out.WriteString(text[end:index])
+			out.WriteString(prefix + "\n" + postfix)
+		}
+		end = index + 1
+	}
+	out.WriteString(text[end:])
+	return out.String()
+}
+
+func indexByteFrom(text string, c byte, from int) int {
+	if index := strings.IndexByte(text[from:], c); index != -1 {
+		return from + index
+	}
+	return -1
 }
 
 // Bold draws text bold.
@@ -189,11 +240,11 @@ func (t UITheme) GetFgAnsi(token string) (string, error) {
 }
 
 // GetBgAnsi returns the background escape sequence of token, or upstream's
-// "Unknown theme background color" error.
+// "Unknown theme color" error.
 func (t UITheme) GetBgAnsi(token string) (string, error) {
 	ansi := t.backgrounds[token]
 	if ansi == "" {
-		return "", fmt.Errorf("Unknown theme background color: %s", token)
+		return "", fmt.Errorf("Unknown theme color: %s", token)
 	}
 	return ansi, nil
 }
@@ -258,6 +309,19 @@ type TextAttributes struct {
 	Bold, Dim, Italic, Underline, Inverse, Strikethrough bool
 }
 
+// tuiColor is c as the pi-tui color the helpers render: the conversions and SGR rendering are package tui's, so the SDK has one implementation.
+func tuiColor(c Color) tui.Color {
+	switch c := c.(type) {
+	case IndexedColor:
+		return tui.IndexedColor(c)
+	case RgbColorValue:
+		return tui.RgbColorValue(c)
+	case OklchColorValue:
+		return tui.OklchColorValue(c)
+	}
+	return nil
+}
+
 // ThemeStyle is the style [UITheme.Style] applies (upstream ThemeStyle): a foreground and a background, each a theme token or a concrete Color, and text attributes. Upstream's one `fg` field holds a token or a Color; Go uses a field per form. Setting both the token and the color of a slot is an error.
 type ThemeStyle struct {
 	TextAttributes
@@ -291,7 +355,7 @@ func (t UITheme) Style(text string, style ThemeStyle) (string, error) {
 		}
 		fgAnsi = ansi
 	case style.Fg != nil:
-		fgAnsi = colorAnsi(style.Fg, t.GetColorMode(), false)
+		fgAnsi = tui.ForegroundAnsi(tuiColor(style.Fg), tui.TerminalColorMode(t.GetColorMode()))
 	}
 	switch {
 	case style.BgToken != "":
@@ -301,9 +365,9 @@ func (t UITheme) Style(text string, style ThemeStyle) (string, error) {
 		}
 		bgAnsi = ansi
 	case style.Bg != nil:
-		bgAnsi = colorAnsi(style.Bg, t.GetColorMode(), true)
+		bgAnsi = tui.BackgroundAnsi(tuiColor(style.Bg), tui.TerminalColorMode(t.GetColorMode()))
 	}
-	return styleTextWithAnsi(text, fgAnsi, bgAnsi, attributes), nil
+	return tui.StyleTextWithAnsi(text, fgAnsi, bgAnsi, tui.TextAttributes(attributes)), nil
 }
 
 // UITheme returns a snapshot of the host's active theme (upstream

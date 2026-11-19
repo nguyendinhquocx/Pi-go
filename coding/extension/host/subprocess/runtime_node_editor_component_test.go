@@ -58,6 +58,8 @@ runtime.applyState({ thinkingLevel: "high", keybindings: { definitions, userBind
 runtime.ui.theme.setPalette({ name: "t", foregrounds: { borderMuted: "\x1b[31m", thinkingHigh: "\x1b[32m", bashMode: "\x1b[33m", accent: "\x1b[34m", muted: "\x1b[35m", thinkingOff: "\x1b[36m" }, backgrounds: {}, modifiers: true, mode: "truecolor" });
 
 class Modal extends pigAgent.CustomEditor {
+  invalidated = 0;
+  invalidate() { this.invalidated++; super.invalidate(); }
   handleInput(data) {
     if (data === "!") { this.mode = "normal"; return; }
     super.handleInput(data);
@@ -148,6 +150,11 @@ runtime.handleNotify({ method: "ui.editor.configure", args: { key, paddingX: 1, 
 assert.equal(editor.borderColor("x"), "\x1b[36mx\x1b[39m", "thinking level change");
 assert.equal(editor.focused, false);
 
+// The theme changed: Pi's TUI calls invalidate() on the editor it holds.
+const invalidatedBefore = editor.invalidated;
+runtime.handleNotify({ method: "ui.editor.invalidate", args: { key } });
+assert.equal(editor.invalidated, invalidatedBefore + 1, "invalidate reached the component");
+
 // Autocomplete asks the host and shows its items.
 runtime.handleNotify({ method: "ui.editor.input", args: { key, data: "/" } });
 for (let i = 0; i < 50 && !take("ui.editor.render").at(-1).args.lines.some((l) => l.includes("Select model")); i++) {
@@ -216,6 +223,24 @@ assert.match(take("ui.editor.render").at(-1).args.lines[0], /── .*A.*Compact
 statusConfig.workingStatus.frames = [];
 runtime.handleNotify({ method: "ui.editor.configure", args: statusConfig });
 assert.match(take("ui.editor.render").at(-1).args.lines[0], /── .*Compacting context/);
+// Pi 1.2.0 (#10810) passes the embedded editor's border color to CompactionStatusIndicator (interactive-mode.ts compaction_start
+// colorFn, status-indicator.ts colorFn), so the spinner and label take the border color, not the host's accent and muted.
+statusConfig.workingStatus = { kind: "compaction", message: "Compacting context... (escape to cancel)", frames: ["A", "B"], frame: 1,
+  spinnerColor: "\x1b[34m", messageColor: "\x1b[35m", indicatorVerbatim: false };
+const compactionStatus = new piStatus.StatusIndicator("compaction", undefined,
+  (text) => oracleEditor.borderColor(text), (text) => oracleEditor.borderColor(text),
+  "Compacting context... (escape to cancel)", { frames: [] });
+compactionStatus.frames = ["A", "B"];
+compactionStatus.currentFrame = 1;
+compactionStatus.renderIndicatorVerbatim = false;
+compactionStatus.invalidate();
+oracleEditor.setText("");
+oracleEditor.setWorkingStatusIndicator(compactionStatus);
+for (const width of [12, 60]) {
+  runtime.ready.width = width;
+  runtime.handleNotify({ method: "ui.editor.configure", args: statusConfig });
+  assert.deepEqual(take("ui.editor.render").at(-1).args.lines, oracleEditor.render(width), "Pi compaction border rows at width " + width);
+}
 statusConfig.workingStatus = null;
 runtime.handleNotify({ method: "ui.editor.configure", args: statusConfig });
 assert.doesNotMatch(take("ui.editor.render").at(-1).args.lines[0], /Working|Indexing|Compacting/);

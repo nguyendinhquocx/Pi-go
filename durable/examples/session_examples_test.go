@@ -1,4 +1,4 @@
-// Ports packages/durable/test/examples/00-conversation.ts through 05-watches.ts.
+// Ports packages/durable/test/examples/00-conversation.ts through 04-watches.ts.
 
 package examples_test
 
@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"reflect"
-	"sync"
 	"testing"
 
 	"github.com/MichaelKinsy/PiG/chord"
@@ -136,9 +135,8 @@ func TestExample03OwnedConversations(t *testing.T) {
 		},
 	})
 	registryDoc := durable.DefineDoc(durable.DocDefinition[agentRegistry]{
-		CommonDocDefinition: durable.CommonDocDefinition[agentRegistry]{Kind: "example.agent-registry", Version: 1},
+		CommonDocDefinition: durable.CommonDocDefinition[agentRegistry]{Kind: "example.agent-registry", Version: 1, Initial: func() agentRegistry { return agentRegistry{Agents: map[string]agentRef{}} }, CheckpointWhen: func(agentRegistry, []durable.Op, durable.CheckpointInfo) bool { return false }},
 		DocumentSemantics:   durable.DocumentSemantics{Scope: durable.ScopeConversation, History: durable.HistoryLatest, Fork: durable.ForkInitial},
-		Initial:             func() agentRegistry { return agentRegistry{Agents: map[string]agentRef{}} },
 	})
 
 	main := commit(t, session, func(tx durable.Tx) (durable.ConversationRecord, error) { return tx.CreateConversation(ownerless) })
@@ -185,57 +183,8 @@ func TestExample03OwnedConversations(t *testing.T) {
 	closeSession(t, session)
 }
 
-// 04-chord-state.ts: documentState() never creates a document; it returns a hydrated read-only Chord state.
-func TestExample04ChordState(t *testing.T) {
-	session := newSession(t)
-	chat := commit(t, session, func(tx durable.Tx) (durable.ConversationRecord, error) {
-		conversation, err := tx.CreateConversation(ownerless)
-		if err != nil {
-			return conversation, err
-		}
-		return conversation, setNotes(tx, conversation.Id, "first")
-	})
-	notesState, err := session.DocumentStateErased(background, notesDoc, chat.Id)
-	if err != nil || notesState == nil {
-		t.Fatalf("notes are absent: %v %v", notesState, err)
-	}
-	type frame struct {
-		kind     chord.DeliveryKind
-		sequence int
-		text     string
-	}
-	var mu sync.Mutex
-	var frames []frame
-	stopNotes, err := notesState.Subscribe(func(value durable.JsonObject, _ context.Context, delivery chord.ReplicatedStateDelivery) {
-		mu.Lock()
-		defer mu.Unlock()
-		text, _ := value["text"].(string)
-		frames = append(frames, frame{delivery.Kind, delivery.Sequence, text})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	commit(t, session, func(tx durable.Tx) (struct{}, error) {
-		return struct{}{}, setNotes(tx, chat.Id, "published through Chord")
-	})
-	eventually(t, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(frames) == 2
-	})
-	stopNotes()
-	notesState.Dispose()
-	mu.Lock()
-	defer mu.Unlock()
-	want := []frame{{chord.DeliveryHydrate, 0, "first"}, {chord.DeliveryUpdate, 1, "published through Chord"}}
-	if !reflect.DeepEqual(frames, want) {
-		t.Fatalf("Chord notes: %+v, want %+v", frames, want)
-	}
-	closeSession(t, session)
-}
-
-// 05-watches.ts: a watch serializes asynchronous document work from one stable acquisition revision.
-func TestExample05Watches(t *testing.T) {
+// 04-watches.ts: a watch serializes asynchronous document work from one stable acquisition revision.
+func TestExample04Watches(t *testing.T) {
 	session := newSession(t)
 	chat := commit(t, session, func(tx durable.Tx) (durable.ConversationRecord, error) {
 		conversation, err := tx.CreateConversation(ownerless)
@@ -248,12 +197,16 @@ func TestExample05Watches(t *testing.T) {
 	if err != nil || notesWatch == nil {
 		t.Fatalf("notes are absent: %v %v", notesWatch, err)
 	}
-	if baseline, _ := notesWatch.Value()["text"].(string); baseline != "first" {
+	if baseline, _ := notesWatch.Value().Value("text").(string); baseline != "first" {
 		t.Fatalf("watch baseline: %q", baseline)
 	}
 	updates := make(chan string, 1)
-	notesWatch.Start(func(_ context.Context, value durable.JsonObject, _ []durable.Op) error {
-		text, _ := value["text"].(string)
+	notesWatch.Start(func(_ context.Context, change chord.WatchCall[durable.JsonObject]) error {
+		if change.Kind != chord.WatchCallValue {
+			return nil
+		}
+		value := change.Value
+		text, _ := value.Value("text").(string)
 		select {
 		case updates <- text:
 		default:

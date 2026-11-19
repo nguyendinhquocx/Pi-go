@@ -10,7 +10,7 @@ import (
 	"slices"
 	"strings"
 
-	semver "github.com/Masterminds/semver/v3"
+	semver "github.com/MichaelKinsy/PiG/third_party/semver"
 
 	"github.com/MichaelKinsy/PiG/coding/extension/installresolver"
 	"github.com/MichaelKinsy/PiG/coding/packagecontent"
@@ -51,6 +51,27 @@ type lineageVisit struct {
 // identity.
 type ResolveOptions struct {
 	Workspace string
+	// AllowInstallScripts lets the package manager run the lifecycle scripts of the npm and Git Packages the Piglet names. The zero value installs them with scripts disabled.
+	//
+	// pig additive (D194): Piglet resolution installs Packages without running lifecycle scripts unless the user opts in.
+	AllowInstallScripts bool
+	// Base, when set, is the Piglet the chain's root implicitly extends: a Piglet Binary's baked Piglet, offered as the base of an overlay selected at launch. The resolved Piglet keeps the base's name and cannot replace, remove or widen what the base baked.
+	//
+	// pig additive (D202): a Piglet Binary can declare that it accepts overlay Piglets.
+	Base *OverlayBase
+}
+
+// BakedSkill reports whether the skill is one the Piglet Binary baked and the overlay left as it was: it has no file, so its
+// location is the Binary's, not the overlay's. It is false for a Piglet that is no overlay.
+func (p *Piglet) BakedSkill(name string) bool { return p != nil && p.bakedSkills[name] }
+
+// OverlayOf names the Piglet Binary this Piglet is an overlay of (D202), or reports false when it is not one. A Piglet Binary's
+// baked Piglet is no overlay; one that resolved a Piglet selected at launch is.
+func (p *Piglet) OverlayOf() (binary string, ok bool) {
+	if p == nil || len(p.lineage) == 0 {
+		return "", false
+	}
+	return strings.CutPrefix(p.lineage[0].Source, "binary:")
 }
 
 // ResolveEffective resolves with no workspace anchor. Piglets that require a
@@ -75,7 +96,17 @@ func ResolveEffectiveWithOptions(path string, options ResolveOptions) (*Effectiv
 
 func resolveEffectiveRoot(canonical string, options ResolveOptions) (*EffectiveResolution, error) {
 	resolved, err := resolveEffective(canonical, "local:"+filepath.ToSlash(filepath.Base(canonical)), nil, 0, options)
+	if err == nil && options.Base != nil {
+		err = checkOverlay(options.Base.Piglet, resolved.Piglet)
+		resolved.Piglet.Name = options.Base.Piglet.Name
+		if err == nil {
+			resolved.Piglet.bakedSkills = unchangedBakedSkills(options.Base.Piglet, resolved.Piglet)
+		}
+	}
 	if err != nil {
+		if options.Base != nil {
+			return nil, fmt.Errorf("overlay %s on Piglet Binary %q: %w", canonical, options.Base.Piglet.Name, err)
+		}
 		return nil, err
 	}
 	var graph strings.Builder
@@ -84,6 +115,7 @@ func resolveEffectiveRoot(canonical string, options ResolveOptions) (*EffectiveR
 	}
 	resolved.GraphDigest = digestPigletBytes([]byte(graph.String()))
 	resolved.EffectiveDigest = digestPigletBytes([]byte("effective-v1\x00" + resolved.GraphDigest))
+	resolved.Piglet.installScripts = options.AllowInstallScripts
 	resolved.Piglet.lineage = slices.Clone(resolved.Lineage)
 	resolved.Piglet.effectiveDigest = resolved.EffectiveDigest
 	resolved.Piglet.graphDigest = resolved.GraphDigest
@@ -119,7 +151,15 @@ func resolveEffective(path, sourceIdentity string, visits []lineageVisit, depth 
 	}
 	visits = append(slices.Clone(visits), lineageVisit{path: path, digest: digest})
 
-	if p.Extends == nil {
+	// pig additive (D202): an extends block that names no source extends the Piglet Binary the Piglet is selected on, so an
+	// overlay can spell extends.remove and extends.allowWiden without another Piglet to name.
+	if p.Extends != nil && p.Extends.Source == "" && options.Base == nil {
+		return nil, fmt.Errorf("Piglet %s: extends.source is required unless a Piglet Binary that is not built closed runs the Piglet as an overlay", path)
+	}
+	if p.Extends == nil || p.Extends.Source == "" {
+		if options.Base != nil {
+			return resolveOverlayRoot(p, entry, digest, options.Base)
+		}
 		effective := clearDerivationMetadata(p)
 		if err := effective.Validate(); err != nil {
 			return nil, fmt.Errorf("effective Piglet %s: %w", path, err)
@@ -246,6 +286,9 @@ func mergePiglets(base, child *Piglet) (*Piglet, error) {
 	if child.present["discovery"] {
 		result.Discovery = child.Discovery
 	}
+	if child.present["contextFiles"] {
+		result.ContextFiles = child.ContextFiles
+	}
 	if child.present["systemPrompt"] {
 		result.SystemPrompt = child.SystemPrompt
 	}
@@ -259,12 +302,25 @@ func mergePiglets(base, child *Piglet) (*Piglet, error) {
 	if child.present["secrets"] {
 		result.Secrets = slices.Clone(child.Secrets)
 	}
+	if child.present["slots"] && child.Slots != nil && child.Slots.Frontend != nil {
+		if result.Slots == nil {
+			result.Slots = &Slots{}
+		}
+		member := *child.Slots.Frontend
+		result.Slots.Frontend = &member
+	}
+	// pig additive (D92): strip lists merge down the extends chain; keep mode
+	// is inherited per list.
+	var err error
+	result.Strip, err = mergeStrip(result.Strip, child.Strip)
+	if err != nil {
+		return nil, err
+	}
 
 	if result.Packages == nil {
 		result.Packages = map[string]string{}
 	}
 	maps.Copy(result.Packages, child.Packages)
-	var err error
 	result.Extensions, err = mergeNamed(result.Extensions, child.Extensions, func(v ExtensionEntry) string { return v.Name })
 	if err != nil {
 		return nil, err
@@ -321,6 +377,18 @@ func applyRemovals(p *Piglet, remove *RemoveSpec) error {
 		return err
 	}
 	p.Skills, err = removeNamed(p.Skills, remove.Skills, func(v SkillEntry) string { return v.Name }, "skills")
+	if err != nil {
+		return err
+	}
+	for _, id := range remove.Slots {
+		// validateSlots admits only known slot IDs, and frontend is the only
+		// one.
+		if p.Slots == nil || p.Slots.Frontend == nil {
+			return fmt.Errorf("remove.slots: %q is absent", id)
+		}
+		p.Slots = nil
+	}
+	p.Strip, err = removeStrip(p.Strip, remove.Strip)
 	return err
 }
 
@@ -408,6 +476,9 @@ func rejectUnsafeWidening(base, child *Piglet) error {
 	if child.present["discovery"] && discoveryWidens(base.Discovery, child.Discovery) {
 		widened = append(widened, "discovery")
 	}
+	if child.present["contextFiles"] && base.ContextFiles == ContextFilesTrustedOnly && child.ContextFiles != ContextFilesTrustedOnly {
+		widened = append(widened, "contextFiles")
+	}
 	if child.present["agentEnv"] && agentEnvironmentWidens(base.AgentEnv, child.AgentEnv) {
 		widened = append(widened, "agentEnv")
 	}
@@ -419,6 +490,10 @@ func rejectUnsafeWidening(base, child *Piglet) error {
 		if previous, exists := baseExtensions[extension.Name]; exists && extensionWidens(previous, extension) {
 			widened = append(widened, "extension/"+extension.Name)
 		}
+	}
+	// pig additive (D92): re-enabling an inherited strip entry widens the base.
+	if child.Extends != nil && child.Extends.Remove != nil {
+		widened = append(widened, stripWidening(child.Extends.Remove.Strip)...)
 	}
 	if len(widened) > 0 {
 		slices.Sort(widened)
@@ -544,6 +619,13 @@ func anchorPigletLocalPaths(p *Piglet, path, workspace string) error {
 			return fmt.Errorf("systemPrompt.file: %w", err)
 		}
 		p.SystemPrompt.File = anchored
+	}
+	if p.Slots != nil && p.Slots.Frontend != nil {
+		anchored, err := anchorPigletPath(base, p.Slots.Frontend.Member)
+		if err != nil {
+			return fmt.Errorf("slots.frontend.member: %w", err)
+		}
+		p.Slots.Frontend.dir = anchored
 	}
 	if p.AgentEnv != nil && p.AgentEnv.Source != "" {
 		anchored, err := anchorTypedLocalSource(p.AgentEnv.Source, base, sourceref.BareNPM)
@@ -707,6 +789,8 @@ func clonePiglet(p *Piglet) *Piglet {
 			remove.Packages = slices.Clone(remove.Packages)
 			remove.Extensions = slices.Clone(remove.Extensions)
 			remove.Skills = slices.Clone(remove.Skills)
+			remove.Slots = slices.Clone(remove.Slots)
+			remove.Strip = cloneStrip(remove.Strip)
 			value.Remove = &remove
 		}
 		extends = &value
@@ -766,6 +850,15 @@ func clonePiglet(p *Piglet) *Piglet {
 		value.Targets = slices.Clone(value.Targets)
 		build = &value
 	}
+	var slots *Slots
+	if p.Slots != nil {
+		value := *p.Slots
+		if value.Frontend != nil {
+			member := *value.Frontend
+			value.Frontend = &member
+		}
+		slots = &value
+	}
 	var release *ReleaseSpec
 	if p.Release != nil {
 		value := *p.Release
@@ -774,8 +867,8 @@ func clonePiglet(p *Piglet) *Piglet {
 	return &Piglet{
 		Name: p.Name, Description: p.Description,
 		Extends: extends, BuiltinTools: cloneStringList(p.BuiltinTools), Packages: maps.Clone(p.Packages), Extensions: extensions, Skills: skills,
-		Discovery: discovery, SystemPrompt: prompt, AgentEnv: environment, Model: model,
-		Build: build, Release: release, Secrets: slices.Clone(p.Secrets),
+		Discovery: discovery, ContextFiles: p.ContextFiles, SystemPrompt: prompt, AgentEnv: environment, Model: model, Slots: slots,
+		Build: build, Release: release, Secrets: slices.Clone(p.Secrets), Strip: cloneStrip(p.Strip),
 		sourceDir: p.sourceDir, sourcePath: p.sourcePath, present: maps.Clone(p.present), nullFields: maps.Clone(p.nullFields),
 		lineage: slices.Clone(p.lineage), effectiveDigest: p.effectiveDigest, graphDigest: p.graphDigest,
 		workspaceRoot: p.workspaceRoot, devContainerPath: p.devContainerPath,

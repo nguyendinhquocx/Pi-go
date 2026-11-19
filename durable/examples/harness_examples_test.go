@@ -1,5 +1,5 @@
-// Ports packages/durable/test/examples/06-harness.ts, 07-configuration.ts, 08-harness-conversations.ts and
-// 10-registry-reload.ts.
+// Ports packages/durable/test/examples/05-harness.ts, 06-configuration.ts, 07-harness-conversations.ts and
+// 09-registry-reload.ts.
 
 package examples_test
 
@@ -28,7 +28,7 @@ func exampleTool(name, description string) *durable.ToolRegistration {
 		},
 		Execute: func(_ context.Context, args any, _ durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			path, _ := args.(map[string]any)["path"].(string)
-			return durable.ToolExecutionResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: name + " " + path}}}, nil
+			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{ai.TextContent{Text: name + " " + path}}}, nil
 		},
 	}
 }
@@ -82,8 +82,8 @@ func expectEqual(t *testing.T, what string, got, want any) {
 	}
 }
 
-// 06-harness.ts: a Harness over a Session resolves each conversation's agent from a registry of extensions.
-func TestExample06Harness(t *testing.T) {
+// 05-harness.ts: a Harness over a Session resolves each conversation's agent from a registry of extensions.
+func TestExample05Harness(t *testing.T) {
 	read := exampleTool("read", "Read a file")
 	registry := harness.CreateRegistry()
 	installed(t, registry, new(durable.Extension{Name: "files", Tools: []*durable.ToolRegistration{read}}))
@@ -120,8 +120,10 @@ func TestExample06Harness(t *testing.T) {
 	closeSession(t, opened)
 }
 
-// 07-configuration.ts: a conversation stores its agent configuration; the registry and settings resolve live.
-func TestExample07Configuration(t *testing.T) {
+// 06-configuration.ts: a conversation stores its agent configuration; the registry and settings resolve live.
+// Pi source: packages/durable/src/harness/registry.ts
+// mutation-checked: zeroing the results of Registry.Uninstall fails it
+func TestExample06Configuration(t *testing.T) {
 	read := exampleTool("read", "Read a file")
 	write := exampleTool("write", "Write a file")
 	grep := exampleTool("grep", "Search files")
@@ -165,7 +167,7 @@ func TestExample07Configuration(t *testing.T) {
 	if err := root.Configure(background, harness.AgentChange{
 		Model:         harness.SetTo(model),
 		ThinkingLevel: harness.SetTo(ai.ModelThinkingLevel("high")),
-		Tools:         harness.SetTo(harness.ToolChange{Exact: true, List: []*durable.ToolRegistration{write, read}}),
+		Tools:         harness.SetTo(harness.ToolChange{List: []*durable.ToolRegistration{write, read}}),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +185,7 @@ func TestExample07Configuration(t *testing.T) {
 	expectEqual(t, "configured tools", toolNames(t, root), []string{"write", "read"})
 
 	if err := root.Configure(background, harness.AgentChange{
-		Extensions: harness.SetTo(harness.ExtensionChange{Remove: []*durable.Extension{search}}),
+		Extensions: harness.SetTo(harness.ExtensionChange{Edit: &harness.ExtensionEdit{Remove: []*durable.Extension{search}}}),
 		Tools:      harness.Cleared[harness.ToolChange](),
 	}); err != nil {
 		t.Fatal(err)
@@ -191,7 +193,7 @@ func TestExample07Configuration(t *testing.T) {
 	expectEqual(t, "without search", toolNames(t, root), []string{"read", "write"})
 
 	if err := root.Configure(background, harness.AgentChange{
-		Extensions: harness.SetTo(harness.ExtensionChange{Exact: true, List: []*durable.Extension{files, search}}),
+		Extensions: harness.SetTo(harness.ExtensionChange{List: []*durable.Extension{files, search}}),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -213,8 +215,8 @@ type messageData struct {
 	From string `json:"from"`
 }
 
-// 08-harness-conversations.ts: typed entries, helper conversations, forks and lookup.
-func TestExample08HarnessConversations(t *testing.T) {
+// 07-harness-conversations.ts: typed entries, helper conversations, forks and lookup.
+func TestExample07HarnessConversations(t *testing.T) {
 	opened := openHarness(t, harness.CreateRegistry(), nil)
 	root, err := opened.Root(background, nil)
 	if err != nil {
@@ -262,8 +264,8 @@ func must[T any](value T, err error) T {
 	return value
 }
 
-// 10-registry-reload.ts: reinstalling an extension, adding a wrapper and uninstalling it reach every conversation.
-func TestExample10RegistryReload(t *testing.T) {
+// 09-registry-reload.ts: reinstalling an extension, adding a wrapper and uninstalling it reach every conversation.
+func TestExample09RegistryReload(t *testing.T) {
 	read := exampleTool("read", "Read a file")
 	registry := harness.CreateRegistry()
 	installed(t, registry, new(durable.Extension{Name: "files", Tools: []*durable.ToolRegistration{read, exampleTool("grep", "Search files")}}))
@@ -278,7 +280,7 @@ func TestExample10RegistryReload(t *testing.T) {
 
 	audit := new(durable.Extension{
 		Name: "audit",
-		Wraps: []durable.Wrap{{Tool: "read", WrapTool: func(tool *durable.ToolRegistration) *durable.ToolRegistration {
+		Wraps: []durable.Wrap{durable.ToolWrap{Tool: "read", Wrap: func(tool *durable.ToolRegistration) *durable.ToolRegistration {
 			wrapped := *tool
 			wrapped.Description = tool.Description + " (audited)"
 			return &wrapped

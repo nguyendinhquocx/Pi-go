@@ -22,8 +22,8 @@ Set `sessionDir` in [settings](settings.md) to store sessions elsewhere.
 | `/new` | Start a session with no history |
 | `/resume` | Open the session picker |
 | `/tree` | Show the session as a tree and move to any point |
-| `/fork` | Continue from the current point in a new session |
-| `/clone` | Copy the session |
+| `/fork` | Select a user message and continue from before it in a new session |
+| `/clone` | Duplicate the active branch at the current position and switch to the copy |
 | `/name` | Give the session a name |
 | `/export` | Write the session to a file |
 | `/share` | Upload the session to PiG's unlisted, expiring share service. |
@@ -34,13 +34,15 @@ Set `sessionDir` in [settings](settings.md) to store sessions elsewhere.
 
 HTML export requires a Session file that has been written. `/export` uses the first path argument, with optional quotes, exactly as supplied. It does not append `.html` or create parent directories. Use a `.jsonl` path to export the current branch as JSON Lines.
 
-After `/clone`, `/new`, or `/resume`, the transcript and footer reflect the current Session. Resuming an unnamed Session clears the previous name.
+After `/fork`, `/clone`, `/new`, or `/resume`, the transcript and footer reflect the current Session. Resuming an unnamed Session clears the previous name.
 
 ## Sharing a session
 
 Run `/share` to upload the active branch, including an in-memory Session, to `https://pi-in-go.dev` (D64). PiG shows a privacy notice before it uploads. The artifact includes prompts, model responses, tool calls, tool output, the effective system prompt, and active tool schemas.
 
 A share is unlisted, not private. Anyone with its URL can read and download it. The service accepts artifacts up to 8 MiB and deletes them after 30 days. Press `Escape` while the upload indicator is open to cancel the request. PiG never uploads a Session automatically. Use `/export` instead when the Session must stay local.
+
+Pi's `sessionShareDestination` setting (`auto`, `gist`, or `radius`) has no effect in PiG. PiG never uploads a share to Radius or a GitHub gist (D64).
 
 ## The session tree
 

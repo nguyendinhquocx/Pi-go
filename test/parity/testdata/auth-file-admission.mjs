@@ -1,3 +1,4 @@
+import { PI_PACKAGE_VERSION } from "./pi-version.mjs";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -6,14 +7,14 @@ import { pathToFileURL } from "node:url";
 
 const operations = ["modify", "delete"];
 if (process.argv[2] === "pig") {
-  const output = execFileSync("go", ["test", "./ai", "-run", "^TestFileAuthStorageQueuedMutationCancellation$", "-count=1", "-v"], { encoding: "utf8" });
+  const output = execFileSync("./test/parity/testdata/prebuilt-go-test.sh", ["./ai", "-run", "^TestFileAuthStorageQueuedMutationCancellation$", "-count=1", "-v"], { encoding: "utf8" });
   const records = output.split("\n").filter(line => line.startsWith("FILE_AUTH_ADMISSION "));
   assert.equal(records.length, operations.length);
   for (const record of records) console.log(record);
 } else {
   assert.equal(process.argv[2], "pi");
   const root = process.env.PI_PACKAGE_ROOT ?? resolve("extensions/sdk-ts/node_modules/@earendil-works/pi-coding-agent");
-  assert.equal(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version, "1.0.3");
+  assert.equal(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version, PI_PACKAGE_VERSION);
   const { AuthStorage } = await import(pathToFileURL(join(root, "dist/core/auth-storage.js")));
   for (const operation of operations) {
     const dir = mkdtempSync(join(process.argv[3], "file-auth-admission-"));

@@ -19,7 +19,7 @@ type lifecycleNavigationHandle struct {
 	aborts   int
 }
 
-func (h *lifecycleNavigationHandle) NavigateTreeHandle(ctx context.Context, _ string, _ bool, _ string) (NavigateTreeResult, error) {
+func (h *lifecycleNavigationHandle) NavigateTreeHandle(ctx context.Context, _ string, _ NavigateTreeOptions) (NavigateTreeResult, error) {
 	return h.navigate(ctx)
 }
 func (h *lifecycleNavigationHandle) AbortBranchSummary() { h.aborts++ }
@@ -107,7 +107,7 @@ func TestTreeSummaryStatusAndEscapeKeepOwnerLoopLive(t *testing.T) {
 						}
 					}
 					sc := m.buildSlashContext(ctx)
-					sc.ShowExtensionSelector = func(string, []string, string) (string, bool) { return "Summarize", true }
+					sc.ShowExtensionSelector = func(string, []string) (string, bool) { return "Summarize", true }
 					reopened := ""
 					sc.PickTreeEntry = func(id string) (string, bool) { reopened = id; return "", false }
 					if err := treeNavigateWithSummarize(sc, "target"); err != nil {
@@ -185,7 +185,7 @@ func TestTreeSummaryCompletionDrainsEventsAndPreservesDraft(t *testing.T) {
 			}
 			m.editor.SetText("draft typed during summary")
 			sc := m.buildSlashContext(t.Context())
-			sc.ShowExtensionSelector = func(string, []string, string) (string, bool) { return "Summarize", true }
+			sc.ShowExtensionSelector = func(string, []string) (string, bool) { return "Summarize", true }
 			err := treeNavigateWithSummarize(sc, "target")
 			if (err != nil) != (outcome == "error") {
 				t.Fatalf("error=%v", err)

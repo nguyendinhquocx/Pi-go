@@ -11,7 +11,8 @@
   "properties": {
     "name": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
     },
     "description": {
       "type": "string"
@@ -43,13 +44,15 @@
     },
     "tools": {
       "type": "array",
+      "description": "Built-in tools the Piglet keeps. The list limits the tools; it does not activate them. A run activates only the default active tools (read, bash, edit, write) that the list keeps.",
       "items": {
         "type": "string",
         "enum": [
-          "bash",
           "read",
-          "write",
+          "bash",
+          "powershell",
           "edit",
+          "write",
           "grep",
           "find",
           "ls"
@@ -60,11 +63,22 @@
     "model": {
       "$ref": "#/$defs/modelConfig"
     },
+    "slots": {
+      "$ref": "#/$defs/slots"
+    },
     "systemPrompt": {
       "$ref": "#/$defs/promptRef"
     },
     "discovery": {
       "$ref": "#/$defs/discovery"
+    },
+    "contextFiles": {
+      "type": "string",
+      "enum": [
+        "all",
+        "trusted-only"
+      ],
+      "description": "Which project context files (AGENTS.md, CLAUDE.md) load. all is Pi's behaviour. trusted-only withholds the project's context files until the project is trusted, and makes a project that has one need a trust decision."
     },
     "agentEnv": {
       "$ref": "#/$defs/agentEnvironment"
@@ -80,6 +94,9 @@
     },
     "build": {
       "$ref": "#/$defs/buildSpec"
+    },
+    "strip": {
+      "$ref": "#/$defs/stripSpec"
     }
   },
   "$defs": {
@@ -93,7 +110,8 @@
       "properties": {
         "name": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
         },
         "from": {
           "$ref": "#/$defs/secretSource"
@@ -110,7 +128,8 @@
           ],
           "properties": {
             "env": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
             }
           }
         },
@@ -134,7 +153,8 @@
           ],
           "properties": {
             "ref": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]*:\\S+$"
             }
           }
         }
@@ -143,9 +163,6 @@
     "extendsSpec": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "source"
-      ],
       "properties": {
         "source": {
           "type": "string",
@@ -183,8 +200,157 @@
           "items": {
             "type": "string"
           }
+        },
+        "slots": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "frontend"
+            ]
+          }
+        },
+        "strip": {
+          "$ref": "#/$defs/stripLists"
         }
       }
+    },
+    "stripSpec": {
+      "description": "Built-ins a Piglet strips. Each list is in deny mode (it names what is stripped) or, under keep, in keep mode (it names what stays; every other ID of that list, including IDs a later core adds, is stripped). One list is never in both modes in one Piglet file.",
+      "$ref": "#/$defs/stripListProperties",
+      "properties": {
+        "keep": {
+          "$ref": "#/$defs/stripLists"
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "stripLists": {
+      "$ref": "#/$defs/stripListProperties",
+      "unevaluatedProperties": false
+    },
+    "stripListProperties": {
+      "type": "object",
+      "properties": {
+        "tools": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stripToolId"
+          },
+          "uniqueItems": true
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stripCommandId"
+          },
+          "uniqueItems": true
+        },
+        "extensions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stripExtensionId"
+          },
+          "uniqueItems": true
+        },
+        "apis": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stripApiId"
+          },
+          "uniqueItems": true
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stripFeatureId"
+          },
+          "uniqueItems": true
+        }
+      },
+      "$comment": "The ID enums (stripToolId and the four defs after it) are written by `make piglet-strip-ids` from the registrations."
+    },
+    "stripToolId": {
+      "type": "string",
+      "enum": [
+        "bash",
+        "edit",
+        "find",
+        "grep",
+        "ls",
+        "powershell",
+        "read",
+        "write"
+      ]
+    },
+    "stripCommandId": {
+      "type": "string",
+      "enum": [
+        "/bug",
+        "/changelog",
+        "/clone",
+        "/compact",
+        "/copy",
+        "/debug",
+        "/export",
+        "/fork",
+        "/hotkeys",
+        "/import",
+        "/login",
+        "/logout",
+        "/model",
+        "/name",
+        "/new",
+        "/piglet",
+        "/quit",
+        "/reload",
+        "/resume",
+        "/scoped-models",
+        "/session",
+        "/settings",
+        "/share",
+        "/thinking",
+        "/tree",
+        "/trust"
+      ]
+    },
+    "stripExtensionId": {
+      "type": "string",
+      "enum": [
+        "codemode",
+        "llama.cpp",
+        "mcp",
+        "pig-login",
+        "tool-search"
+      ]
+    },
+    "stripApiId": {
+      "type": "string",
+      "enum": [
+        "bedrock-converse-stream",
+        "google-vertex",
+        "mistral-conversations"
+      ]
+    },
+    "stripFeatureId": {
+      "type": "string",
+      "enum": [
+        "changelog",
+        "docs",
+        "export-html",
+        "extension-sdk-go",
+        "extension-sdk-lisp",
+        "extension-sdk-python",
+        "extension-sdk-rust",
+        "mermaid",
+        "node-extensions",
+        "piglet-builder",
+        "prompt-templates",
+        "self-update",
+        "skills",
+        "syntax-highlight",
+        "themes",
+        "word-dictionaries"
+      ]
     },
     "skillEntry": {
       "oneOf": [
@@ -328,7 +494,39 @@
             "$ref": "#/$defs/agentSecretBinding"
           }
         }
-      }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "image"
+          ],
+          "properties": {
+            "image": {
+              "pattern": "\\S"
+            }
+          }
+        },
+        {
+          "required": [
+            "devContainer"
+          ],
+          "properties": {
+            "devContainer": {
+              "pattern": "\\S"
+            }
+          }
+        },
+        {
+          "required": [
+            "source"
+          ],
+          "properties": {
+            "source": {
+              "pattern": "\\S"
+            }
+          }
+        }
+      ]
     },
     "agentSecretBinding": {
       "type": "object",
@@ -349,7 +547,8 @@
           ],
           "properties": {
             "env": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
             }
           }
         }
@@ -360,7 +559,11 @@
       "additionalProperties": false,
       "properties": {
         "mode": {
-          "type": "string"
+          "type": "string",
+          "enum": [
+            "inject",
+            "image"
+          ]
         },
         "version": {
           "type": "string"
@@ -372,7 +575,12 @@
       "additionalProperties": false,
       "properties": {
         "preset": {
-          "type": "string"
+          "type": "string",
+          "enum": [
+            "minimal",
+            "standard",
+            "elevated"
+          ]
         }
       }
     },
@@ -396,12 +604,17 @@
           "type": "string"
         },
         "target": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^/"
         },
         "readonly": {
           "type": "boolean"
         }
-      }
+      },
+      "required": [
+        "source",
+        "target"
+      ]
     },
     "modelConfig": {
       "type": "object",
@@ -428,11 +641,50 @@
         "targets": {
           "type": "array",
           "items": {
-            "type": "string"
-          }
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9_-]*$"
+          },
+          "uniqueItems": true
         },
         "outputName": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^[^/\\\\]*$",
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          }
+        },
+        "extensionRealization": {
+          "enum": [
+            "fused"
+          ]
+        },
+        "closed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "slots": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "frontend": {
+          "$ref": "#/$defs/slotMember"
+        }
+      }
+    },
+    "slotMember": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "member"
+      ],
+      "properties": {
+        "member": {
+          "type": "string",
+          "minLength": 1
         }
       }
     },
@@ -441,7 +693,9 @@
       "additionalProperties": false,
       "properties": {
         "version": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^((0|[1-9][0-9]*)(\\.(0|[1-9][0-9]*)){0,2}|(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?)?$",
+          "description": "Semantic Version; the Go parser also accepts the short forms 1 and 1.2."
         }
       }
     }

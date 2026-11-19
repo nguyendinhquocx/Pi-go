@@ -2,12 +2,15 @@
 
 package tui
 
+// Ports packages/tui/src/terminal.ts (ProcessTerminal on Unix: raw-mode input and the terminal size).
+
 import (
 	"context"
 	"errors"
 	"io"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -23,6 +26,42 @@ func terminalInputBuffered(*os.File) bool { return false }
 // terminalInputPending reports, after file became readable, whether a read
 // returns without blocking. A readable descriptor always does.
 func terminalInputPending(*os.File) (bool, error) { return true, nil }
+
+// terminalHungUp reports whether the terminal behind file has been hung up, as when the master side of a pseudo-terminal closes.
+func terminalHungUp(file *os.File) bool {
+	pollfds := []unix.PollFd{{Fd: int32(file.Fd()), Events: unix.POLLIN}}
+	for {
+		n, err := unix.Poll(pollfds, 0)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		return err == nil && n > 0 && pollfds[0].Revents&unix.POLLHUP != 0
+	}
+}
+
+// inForeground is tcgetpgrp on stdin compared with this process's group: whether the group may use the terminal without a SIGTTOU or SIGTTIN
+// stop. Job control applies only to the controlling terminal: ENOTTY means stdin is a terminal that is not this process's controlling terminal,
+// so nothing can stop the process there and it counts as foreground, as Pi's SIGCONT handler restarts the UI there. Any other error, EIO of a
+// hung-up terminal first, is returned for the caller to treat as a dead terminal.
+func (t *ProcessTerminal) inForeground() (bool, error) {
+	if t.stdin == nil {
+		return false, syscall.ENOTTY
+	}
+	fd := int(t.stdin.Fd())
+	for {
+		pgrp, err := unix.IoctlGetInt(fd, unix.TIOCGPGRP)
+		if isEINTR(err) {
+			continue
+		}
+		if errors.Is(err, unix.ENOTTY) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return pgrp == syscall.Getpgrp(), nil
+	}
+}
 
 // pollReadable waits up to ms milliseconds for fd to become readable. It
 // returns n>0 when readable, 0 on timeout. EINTR is retried internally so the
@@ -49,7 +88,7 @@ type terminalInputWaiter struct {
 	callbackDone chan struct{}
 }
 
-func newTerminalInputWaiter(ctx context.Context) (*terminalInputWaiter, error) {
+func newTerminalInputWaiter(ctx context.Context, _ *os.File) (*terminalInputWaiter, error) {
 	cancelRead, cancelWrite, err := os.Pipe()
 	if err != nil {
 		return nil, err
@@ -90,6 +129,9 @@ func (w *terminalInputWaiter) wait(file *os.File, ms int) (bool, error) {
 	}
 }
 
+// readPipe reports no pipe: a pipe is waited on by wait like any other file, since poll answers for it.
+func (w *terminalInputWaiter) readPipe(*os.File, int) ([]byte, bool, error) { return nil, false, nil }
+
 func (w *terminalInputWaiter) close() {
 	if !w.stopCallback() {
 		<-w.callbackDone
@@ -98,7 +140,7 @@ func (w *terminalInputWaiter) close() {
 	_ = w.cancelWrite.Close()
 }
 
-// isEINTR reports whether a read error is an interrupted syscall worth retrying.
+// isEINTR reports whether a read, poll or termios ioctl error is an interrupted syscall worth retrying.
 func isEINTR(err error) bool { return errors.Is(err, unix.EINTR) }
 
 // startResizeWatcher installs a SIGWINCH handler that calls onResize on resize,
@@ -121,6 +163,24 @@ func (t *ProcessTerminal) startResizeWatcher(ctx context.Context, onResize func(
 		return syscall.Kill(pid, syscall.SIGWINCH)
 	})
 	return func() { signal.Stop(winchCh) }
+}
+
+// CacheSizeUntilResize makes Columns and Rows reuse the size they last read, as Node keeps process.stdout.columns and rows
+// and refreshes them only when SIGWINCH arrives (lib/tty.js WriteStream._refreshSize), instead of reading the size from the
+// terminal for every frame. The caller must own SIGWINCH delivery and run invalidate on every SIGWINCH before it renders for
+// it; stop ends the caching once every holder has stopped.
+func (t *ProcessTerminal) CacheSizeUntilResize() (invalidate, stop func()) {
+	cache := &t.sizeCache
+	forget := func(holders int) {
+		cache.mu.Lock()
+		cache.holders += holders
+		cache.generation++
+		cache.valid = false
+		cache.mu.Unlock()
+	}
+	forget(1)
+	var once sync.Once
+	return func() { forget(0) }, func() { once.Do(func() { forget(-1) }) }
 }
 
 // enableVTProcessing is a no-op on unix; ANSI output needs no console mode

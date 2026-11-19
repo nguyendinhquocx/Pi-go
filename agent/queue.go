@@ -16,6 +16,7 @@ const (
 	QueueModeOneAtATime QueueMode = "one-at-a-time"
 )
 
+// Ports packages/agent/src/agent.ts (PendingMessageQueue).
 // PendingMessageQueue is a thread-safe FIFO of agent messages with a
 // configurable drain policy. Used for steering and follow-up queues.
 //
@@ -81,6 +82,22 @@ func (q *PendingMessageQueue) Clear() []AgentMessage {
 	defer q.mu.Unlock()
 	cleared := q.messages
 	q.messages = nil
+	return cleared
+}
+
+// ClearUserMessages removes and returns the queued user messages and keeps every other queued message in order.
+func (q *PendingMessageQueue) ClearUserMessages() []AgentMessage {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var cleared, kept []AgentMessage
+	for _, message := range q.messages {
+		if message.User != nil {
+			cleared = append(cleared, message)
+		} else {
+			kept = append(kept, message)
+		}
+	}
+	q.messages = kept
 	return cleared
 }
 

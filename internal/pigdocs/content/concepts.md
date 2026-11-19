@@ -1,6 +1,6 @@
-# How Pig fits together
+# How PiG fits together
 
-Pig is a small coding agent that you shape for the work in front of you. The
+PiG is a small coding agent that you shape for the work in front of you. The
 shortest accurate model is:
 
 > Packages distribute available Resources. Piglets select and scope them.
@@ -53,9 +53,9 @@ A Piglet may have these execution carriers:
 
 | Carrier | Meaning |
 |---|---|
-| Host Piglet | Pig resolves and runs Piglet source on the host or inside its required environment |
-| Piglet Binary | target-native Pig executable built for one immutable Piglet composition |
-| Piglet Image | OCI artifact materializing the Piglet and required runtime environment |
+| Host Piglet | PiG resolves and runs Piglet source on the host or inside its required environment |
+| Piglet Binary | target-native PiG executable built for one immutable Piglet composition |
+| Piglet Image | planned, not in this release: an OCI artifact that would materialize the Piglet and its runtime environment |
 
 Binary and image are build outputs, not files you author or peer management
 namespaces. Piglet source and several target artifacts may coexist in one
@@ -63,7 +63,7 @@ Piglet release.
 
 ## Component execution is not an artifact kind
 
-Raw Pig normally hosts extensions as subprocesses. A Piglet Binary is still Pig
+Raw PiG normally hosts extensions as subprocesses. A Piglet Binary is still PiG
 and can use the same subprocess host while additionally fusing compatible Go
 factories.
 
@@ -90,8 +90,8 @@ from `PATH` or ambient Package discovery.
 realization:
 
 - no `agentEnv`: run on the current compatible host;
-- required `agentEnv`: Host Piglet, Piglet Binary, Piglet Image, and managed deployments
-  enter or verify it before startup;
+- required `agentEnv`: Host Piglet, Piglet Binary, and managed deployments
+  enter or verify it before startup (a Piglet Image is planned);
 - only explicit local one-run `--unsafe-host` may bypass it.
 
 The code-execution sandbox is separate from the whole-agent environment.
@@ -113,7 +113,7 @@ build optional Binary/Image
 publish one Piglet release with exact Resource closure and executable plan
 ```
 
-Every stage after Resource acquisition is optional. You can use bare Pig, run a
+Every stage after Resource acquisition is optional. You can use bare PiG, run a
 Piglet indefinitely without building, or publish selected target artifacts.
 
 ## Packages versus Piglets
@@ -132,7 +132,7 @@ Piglet indefinitely without building, or publish selected target artifacts.
 - Piglet release SemVer uses `release.version`.
 - The first production Piglet record schema is version 1.
 - The extension subprocess wire has one current unversioned shape. It changes
-  atomically with Pig and the staged SDKs.
+  atomically with PiG and the staged SDKs.
 - Undeployed interfaces may change directly. Deployed external contracts need an
   explicit compatibility decision.
 

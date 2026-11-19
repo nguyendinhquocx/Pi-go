@@ -66,7 +66,7 @@ type CompactOptions struct {
 type ContextActions struct {
 	// SessionManager backs Context.SessionManager().
 	// upstream: types.ts:301 (read-only)
-	SessionManager SessionManager
+	SessionManager ReadonlySessionManager
 
 	// ModelRegistry backs Context.ModelRegistry().
 	// upstream: types.ts:303
@@ -80,6 +80,10 @@ type ContextActions struct {
 	// GetScopedModels returns the current read-only model scope. Context creation captures this callback, not its result.
 	// upstream: packages/coding-agent/src/core/extensions/runner.ts:createContext
 	GetScopedModels func() []ScopedModel
+
+	// GetThinkingLevel backs Context.ThinkingLevel(): the level the session runtime provides, read each time.
+	// upstream: packages/coding-agent/src/core/extensions/runner.ts:914 (`runner.runtime.getThinkingLevel()`)
+	GetThinkingLevel func() ThinkingLevel
 
 	// IsIdle backs Context.IsIdle().
 	// upstream: types.ts:307
@@ -227,6 +231,8 @@ type CommandActions struct {
 	// WaitForIdle blocks until the agent finishes streaming.
 	WaitForIdle        func() error
 	WaitForIdleContext func(context.Context) error
+	// WaitForIdleBlocks reports whether WaitForIdle would wait now. A mode that settles an idle wait at once, as Pi's `if (this.isIdle) return`, binds it so the host does not count the calling command as suspended; nil means it waits.
+	WaitForIdleBlocks func() bool
 
 	// NewSession starts a new session.
 	NewSession        func(opts *NewSessionOptions) (CancelledResult, error)

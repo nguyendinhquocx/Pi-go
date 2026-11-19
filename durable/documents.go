@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sync/atomic"
 
 	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
 )
@@ -21,7 +22,9 @@ type AnyDocDefinition struct {
 	Initial func(seed JsonValue) (JsonObject, error)
 	// Migrate is nil when the definition has no migration.
 	Migrate func(value JsonObject, fromVersion int) (JsonObject, error)
-	// CheckpointWhen is nil when the definition has no checkpoint predicate.
+	// CheckpointWhen decides whether an ordinary change is stored as a complete base. Every definition has one: DefineDoc
+	// and DefineDocFamily reject a definition with neither CheckpointWhen nor CheckpointWhenRaw, as upstream's types require
+	// checkpointWhen on every definition (documents.ts AnyDocDefinition, types.ts CommonDocDefinition).
 	CheckpointWhen func(value JsonObject, ops []Op, info CheckpointInfo) (bool, error)
 }
 
@@ -47,7 +50,10 @@ func (DocFamilyToken[T, I]) docType(T) {}
 
 // DefineDoc defines a singleton document. Scope selects a Session, conversation, or task document; conversation
 // documents also declare History and Fork. It panics when the version is not a positive integer, where upstream
-// throws a TypeError at definition time.
+// throws a TypeError at definition time, when DocumentSemantics is not a member of upstream's union (types.ts:42-60),
+// which upstream's overloads reject at compile time, and when the definition has neither CheckpointWhen nor
+// CheckpointWhenRaw: upstream's types require checkpointWhen with no default (types.ts:77-78), so the Go definition names
+// its policy too, `func(T, []Op, CheckpointInfo) bool { return false }` to keep every change a delta.
 func DefineDoc[T any](definition DocDefinition[T]) DocToken[T] {
 	initial := definition.Initial
 	erased := eraseDocDefinition(definition.CommonDocDefinition, definition.DocumentSemantics, false, func(_ JsonValue) (JsonObject, error) {
@@ -58,10 +64,14 @@ func DefineDoc[T any](definition DocDefinition[T]) DocToken[T] {
 }
 
 // DefineDocFamily defines a keyed document family; Initial(seed) runs only when a member is absent. It panics when
-// the version is not a positive integer.
+// the version is not a positive integer, DocumentSemantics is not a member of upstream's union (types.ts:42-60), CheckpointWhen is absent (see [DefineDoc]), or Family is not true: upstream's FamilyInput requires `family: true` at compile time (documents.ts:31-34),
+// and the erased definition's family flag is what addressing reads (resolveAddress).
 func DefineDocFamily[T, I any](definition DocFamilyDefinition[T, I]) DocFamilyToken[T, I] {
+	if !definition.Family {
+		panic(fmt.Sprintf("Document %s family must be true", definition.Kind))
+	}
 	initial := definition.Initial
-	erased := eraseDocDefinition(definition.CommonDocDefinition, definition.DocumentSemantics, true, func(seed JsonValue) (JsonObject, error) {
+	erased := eraseDocDefinition(CommonDocDefinition[T]{Kind: definition.Kind, Version: definition.Version, Migrate: definition.Migrate, CheckpointWhen: definition.CheckpointWhen}, definition.DocumentSemantics, definition.Family, func(seed JsonValue) (JsonObject, error) {
 		typedSeed, err := FromJsonValue[I](seed)
 		if err != nil {
 			return nil, err
@@ -89,7 +99,14 @@ func eraseDocDefinition[T any](common CommonDocDefinition[T], semantics Document
 			return ToJsonObject(migrated)
 		}
 	}
-	if checkpointWhen := common.CheckpointWhen; checkpointWhen != nil {
+	if raw := common.CheckpointWhenRaw; raw != nil {
+		erased.CheckpointWhen = func(value JsonObject, ops []Op, info CheckpointInfo) (bool, error) {
+			if err := checkDecodes[T](value, ops); err != nil {
+				return false, err
+			}
+			return raw(value, ops, info), nil
+		}
+	} else if checkpointWhen := common.CheckpointWhen; checkpointWhen != nil {
 		erased.CheckpointWhen = func(value JsonObject, ops []Op, info CheckpointInfo) (bool, error) {
 			// A JSON-object document receives the exact prepared revision, as upstream passes it.
 			if exact, ok := any(value).(T); ok {
@@ -109,6 +126,40 @@ func validateDefinition(definition *AnyDocDefinition) {
 	if definition.Version < 1 || definition.Version > maxSafeInteger {
 		panic(fmt.Sprintf("Document %s version must be a positive integer", definition.Kind))
 	}
+	if err := validateDocumentSemantics(definition.DocumentSemantics); err != nil {
+		panic(fmt.Sprintf("Document %s %v", definition.Kind, err))
+	}
+	if definition.CheckpointWhen == nil {
+		panic(fmt.Sprintf("Document %s checkpointWhen is required", definition.Kind))
+	}
+}
+
+// validateDocumentSemantics admits the combinations of Pi's DocumentSemantics union (types.ts:42-60), which the compiler enforces upstream: a
+// session or task document declares neither history nor fork, a latest conversation document forks "current" or "initial", and a rewindable
+// one forks "asOf", "current" or "initial".
+func validateDocumentSemantics(semantics DocumentSemantics) error {
+	switch semantics.Scope {
+	case ScopeSession, ScopeTask:
+		if semantics.History != "" || semantics.Fork != "" {
+			return fmt.Errorf("semantics: only conversation documents declare history and fork, not a %s document", semantics.Scope)
+		}
+	case ScopeConversation:
+		switch semantics.History {
+		case HistoryLatest:
+			if semantics.Fork != ForkCurrent && semantics.Fork != ForkInitial {
+				return fmt.Errorf("semantics: a latest conversation document forks \"current\" or \"initial\", not %q", semantics.Fork)
+			}
+		case HistoryRewindable:
+			if semantics.Fork != ForkAsOf && semantics.Fork != ForkCurrent && semantics.Fork != ForkInitial {
+				return fmt.Errorf("semantics: a rewindable conversation document forks \"asOf\", \"current\" or \"initial\", not %q", semantics.Fork)
+			}
+		default:
+			return fmt.Errorf("semantics: a conversation document's history is \"latest\" or \"rewindable\", not %q", semantics.History)
+		}
+	default:
+		return fmt.Errorf("semantics: scope is \"session\", \"conversation\" or \"task\", not %q", semantics.Scope)
+	}
+	return nil
 }
 
 const maxSafeInteger = 1<<53 - 1
@@ -311,6 +362,118 @@ func SnapshotAsOf[T any](ctx context.Context, reader DocumentReader, token DocTo
 		return nil, err
 	}
 	return DecodeDoc[T](value)
+}
+
+// typedWatch is a document watch whose values decode as T.
+type typedWatch[T any] struct {
+	WatchHandle[JsonObject]
+	// decoded is the latest value that decoded as T; Value never panics, as upstream's getter cannot fail.
+	decoded *atomic.Pointer[typedValue[T]]
+}
+
+type typedValue[T any] struct{ value T }
+
+// decodeValue decodes a document value as T; a document value is never null.
+func decodeValue[T any](value JsonObject) (T, error) {
+	decoded, err := DecodeDoc[T](value)
+	if err != nil || decoded == nil {
+		var zero T
+		return zero, err
+	}
+	return *decoded, nil
+}
+
+// Value is the acquisition or latest delivered revision. A revision that does not decode as the token's type breaks the
+// document's definition: Start's listener fails and ends the watch with its listener_error, and Value keeps returning the
+// latest revision that decoded.
+func (watch typedWatch[T]) Value() T {
+	if value, err := decodeValue[T](watch.WatchHandle.Value()); err == nil {
+		watch.decoded.Store(&typedValue[T]{value})
+		return value
+	}
+	return watch.decoded.Load().value
+}
+
+// Start installs the sole listener; a value that does not decode ends the watch with its listener_error.
+//
+// A listener that blocks on something the host cannot see before it returns (a channel send or receive, a mutex, network I/O, a
+// child process) holds back every wait that follows its delivery until it returns: the Harness waits, and the Session's
+// publication of the next commit of a call, which waits for the synchronous part of each listener (pig divergence (D224): Pi's
+// listener awaits, which ends its synchronous part, and nothing waits for it). Such a listener calls chord.DeliveryEntered before it
+// blocks, or does the blocking on a goroutine of its own and returns.
+func (watch typedWatch[T]) Start(listener func(ctx context.Context, call WatchCall[T]) error) {
+	watch.WatchHandle.Start(func(ctx context.Context, call WatchCall[JsonObject]) error {
+		if call.Kind == WatchCallFailed {
+			return listener(ctx, WatchCall[T]{Kind: WatchCallFailed, Error: call.Error})
+		}
+		decoded, err := decodeValue[T](call.Value)
+		if err != nil {
+			return err
+		}
+		watch.decoded.Store(&typedValue[T]{decoded})
+		return listener(ctx, WatchCall[T]{Kind: WatchCallValue, Value: decoded, Ops: call.Ops, Retired: call.Retired})
+	})
+}
+
+// WatchDoc returns a watch of a document's committed value decoded as T, or nil when the document is absent. The watch
+// follows the document's address: a retirement is a call with Retired set, and a document created there later arrives on
+// the same watch. args are the owner ID and family key as for TxDoc. The erased form is DocumentObserver.WatchDocErased.
+func WatchDoc[T any](ctx context.Context, observer DocumentObserver, token DocTokenOf[T], args ...any) (DocumentWatch[T], error) {
+	watch, err := observer.WatchDocErased(ctx, token, args...)
+	if err != nil || watch == nil {
+		return nil, err
+	}
+	// The acquisition value is checked like Snapshot's.
+	acquired, err := decodeValue[T](watch.Value())
+	if err != nil {
+		_, _ = watch.Stop()
+		return nil, err
+	}
+	decoded := new(atomic.Pointer[typedValue[T]])
+	decoded.Store(&typedValue[T]{acquired})
+	return typedWatch[T]{watch, decoded}, nil
+}
+
+// typedObserver is an observer of decoded values over an erased one.
+type typedObserver[T any] struct{ observer Observer[T] }
+
+// Advance decodes the call; a value that does not decode panics, which the Session reports as the observer's
+// listener_error, detaching and ending it.
+func (typed typedObserver[T]) Advance(ctx context.Context, call WatchCall[JsonObject]) {
+	if call.Kind == WatchCallFailed {
+		typed.observer.Advance(ctx, WatchCall[T]{Kind: WatchCallFailed, Error: call.Error})
+		return
+	}
+	value, err := decodeValue[T](call.Value)
+	if err != nil {
+		panic(err)
+	}
+	typed.observer.Advance(ctx, WatchCall[T]{Kind: WatchCallValue, Value: value, Ops: call.Ops, Retired: call.Retired})
+}
+
+func (typed typedObserver[T]) End(end WatchEnd) { typed.observer.End(end) }
+
+// typedObservation is an observation whose value decoded as T.
+type typedObservation[T any] struct {
+	Observation[JsonObject]
+	value T
+}
+
+func (observation typedObservation[T]) Value() T { return observation.value }
+
+// ObserveDoc attaches a synchronous observer to a document address and decodes its values as T, as Session.ObserveDocErased
+// does for JSON; the observation is nil when the document is absent. args are the owner ID and family key as for TxDoc.
+func ObserveDoc[T any](ctx context.Context, session Session, token DocTokenOf[T], observer Observer[T], args ...any) (Observation[T], error) {
+	observation, err := session.ObserveDocErased(ctx, token, typedObserver[T]{observer}, args...)
+	if err != nil || observation == nil {
+		return nil, err
+	}
+	value, err := decodeValue[T](observation.Value())
+	if err != nil {
+		observation.Detach()
+		return nil, err
+	}
+	return typedObservation[T]{observation, value}, nil
 }
 
 // TxRetireDoc retires a document; args are the owner ID and family key as for TxDoc, without a seed.

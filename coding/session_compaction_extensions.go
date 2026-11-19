@@ -2,7 +2,6 @@ package coding
 
 import (
 	"context"
-	"errors"
 
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
@@ -32,12 +31,10 @@ func (s *Session) extensionCompaction(
 		return nil, false, nil
 	}
 	branchEntries := make([]extension.SessionEntry, len(entries))
-	for i := range entries {
-		branchEntries[i] = entries[i]
-	}
+	copy(branchEntries, entries)
 	result, err := runner.Emit(ctx, extension.SessionBeforeCompactEvent{
 		Type:               icodingagent.EventSessionBeforeCompact,
-		Preparation:        preparation,
+		Preparation:        *preparation,
 		BranchEntries:      branchEntries,
 		CustomInstructions: customInstructions,
 		Reason:             reason,
@@ -62,7 +59,7 @@ func (s *Session) extensionCompaction(
 		return nil, false, err
 	}
 	if envelope.Cancel {
-		return nil, false, errors.New("Compaction cancelled")
+		return nil, false, errCompactionCancelled
 	}
 	if len(envelope.Compaction) == 0 || string(envelope.Compaction) == "null" {
 		return nil, false, nil
@@ -98,14 +95,24 @@ func generatedCompactionData(result compaction.CompactionResult) *sessionCompact
 	}
 }
 
+// emitSessionCompact notifies extensions that a compaction entry was saved
+// (agent-session.ts awaits runner.emit session_compact after appendCompaction).
+// Upstream's emit takes no signal and checks none, so an abort raised after the
+// last check, or by a handler during this dispatch, never skips an extension
+// and never fails the saved compaction: dispatch must not inherit the
+// cancellation that aborts the compaction.
 func (s *Session) emitSessionCompact(ctx context.Context, entry icodingagent.SessionEntry, fromExtension bool, reason string, willRetry bool) {
 	runner := s.currentRunner()
 	if runner == nil || !runner.HasHandlers(icodingagent.EventSessionCompact) {
 		return
 	}
-	_, _ = runner.Emit(ctx, extension.SessionCompactEvent{
+	var compactionEntry extension.CompactionEntry
+	if raw, err := json.Marshal(entry); err != nil || json.Unmarshal(raw, &compactionEntry) != nil {
+		return
+	}
+	_, _ = runner.Emit(context.WithoutCancel(ctx), extension.SessionCompactEvent{
 		Type:            icodingagent.EventSessionCompact,
-		CompactionEntry: entry,
+		CompactionEntry: compactionEntry,
 		FromExtension:   fromExtension,
 		Reason:          reason,
 		WillRetry:       willRetry,

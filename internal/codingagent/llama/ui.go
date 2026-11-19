@@ -11,8 +11,9 @@ import (
 	"time"
 	"unicode/utf16"
 
+	"github.com/MichaelKinsy/PiG/internal/jsnumber"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
-
 	"github.com/MichaelKinsy/PiG/tui"
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
@@ -102,23 +103,16 @@ func contextLabel(model LlamaModelInfo) string {
 
 func formatContext(value float64) string {
 	if value >= 1000 {
-		return jsNumberString(jsRound(value/1000)) + "k"
+		return jsnumber.String(jsnumber.Round(value/1000)) + "k"
 	}
-	return jsNumberString(value)
+	return jsnumber.String(value)
 }
 
 // jsNumberValue mirrors Number(text); ok is false for NaN.
 func jsNumberValue(text string) (float64, bool) {
-	trimmed := strings.TrimFunc(text, isJSWhitespace)
-	if trimmed == "" {
-		return 0, true
-	}
-	value, err := strconv.ParseFloat(trimmed, 64)
-	return value, err == nil
+	value := jsnumber.Parse(text)
+	return value, !math.IsNaN(value)
 }
-
-// jsRound mirrors Math.round, which rounds halves toward +Infinity.
-func jsRound(value float64) float64 { return math.Floor(value + 0.5) }
 
 func modelDescription(model LlamaModelInfo) string {
 	var details []string
@@ -136,7 +130,7 @@ func modelDescription(model LlamaModelInfo) string {
 	return strings.Join(details, " · ")
 }
 
-func fg(token, text string) string { return tui.ActiveTheme().FgText(token, text) }
+func fg(token, text string) string { return tui.ActiveTheme().Fg(token, text) }
 
 // keyHint mirrors keybinding-hints.ts keyHint.
 func keyHint(action, description string) string {
@@ -148,8 +142,8 @@ func paddedText(content string) *tui.Text { return tui.NewPaddedText(content, 1,
 
 func frame(title string, body []tui.Component, footer string) *tui.Container {
 	container := tui.NewContainer()
-	container.Add(tui.NewDynamicBorder(tui.ActiveTheme().Fg("accent")))
-	container.Add(paddedText(fg("accent", "\x1b[1m"+title+tui.SGRBoldDimReset)))
+	container.Add(tui.NewDynamicBorder(func(text string) string { return tui.ActiveTheme().Fg("accent", text) }))
+	container.Add(paddedText(fg("accent", tui.ActiveTheme().Bold(title))))
 	for _, child := range body {
 		container.Add(child)
 	}
@@ -157,7 +151,7 @@ func frame(title string, body []tui.Component, footer string) *tui.Container {
 		container.Add(tui.NewSpacer(1))
 		container.Add(paddedText(fg("dim", footer)))
 	}
-	container.Add(tui.NewDynamicBorder(tui.ActiveTheme().Fg("accent")))
+	container.Add(tui.NewDynamicBorder(func(text string) string { return tui.ActiveTheme().Fg("accent", text) }))
 	return container
 }
 
@@ -167,16 +161,16 @@ func compactCount(value float64) string {
 		if value >= 10_000_000 {
 			digits = 0
 		}
-		return jsToFixed(value/1_000_000, digits) + "M"
+		return jsstring.ToFixed(value/1_000_000, digits) + "M"
 	}
 	if value >= 1_000 {
 		digits := 1
 		if value >= 100_000 {
 			digits = 0
 		}
-		return jsToFixed(value/1_000, digits) + "k"
+		return jsstring.ToFixed(value/1_000, digits) + "k"
 	}
-	return jsNumberString(value)
+	return jsnumber.String(value)
 }
 
 // newSelectList mirrors `new SelectList(items, maxVisible, theme, layout)`
@@ -188,6 +182,7 @@ func newSelectList(labels, descriptions []string, minPrimary, maxPrimary int) *t
 	list.MinPrimaryColumnWidth = minPrimary
 	list.MaxPrimaryColumnWidth = maxPrimary
 	list.MaxVisible = min(len(labels), 12)
+	list.ScrollInfo = func(text string) string { return fg("dim", text) } // selectTheme scrollInfo
 	return list
 }
 
@@ -198,6 +193,9 @@ var exactModelPattern = lazyregexp.New(`^[^/` + jsWhitespaceClass + `]+/[^:` + j
 
 // jsLength mirrors String.prototype.length in UTF-16 code units.
 func jsLength(text string) int { return len(utf16.Encode([]rune(text))) }
+
+// searchMaxVisible is ui.ts SEARCH_MAX_VISIBLE: the visible results and the rows a selection page key moves.
+const searchMaxVisible = 10
 
 const searchingStatus = "Searching Hugging Face…"
 
@@ -218,20 +216,29 @@ type HuggingFaceSearch struct {
 	selectedIndex   int
 	query           string
 	status          string
-	debounce        *time.Timer
-	cancelRequest   context.CancelFunc
-	request         int
-	closed          bool
-	tasks           sync.WaitGroup
+	debounce        debounceTimer
+	// afterFunc starts the debounce timer: time.AfterFunc, or a manual clock in tests that compare against Pi on a virtual clock.
+	afterFunc     func(d time.Duration, f func()) debounceTimer
+	cancelRequest context.CancelFunc
+	request       int
+	closed        bool
+	tasks         sync.WaitGroup
 }
 
-func newHuggingFaceSearch(lock *sync.Mutex, requestRender func(), search HuggingFaceSearchFunc, cache map[string][]HuggingFaceModel, onSelectModel func(string, bool)) *HuggingFaceSearch {
+// debounceTimer is the part of a timer the search uses: Stop reports whether it stopped the callback before it started.
+type debounceTimer interface{ Stop() bool }
+
+func newHuggingFaceSearch(lock *sync.Mutex, requestRender func(), search HuggingFaceSearchFunc, cache map[string][]HuggingFaceModel, onSelectModel func(string, bool), afterFunc func(time.Duration, func()) debounceTimer) *HuggingFaceSearch {
+	if afterFunc == nil {
+		afterFunc = func(d time.Duration, f func()) debounceTimer { return time.AfterFunc(d, f) }
+	}
 	component := &HuggingFaceSearch{
 		lock:          lock,
 		requestRender: requestRender,
 		search:        search,
 		cache:         cache,
 		onSelectModel: onSelectModel,
+		afterFunc:     afterFunc,
 		input:         tui.NewTextInput(""),
 		results:       tui.NewContainer(),
 		status:        "Type at least 2 characters",
@@ -246,6 +253,9 @@ func newHuggingFaceSearch(lock *sync.Mutex, requestRender func(), search Hugging
 	return component
 }
 
+// CapturesViewportInput is ui.ts HuggingFaceSearch capturesViewportInput: the search takes the fullscreen viewport keys.
+func (s *HuggingFaceSearch) CapturesViewportInput() bool { return true }
+
 // Render draws the prompt, input, and results. The component reports no
 // dirty state, so its container renders it every frame.
 func (s *HuggingFaceSearch) Render(width int) []string { return s.container.Render(width) }
@@ -255,9 +265,8 @@ func (s *HuggingFaceSearch) Invalidate() { s.container.Invalidate() }
 
 func (s *HuggingFaceSearch) updateResults() {
 	s.results.Clear()
-	const maxVisible = 10
-	start := max(0, min(s.selectedIndex-maxVisible/2, len(s.filteredResults)-maxVisible))
-	end := min(start+maxVisible, len(s.filteredResults))
+	start := max(0, min(s.selectedIndex-searchMaxVisible/2, len(s.filteredResults)-searchMaxVisible))
+	end := min(start+searchMaxVisible, len(s.filteredResults))
 	for index := start; index < end; index++ {
 		model := s.filteredResults[index]
 		details := compactCount(model.Downloads) + " downloads"
@@ -325,9 +334,13 @@ func (s *HuggingFaceSearch) scheduleSearch() {
 	}
 	s.status = searchingStatus
 	s.filterResults()
+	if s.closed {
+		// Keys that reach a closed search still edit the input and the list, as upstream's do, but start no search: SearchModels has stopped waiting for the pending ones, and a timer added now would outlive it.
+		return
+	}
 	query := s.query
 	s.tasks.Add(1)
-	s.debounce = time.AfterFunc(500*time.Millisecond, func() {
+	s.debounce = s.afterFunc(500*time.Millisecond, func() {
 		defer s.tasks.Done()
 		s.runSearch(query)
 	})
@@ -397,6 +410,11 @@ func (s *HuggingFaceSearch) HandleInput(data string) {
 			s.selectedIndex = (s.selectedIndex + 1) % len(s.filteredResults)
 			s.updateResults()
 		}
+	case keys.Matches(data, tui.KBSelectPageUp) || keys.Matches(data, tui.KBSelectPageDown):
+		if len(s.filteredResults) > 0 {
+			s.selectedIndex, _ = tui.GetSelectPageIndex(keys, data, s.selectedIndex, len(s.filteredResults), searchMaxVisible)
+			s.updateResults()
+		}
 	case keys.Matches(data, tui.KBSelectConfirm):
 		selected := ""
 		if exactModelPattern.MatchString(s.query) {
@@ -411,7 +429,7 @@ func (s *HuggingFaceSearch) HandleInput(data string) {
 		s.close("", false)
 	default:
 		s.input.HandleInput(data)
-		query := strings.TrimFunc(s.input.Text(), isJSWhitespace)
+		query := jsstring.Trim(s.input.Text())
 		if query == s.query {
 			return
 		}
@@ -429,8 +447,11 @@ type LlamaView struct {
 	searchCache     map[string][]HuggingFaceModel
 	content         tui.Component
 	inputHandler    func(data string)
+	captures        bool
 	progressStop    chan struct{}
 	showingProgress bool
+	// afterFunc replaces time.AfterFunc for the search debounce in tests; nil means the real clock.
+	afterFunc func(time.Duration, func()) debounceTimer
 }
 
 // NewLlamaView creates the manager view; requestRender asks the host to
@@ -443,16 +464,18 @@ func NewLlamaView(requestRender func()) *LlamaView {
 	}
 }
 
-func (v *LlamaView) setContentLocked(content tui.Component, inputHandler func(string)) {
+// setContentLocked shows content. capturesViewportInput is the current input handler's capturesViewportInput (ui.ts InputHandler).
+func (v *LlamaView) setContentLocked(content tui.Component, inputHandler func(string), capturesViewportInput bool) {
 	v.progressStop = nil
 	v.showingProgress = false
 	v.content = content
 	v.inputHandler = inputHandler
+	v.captures = capturesViewportInput && inputHandler != nil
 }
 
-func (v *LlamaView) setContent(content tui.Component, inputHandler func(string)) {
+func (v *LlamaView) setContent(content tui.Component, inputHandler func(string), capturesViewportInput bool) {
 	v.mu.Lock()
-	v.setContentLocked(content, inputHandler)
+	v.setContentLocked(content, inputHandler, capturesViewportInput)
 	v.mu.Unlock()
 	v.requestRender()
 }
@@ -470,7 +493,7 @@ func (v *LlamaView) showList(list *tui.FilterableList, title string, before []tu
 			default:
 			}
 		}
-	})
+	}, true)
 	return <-result
 }
 
@@ -546,9 +569,9 @@ func (v *LlamaView) SearchModels(search HuggingFaceSearchFunc) (string, bool) {
 	v.mu.Lock()
 	component := newHuggingFaceSearch(&v.mu, v.requestRender, search, v.searchCache, func(model string, ok bool) {
 		result <- selection{model, ok}
-	})
+	}, v.afterFunc)
 	v.setContentLocked(frame("Download model", []tui.Component{tui.NewSpacer(1), component},
-		keyHint(tui.KBSelectConfirm, "select")+" • "+keyHint(tui.KBSelectCancel, "back")), component.HandleInput)
+		keyHint(tui.KBSelectConfirm, "select")+" • "+keyHint(tui.KBSelectCancel, "back")), component.HandleInput, true)
 	v.mu.Unlock()
 	v.requestRender()
 	chosen := <-result
@@ -558,7 +581,7 @@ func (v *LlamaView) SearchModels(search HuggingFaceSearchFunc) (string, bool) {
 
 // ShowStatus mirrors LlamaView.showStatus.
 func (v *LlamaView) ShowStatus(title, message string) {
-	v.setContent(frame(title, []tui.Component{tui.NewSpacer(1), paddedText(fg("muted", message))}, ""), nil)
+	v.setContent(frame(title, []tui.Component{tui.NewSpacer(1), paddedText(fg("muted", message))}, ""), nil, false)
 }
 
 // Progress mirrors LlamaView.progress: repeated calls share one pending stop
@@ -597,8 +620,8 @@ func (v *LlamaView) updateProgressLocked(state ProgressState) bool {
 	}
 	if state.Ratio != nil {
 		const available = 40
-		filled := int(jsRound(max(0, min(1, *state.Ratio)) * available))
-		bar := strings.Repeat("█", filled) + strings.Repeat("─", available-filled) + " " + jsNumberString(jsRound(*state.Ratio*100)) + "%"
+		filled := int(jsnumber.Round(max(0, min(1, *state.Ratio)) * available))
+		bar := strings.Repeat("█", filled) + strings.Repeat("─", available-filled) + " " + jsnumber.String(jsnumber.Round(*state.Ratio*100)) + "%"
 		body = append(body, paddedText(fg("accent", bar)))
 	}
 	if state.Detail != "" {
@@ -607,6 +630,13 @@ func (v *LlamaView) updateProgressLocked(state ProgressState) bool {
 	v.content = frame(state.Title, body, keyHint(tui.KBSelectCancel, "stop"))
 	v.inputHandler = nil
 	return true
+}
+
+// CapturesViewportInput is ui.ts LlamaView capturesViewportInput: the current input handler's flag.
+func (v *LlamaView) CapturesViewportInput() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.captures
 }
 
 // HandleInput mirrors LlamaView.handleInput.

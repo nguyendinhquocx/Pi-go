@@ -37,7 +37,10 @@ func (p *nativeModelProvider) Stream(ctx context.Context, transcript ai.Transcri
 		provider.(*nativeModelProvider).simple = p.simple
 		return provider.Stream(ctx, transcript, prepared)
 	}
-	return p.native.Stream(ctx, p.model, transcript, options, p.simple)
+	if p.simple && p.native.StreamSimple != nil {
+		return p.native.StreamSimple(ctx, p.model, transcript, options)
+	}
+	return p.native.Stream(ctx, p.model, transcript, options)
 }
 
 func (runtime *ModelRuntime) prepareNativeRequest(ctx context.Context, model *ai.Model, options ai.StreamOptions, p *extension.NativeProvider) (*ai.Model, ai.Provider, ai.StreamOptions, error) {
@@ -81,7 +84,7 @@ func prepareNativeRequest(ctx context.Context, model *ai.Model, options ai.Strea
 	prepared := options
 	prepared.APIKey = resolution.Auth.APIKey
 	prepared.ModelCost = model.CostRates()
-	prepared.Headers = ai.MergeProviderHeaders(resolution.Auth.Headers, options.Headers)
+	prepared.Headers = withOpenCodeSessionHeaders(p.ID, requestModel.ProviderMeta.BaseURL, options.SessionID, ai.MergeProviderHeaders(resolution.Auth.Headers, options.Headers))
 	prepared.Env = maps.Clone(resolution.Env)
 	if prepared.Env == nil && options.Env != nil {
 		prepared.Env = ai.ProviderEnv{}

@@ -52,7 +52,7 @@ func BuildPythonPackedCell(ctx context.Context, cacheRoot, key string, extension
 	if err != nil {
 		return nil, err
 	}
-	lockCandidates := append([]string{os.Getenv("PIG_SDK_PY_ROOT")}, stagedSDKRoots("sdk-py")...)
+	lockCandidates := append([]string{os.Getenv("PIG_SDK_PY_ROOT")}, stagedSDKRoots("python")...)
 	return pigsdklock.WithBuildCandidates(ctx, lockCandidates, func() (*PythonPackedCell, error) {
 		sdkRoot, err := findPythonSDKRoot()
 		if err != nil {
@@ -146,7 +146,11 @@ func findPythonSDKRoot() (string, error) {
 			return abs, nil
 		}
 	}
-	for _, root := range stagedSDKRoots("sdk-py") {
+	// pig additive (D92): only PIG_SDK_PY_ROOT serves a Python SDK the active Piglet strips; this binary staged none.
+	if err := StrippedSDKError("python"); err != nil {
+		return "", err
+	}
+	for _, root := range stagedSDKRoots("python") {
 		if _, err := os.Stat(filepath.Join(root, "pig_sdk", "__init__.py")); err == nil {
 			return root, nil
 		}
@@ -195,12 +199,35 @@ func renderPythonRunner(extensions []PythonExtension, sdkRoot string) string {
 	b.WriteString("]\n\n")
 	fmt.Fprintf(&b, "_KEPT = [os.path.normcase(os.path.join(os.path.abspath(p), '')) for p in (%q, sys.prefix, sys.exec_prefix, sys.base_prefix, sys.base_exec_prefix, os.path.dirname(os.path.abspath(__file__)))]\n", filepath.ToSlash(sdkRoot))
 	b.WriteString(pythonRunnerModuleCache)
-	b.WriteString("def _run(item, sock):\n")
-	b.WriteString("    _factory(item).run_with_socket(sock)\n\n")
+	b.WriteString(pythonRunnerFactoryScope)
+	b.WriteString("def _run(item, sock, built=None):\n")
+	b.WriteString("    extension = _build(item, sock)\n")
+	b.WriteString("    if built is not None:\n")
+	b.WriteString("        built.set()\n")
+	b.WriteString("    extension.run_with_socket(sock)\n\n")
 	b.WriteString(pythonRunnerFailureReport)
 	b.WriteString(pythonRunnerMain)
 	return b.String()
 }
+
+// pythonRunnerFactoryScope builds one member at a time with PIG_EXT_SOCKET set to that member's socket, which is what an isolated extension's factory sees: a
+// helper the factory calls before run (pig_sdk.parse_frontmatter, parse_date) dials that socket. The members' factories run one at a time, as Pi loads
+// extensions one at a time.
+const pythonRunnerFactoryScope = `_FACTORY_TURN = threading.Lock()
+
+def _build(item, sock):
+    with _FACTORY_TURN:
+        previous = os.environ.get('PIG_EXT_SOCKET')
+        os.environ['PIG_EXT_SOCKET'] = sock
+        try:
+            return _factory(item)
+        finally:
+            if previous is None:
+                os.environ.pop('PIG_EXT_SOCKET', None)
+            else:
+                os.environ['PIG_EXT_SOCKET'] = previous
+
+`
 
 // pythonRunnerMain starts each member's factory, then admits a further generation of a member's factory for every "admit" line on stdin: Pi re-invokes an extension's factory in the process that already holds its module state. The runner exits once every generation has ended, unless the host parked it for a replacement Session. A "park" line names a socket the runner connects to once it holds the process open, so the host retires its last generation only after the notice took effect.
 const pythonRunnerMain = `def _unescape(field):
@@ -214,28 +241,35 @@ def main():
     active_value = os.environ.get('PIG_EXT_ACTIVE_MEMBERS')
     active = set(active_value.split(',')) if active_value else None
 
-    def target(item, sock):
+    def target(item, sock, built):
         try:
             if not sock:
                 raise RuntimeError(f'{item[1]} not set for {item[0]}')
-            _run(item, sock)
+            _run(item, sock, built)
         except BaseException as exc:
             errors.append(f'{item[0]}: {exc}')
             _report_member_failure(item, exc, sock)
         finally:
+            built.set()
             with cond:
                 state['live'] -= 1
                 cond.notify_all()
 
     def start(item, sock):
+        # The returned event is set once the member's factory has returned or failed.
+        built = threading.Event()
         with cond:
             state['live'] += 1
-        threading.Thread(target=target, args=(item, sock)).start()
+        threading.Thread(target=target, args=(item, sock, built)).start()
+        return built
 
     for item in ITEMS:
         if active is not None and item[0] not in active:
             continue
-        start(item, os.environ.get(item[1]) or (os.environ.get('PIG_EXT_SOCKET') if len(ITEMS) == 1 else None))
+        # The host accepts the members in order and serves a connection only after the members before it. A factory that calls the host before it returns (a
+        # subscription on the event bus) waits for that service, so a later member must not take the factory turn before an earlier one: it would hold the turn
+        # while the host waits for the earlier member's connection.
+        start(item, os.environ.get(item[1]) or (os.environ.get('PIG_EXT_SOCKET') if len(ITEMS) == 1 else None)).wait()
 
     def control():
         for line in sys.stdin:
@@ -517,7 +551,7 @@ func CurrentPythonPackedCellEntry(cacheRoot, key string, extensions []PythonExte
 	if err != nil {
 		return "", false, err
 	}
-	lockCandidates := append([]string{os.Getenv("PIG_SDK_PY_ROOT")}, stagedSDKRoots("sdk-py")...)
+	lockCandidates := append([]string{os.Getenv("PIG_SDK_PY_ROOT")}, stagedSDKRoots("python")...)
 	return pigsdklock.WithBuildEntryCandidates(context.Background(), lockCandidates, func() (string, bool, error) {
 		sdkRoot, err := findPythonSDKRoot()
 		if err != nil {

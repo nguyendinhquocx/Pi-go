@@ -24,7 +24,7 @@ export { VStack, } from "./components/v-stack.js";
 // Fuzzy matching
 export { fuzzyFilter, fuzzyMatch } from "./fuzzy.js";
 // Keybindings
-export { getKeybindings, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS, } from "./keybindings.js";
+export { getKeybindings, getSelectPageIndex, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS, } from "./keybindings.js";
 // Keyboard input handling
 export { decodeKittyPrintable, isKeyRelease, isKeyRepeat, isKittyProtocolActive, Key, matchesKey, parseKey, setKittyProtocolActive, } from "./keys.js";
 // LaTeX rendering
@@ -32,6 +32,8 @@ export { renderLatex } from "./latex.js";
 // Native platform integration
 export { getNativeClipboard } from "./native-platform.js";
 export { oklabToOkhslLightness } from "./oklab.js";
+// Program status reporting (OSC 7501)
+export { formatProgramStatus } from "./program-status.js";
 // Input buffering for batch splitting
 export { StdinBuffer } from "./stdin-buffer.js";
 // Terminal interface and implementations
@@ -40,9 +42,9 @@ export { isAppleTerminalSession, ProcessTerminal } from "./terminal.js";
 export { parseTerminalColorSchemeReport, } from "./terminal-colors.js";
 // Terminal image support
 export { allocateImageId, calculateImageRows, deleteAllKittyImages, deleteKittyImage, detectCapabilities, encodeITerm2, encodeKitty, getCapabilities, getCellDimensions, getGifDimensions, getImageDimensions, getJpegDimensions, getPngDimensions, getTerminalColorMode, getWebpDimensions, hyperlink, imageFallback, renderImage, resetCapabilitiesCache, setCapabilities, setCapabilityOverrides, setCellDimensions, } from "./terminal-image.js";
-export { Container, CURSOR_MARKER, compositeTuiLine, isFocusable, isViewportTUI, } from "./tui.js";
+export { Container, CURSOR_MARKER, compositeTuiLine, isFocusable, isViewportTUI, renderFakeCursor, } from "./tui.js";
 export { TuiAltScreen } from "./tui-alt-screen.js";
 export { TuiMainScreen } from "./tui-main-screen.js";
 // Utilities
-export { getOsc8LinkAtColumn, sliceByColumn, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, } from "./utils.js";
+export { getOsc8LinkAtColumn, replaceControlCharacters, sliceByColumn, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, } from "./utils.js";
 //# sourceMappingURL=index.js.map

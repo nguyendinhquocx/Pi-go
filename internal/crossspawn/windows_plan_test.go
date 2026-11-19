@@ -1,5 +1,7 @@
 package crossspawn
 
+// pi: packages/coding-agent/src/utils/child-process.ts
+
 import (
 	"encoding/json"
 	"os"
@@ -49,6 +51,23 @@ func TestWindowsPlanCmdShimMatcherMatchesCrossSpawn(t *testing.T) {
 		plan := planWindowsCommand("", script, []string{"one&two"})
 		if !strings.HasSuffix(plan.cmdLine, ` ^^^"one^^^&two^^^""`) {
 			t.Errorf("%s: lost second escape pass: %q", dir, plan.cmdLine)
+		}
+	}
+}
+
+// isCmdShimRegExp is /node_modules[\\/].bin[\\/][^\\/]+\.cmd$/i: a long s (U+017F) is not the s of node_modules in JavaScript, although Go's (?i) folds it.
+func TestWindowsPlanCmdShimMatcherFoldsASCIIOnly(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{`C:\p\node_modules\.bin\tool.cmd`, true},
+		{`C:\p\NODE_MODULES\.BIN\TOOL.CMD`, true},
+		{`C:\p\node_moduleſ\.bin\tool.cmd`, false},
+		{`C:\p\node_modules\.bin\tooſ.cmd`, true},
+	} {
+		if got := cmdShim.MatchString(tc.path); got != tc.want {
+			t.Errorf("cmdShim(%q) = %v, want %v", tc.path, got, tc.want)
 		}
 	}
 }

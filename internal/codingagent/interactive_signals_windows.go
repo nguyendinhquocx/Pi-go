@@ -2,6 +2,8 @@
 
 package codingagent
 
+// Ports packages/coding-agent/src/modes/interactive/interactive-mode.ts (handleCtrlZ; the resize handler is the pig terminal wiring of the same lifecycle).
+
 import (
 	"context"
 	"os"
@@ -47,5 +49,6 @@ func (m *InteractiveMode) installResizeHandler(ctx context.Context) func() {
 // SIGTSTP job control, which Windows lacks. Mirrors upstream handleCtrlZ's
 // win32 branch (interactive-mode.ts), which calls showStatus.
 func (m *InteractiveMode) handleSuspend() error {
+	//portlint:allow ctxbackground interactive-mode.ts:4399-4401 handleCtrlZ only shows a status on win32; suspendTerminal returns before it reads the context
 	return suspendTerminal(context.Background(), "windows", m.showStatus, suspendOperations{})
 }

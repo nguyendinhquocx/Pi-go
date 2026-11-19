@@ -7,7 +7,7 @@ import { createRequire } from "node:module";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CONFIG_DIR_NAME, getAgentDir, isBunBinary, isBundledNode } from "../../config.js";
-import { resolvePath } from "../../utils/paths.js";
+import { pathsEqual, resolvePath } from "../../utils/paths.js";
 import { createEventBus } from "../event-bus.js";
 import { execCommand } from "../exec.js";
 import { McpServerRegistry, mcpNamespace, validateMcpServerConfig } from "../mcp-servers.js";
@@ -53,10 +53,12 @@ function getAliases() {
     const piCodingAgentEntry = packageIndex;
     const piAgentCoreEntry = resolveWorkspaceOrImport("agent/dist/index.js", "@earendil-works/pi-agent-core");
     const piTuiEntry = resolveWorkspaceOrImport("tui/dist/index.js", "@earendil-works/pi-tui");
-    // Extensions resolve the pi-ai root to the compat entrypoint (a strict
-    // superset of the core entrypoint): existing extensions using the old
-    // global API keep working at runtime until compat is removed.
-    const piAiCompatEntry = resolveWorkspaceOrImport("ai/dist/compat.js", "@earendil-works/pi-ai/compat");
+    // Extensions resolve the pi-ai root to the extension view: the compat
+    // entrypoint (a strict superset of the core entrypoint) plus TypeBox's Type,
+    // Static and TSchema, so extensions using the old global API and pi-ai's
+    // former TypeBox re-exports keep working.
+    const piAiCompatEntry = path.resolve(__dirname, "pi-ai-extension-view.js");
+    const piAiModelsEntry = resolveWorkspaceOrImport("ai/dist/models.js", "@earendil-works/pi-ai/models");
     const piAiOauthEntry = resolveWorkspaceOrImport("ai/dist/oauth.js", "@earendil-works/pi-ai/oauth");
     const piAiProvidersEntry = resolveWorkspaceOrImport("ai/dist/providers/all.js", "@earendil-works/pi-ai/providers/all");
     _aliases = {
@@ -65,6 +67,7 @@ function getAliases() {
         "@earendil-works/pi-tui": piTuiEntry,
         "@earendil-works/pi-ai/providers/all": piAiProvidersEntry,
         "@earendil-works/pi-ai/compat": piAiCompatEntry,
+        "@earendil-works/pi-ai/models": piAiModelsEntry,
         "@earendil-works/pi-ai/oauth": piAiOauthEntry,
         "@earendil-works/pi-ai": piAiCompatEntry,
         "@mariozechner/pi-coding-agent": piCodingAgentEntry,
@@ -72,6 +75,7 @@ function getAliases() {
         "@mariozechner/pi-tui": piTuiEntry,
         "@mariozechner/pi-ai/providers/all": piAiProvidersEntry,
         "@mariozechner/pi-ai/compat": piAiCompatEntry,
+        "@mariozechner/pi-ai/models": piAiModelsEntry,
         "@mariozechner/pi-ai/oauth": piAiOauthEntry,
         "@mariozechner/pi-ai": piAiCompatEntry,
         typebox: typeboxEntry,
@@ -93,7 +97,7 @@ export function clearExtensionCache() {
 }
 function useExtensionCacheCwd(cwd) {
     const resolvedCwd = resolvePath(cwd);
-    if (extensionCacheCwd !== undefined && extensionCacheCwd !== resolvedCwd) {
+    if (extensionCacheCwd !== undefined && !pathsEqual(extensionCacheCwd, resolvedCwd)) {
         clearExtensionCache();
     }
     extensionCacheCwd = resolvedCwd;

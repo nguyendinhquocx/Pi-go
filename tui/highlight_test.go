@@ -1,6 +1,10 @@
+//go:build !pig_strip_syntax_highlight
+
 package tui
 
 import (
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -63,6 +67,40 @@ func TestHighlightCode_MultilineString(t *testing.T) {
 	}
 	if !strings.Contains(stripANSI(out[2]), "}") {
 		t.Errorf("line 2 content lost: %q", out[2])
+	}
+}
+
+// Ports packages/coding-agent/test/syntax-highlight.test.ts "colors each line of Python docstrings independently" (1.0.4,
+// #10143): a token that spans lines is formatted once per non-empty line, so every line keeps its color and an empty line
+// stays empty.
+func TestHighlightCode_ColorsEachLineOfPythonDocstringsIndependently(t *testing.T) {
+	code := "\"\"\"\nline one\n\nline two\n\"\"\"\nafter"
+	ansi := ActiveTheme().SyntaxString
+	want := []string{
+		ansi + "\"\"\"\x1b[39m",
+		ansi + "line one\x1b[39m",
+		"",
+		ansi + "line two\x1b[39m",
+		ansi + "\"\"\"\x1b[39m",
+		"after",
+	}
+	if got := HighlightCode(code, "python"); !slices.Equal(got, want) {
+		t.Errorf("HighlightCode = %q, want %q", got, want)
+	}
+	if got := HighlightCode(code, "python"); !slices.Equal(got, want) {
+		t.Errorf("markdown theme highlightCode = %q, want %q", got, want)
+	}
+}
+
+// Ports the `subst` entry of theme.ts buildCliHighlightTheme (1.0.4): string interpolations take the text color.
+func TestCliHighlightThemeColorsSubstitutionsWithTheTextColor(t *testing.T) {
+	theme := cliHighlightTheme(ActiveTheme())
+	format, ok := theme["subst"]
+	if !ok {
+		t.Fatal("the highlight theme has no subst entry")
+	}
+	if got, want := format("${x}"), ActiveTheme().Fg("text", "${x}"); got != want {
+		t.Errorf("subst = %q, want %q", got, want)
 	}
 }
 
@@ -164,5 +202,35 @@ func TestRenderHighlightedHtmlReadsObjectPrototypeMembers(t *testing.T) {
 	}
 	if got := RenderHighlightedHtml(`<span class="hljs-keyword">x</span>y`, HighlightTheme{"keyword": nil, "default": defaultFormatter}); got != "DxDy" {
 		t.Errorf("own undefined keyword: got %q, want %q", got, "DxDy")
+	}
+}
+
+// theme.ts highlightCode (Pi 0f21a331) wraps the highlight in `try { ... } catch { return code.split("\n").map((line) => theme.fg("mdCodeBlock", line)); }`, and
+// getMarkdownTheme().highlightCode is that same function, so a highlight that throws takes the mdCodeBlock color for both. A theme with no color for a syntax token is a
+// highlight that throws: the cli-highlight formatter calls theme.fg, and fg throws `Unknown theme color: <token>`.
+func TestHighlightCodeThatFailsTakesTheCodeBlockColor(t *testing.T) {
+	full := componentThemeOverride(t)
+	broken, err := NewThemeFromANSIPalette("broken", maps.Clone(full.fgAnsi), maps.Clone(full.bgAnsi), full.GetColorMode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(broken.fgAnsi, "syntaxKeyword")
+	code := "const answer = 42;\nreturn answer"
+	want := codeBlockLines(code, broken)
+	if slices.Equal(want, strings.Split(code, "\n")) {
+		t.Fatal("the mdCodeBlock color of the test theme draws nothing, so it cannot tell a styled fallback from an unstyled one")
+	}
+	if got := HighlightCodeFor(broken, code, "javascript"); !slices.Equal(got, want) {
+		t.Errorf("highlightCode of a failing highlight = %q, Pi gives %q", got, want)
+	}
+	if got := MarkdownThemeFor(broken).HighlightCode(code, "javascript"); !slices.Equal(got, want) {
+		t.Errorf("getMarkdownTheme().highlightCode of a failing highlight = %q, Pi gives %q", got, want)
+	}
+	// The active theme goes through the memo and the resumable highlighter: a failure is not a panic there either.
+	previous := activeTheme.Load()
+	t.Cleanup(func() { activeTheme.Store(previous) })
+	activeTheme.Store(broken)
+	if got := HighlightCode(code, "javascript"); !slices.Equal(got, want) {
+		t.Errorf("HighlightCode under the active theme = %q, Pi gives %q", got, want)
 	}
 }

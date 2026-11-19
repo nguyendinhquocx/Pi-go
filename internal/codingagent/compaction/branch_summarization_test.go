@@ -1,5 +1,7 @@
 package compaction
 
+// pi: packages/coding-agent/src/core/compaction/branch-summarization.ts
+
 import (
 	"context"
 	"encoding/json"
@@ -7,6 +9,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/MichaelKinsy/PiG/internal/sessionentry"
 
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
@@ -22,8 +26,8 @@ type memSession struct {
 	chains map[string][]string // leafID → ordered IDs (root first)
 }
 
-func (m *memSession) Branch(leafID string) []codingagent.SessionEntry {
-	ids, ok := m.chains[leafID]
+func (m *memSession) GetBranch(fromID ...string) []codingagent.SessionEntry {
+	ids, ok := m.chains[fromID[0]]
 	if !ok {
 		return nil
 	}
@@ -36,24 +40,19 @@ func (m *memSession) Branch(leafID string) []codingagent.SessionEntry {
 	return out
 }
 
-func (m *memSession) EntryByID(id string) (codingagent.SessionEntry, bool) {
+func (m *memSession) GetEntry(id string) (codingagent.SessionEntry, bool) {
 	e, ok := m.entries[id]
 	return e, ok
 }
 
 // makeEntry builds a SessionEntry of the given type with the given IDs.
 func makeEntry(typ, id string, parentID *string) codingagent.SessionEntry {
-	base := codingagent.SessionEntryBase{
-		Type:     typ,
-		ID:       id,
-		ParentID: parentID,
-	}
 	raw, _ := json.Marshal(map[string]any{
 		"type":     typ,
 		"id":       id,
 		"parentId": parentIDOrNull(parentID),
 	})
-	return codingagent.NewSessionEntry(raw, base)
+	return sessionentry.DecodeSessionEntry(raw)
 }
 
 func parentIDOrNull(p *string) any {
@@ -69,11 +68,6 @@ func makeMessageEntry(id string, parentID *string, tokens int) codingagent.Sessi
 	for i := range text {
 		text[i] = 'x'
 	}
-	base := codingagent.SessionEntryBase{
-		Type:     "message",
-		ID:       id,
-		ParentID: parentID,
-	}
 	raw, _ := json.Marshal(map[string]any{
 		"type":     "message",
 		"id":       id,
@@ -83,16 +77,11 @@ func makeMessageEntry(id string, parentID *string, tokens int) codingagent.Sessi
 			"content": []any{map[string]any{"type": "text", "text": string(text)}},
 		},
 	})
-	return codingagent.NewSessionEntry(raw, base)
+	return sessionentry.DecodeSessionEntry(raw)
 }
 
 // makeBranchSummaryEntry builds a branch_summary SessionEntry.
 func makeBranchSummaryEntry(id string, parentID *string, summary string, fromHook bool, details *BranchSummaryDetails) codingagent.SessionEntry {
-	base := codingagent.SessionEntryBase{
-		Type:     "branch_summary",
-		ID:       id,
-		ParentID: parentID,
-	}
 	body := map[string]any{
 		"type":     "branch_summary",
 		"id":       id,
@@ -105,7 +94,7 @@ func makeBranchSummaryEntry(id string, parentID *string, summary string, fromHoo
 		body["details"] = details
 	}
 	raw, _ := json.Marshal(body)
-	return codingagent.NewSessionEntry(raw, base)
+	return sessionentry.DecodeSessionEntry(raw)
 }
 
 // branchFakeCompleter implements SimpleCompleter for branch summarization tests.
@@ -130,6 +119,7 @@ func (f *branchFakeCompleter) CompleteSimple(ctx context.Context, _ *ai.Model, _
 // TestCollectEntriesForBranchSummary: 4-node chain A→B→C→D.
 // oldLeafID="D", targetID="B"
 // Expected: entries=[C,D] in chronological order, commonAncestorID="B".
+// Pi: packages/coding-agent/src/core/compaction/branch-summarization.ts:62 (CollectEntriesResult.entries); packages/coding-agent/src/core/compaction/branch-summarization.ts:64 (CollectEntriesResult.commonAncestorId).
 func TestCollectEntriesForBranchSummary(t *testing.T) {
 	// Build chain A→B→C→D
 	entA := makeEntry("message", "A", nil)
@@ -155,11 +145,11 @@ func TestCollectEntriesForBranchSummary(t *testing.T) {
 	if len(result.Entries) != 2 {
 		t.Fatalf("entries length: got %d, want 2", len(result.Entries))
 	}
-	if result.Entries[0].Base.ID != "C" {
-		t.Errorf("entries[0].ID: got %q, want %q", result.Entries[0].Base.ID, "C")
+	if result.Entries[0].Base().ID != "C" {
+		t.Errorf("entries[0].ID: got %q, want %q", result.Entries[0].Base().ID, "C")
 	}
-	if result.Entries[1].Base.ID != "D" {
-		t.Errorf("entries[1].ID: got %q, want %q", result.Entries[1].Base.ID, "D")
+	if result.Entries[1].Base().ID != "D" {
+		t.Errorf("entries[1].ID: got %q, want %q", result.Entries[1].Base().ID, "D")
 	}
 }
 
@@ -184,6 +174,7 @@ func TestCollectEntries_NoOldLeaf(t *testing.T) {
 
 // TestPrepareBranchEntries_TokenBudget: entries summing to ~8000 tokens with
 // budget=5000 → total ≤ 5000; file ops collected from ALL entries.
+// Pi: packages/coding-agent/src/core/compaction/branch-summarization.ts:57 (BranchPreparation.totalTokens).
 func TestPrepareBranchEntries_TokenBudget(t *testing.T) {
 	// Each entry is 2000 tokens (2000*4 = 8000 chars). Four entries = 8000 tokens.
 	e1 := makeMessageEntry("1", nil, 2000)
@@ -192,7 +183,10 @@ func TestPrepareBranchEntries_TokenBudget(t *testing.T) {
 	e4 := makeMessageEntry("4", new("3"), 2000)
 
 	entries := []codingagent.SessionEntry{e1, e2, e3, e4}
-	prep := PrepareBranchEntries(entries, 5000)
+	prep, err := PrepareBranchEntries(entries, 5000)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if prep.TotalTokens > 5000 {
 		t.Errorf("TotalTokens %d exceeds budget 5000", prep.TotalTokens)
@@ -201,6 +195,7 @@ func TestPrepareBranchEntries_TokenBudget(t *testing.T) {
 
 // TestPrepareBranchEntries_SummaryEntryFitsPriority: a branch_summary entry
 // that would exceed budget at 89% usage → still included.
+// Pi: packages/coding-agent/src/core/compaction/branch-summarization.ts:53 (BranchPreparation.messages).
 func TestPrepareBranchEntries_SummaryEntryFitsPriority(t *testing.T) {
 	// Budget = 1000. First build a message using 880 tokens (88%).
 	msgEntry := makeMessageEntry("1", nil, 880)
@@ -213,7 +208,10 @@ func TestPrepareBranchEntries_SummaryEntryFitsPriority(t *testing.T) {
 	bsEntry := makeBranchSummaryEntry("2", new("1"), string(summaryText), false, nil)
 
 	entries := []codingagent.SessionEntry{msgEntry, bsEntry}
-	prep := PrepareBranchEntries(entries, 1000)
+	prep, err := PrepareBranchEntries(entries, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// The branch_summary should be included (priority fit: 88% < 90%).
 	found := false
@@ -235,8 +233,34 @@ func makeTestEntries() []codingagent.SessionEntry {
 	return []codingagent.SessionEntry{makeMessageEntry("1", nil, 10)}
 }
 
+// branch-summarization.test.ts "passes the thinking level only for reasoning-capable models" (:47): a reasoning model
+// at xhigh requests xhigh, at off requests nothing, and a non-reasoning model requests nothing.
+func TestGenerateBranchSummaryPassesThinkingLevelOnlyForReasoningModels(t *testing.T) {
+	recorder := &summaryRecorder{}
+	for _, tc := range []struct {
+		model *ai.Model
+		level ai.ModelThinkingLevel
+	}{
+		{createSummaryModel(true, 8192, nil), ai.ThinkingXHigh},
+		{createSummaryModel(true, 8192, nil), ai.ThinkingOff},
+		{createSummaryModel(false, 8192, nil), ai.ThinkingHigh},
+	} {
+		if result := GenerateBranchSummary(t.Context(), makeTestEntries(), GenerateBranchSummaryOptions{Model: tc.model, Completer: recorder, ThinkingLevel: tc.level}); result.Error != "" {
+			t.Fatal(result.Error)
+		}
+	}
+	var seen []ai.ThinkingLevel
+	for _, call := range recorder.calls {
+		seen = append(seen, call.options.Thinking)
+	}
+	if want := []ai.ThinkingLevel{ai.ThinkingLevelXHigh, "", ""}; !slices.Equal(seen, want) {
+		t.Fatalf("reasoning = %q, want %q", seen, want)
+	}
+}
+
 // TestGenerateBranchSummary_Abort: fake completer returns aborted context →
 // BranchSummaryResult{Aborted: true}.
+// Pi: packages/coding-agent/src/core/compaction/branch-summarization.ts:39 (BranchSummaryResult.aborted).
 func TestGenerateBranchSummary_Abort(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately so ctx.Err() != nil
@@ -287,6 +311,7 @@ func TestGenerateBranchSummary_Error(t *testing.T) {
 
 // TestGenerateBranchSummary_Success: fake completer returns "my summary" →
 // result has BRANCH_SUMMARY_PREAMBLE prefix.
+// Pi: packages/coding-agent/src/core/compaction/branch-summarization.ts:35 (BranchSummaryResult.summary).
 func TestGenerateBranchSummary_Success(t *testing.T) {
 	completer := &branchFakeCompleter{result: "my summary"}
 	result := GenerateBranchSummary(context.Background(), makeTestEntries(), GenerateBranchSummaryOptions{
@@ -308,31 +333,89 @@ func TestGenerateBranchSummary_Success(t *testing.T) {
 // TestBranchSummaryMaxTokens pins upstream generateBranchSummary's response
 // budget: min(4096, model.maxTokens), where a zero model limit means 4096. The
 // input token budget (context window minus reserve) must not reach the request.
+// Pi: packages/coding-agent/src/core/compaction/branch-summarization.ts:39 (BranchSummaryResult.aborted); packages/coding-agent/src/core/compaction/branch-summarization.ts:83 (GenerateBranchSummaryOptions.reserveTokens).
 func TestBranchSummaryMaxTokens(t *testing.T) {
-	cases := []struct {
-		name            string
-		maxOutputTokens int
-		want            int
-	}{
-		{name: "large output limit caps at 4096", maxOutputTokens: 64000, want: 4096},
-		{name: "small output limit wins", maxOutputTokens: 1024, want: 1024},
-		{name: "unknown output limit uses 4096", maxOutputTokens: 0, want: 4096},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			completer := &fakeCompleter{response: "summary"}
-			model := &ai.Model{Capabilities: ai.ModelCapabilities{ContextWindow: 200000, MaxOutputTokens: tc.maxOutputTokens}}
-			result := GenerateBranchSummary(context.Background(), makeTestEntries(), GenerateBranchSummaryOptions{
-				Model:         model,
-				Completer:     completer,
-				ReserveTokens: 16384,
-			})
-			if result.Error != "" || result.Aborted {
-				t.Fatalf("unexpected result: %+v", result)
-			}
-			if !slices.Equal(completer.maxTokens, []int{tc.want}) {
-				t.Fatalf("maxTokens = %v, want [%d]", completer.maxTokens, tc.want)
-			}
+	// branch-summarization.test.ts (Pi 6fcb4867, #9512): a branch summary sets no maxTokens, whatever the model's output
+	// limit, so it uses the model's own.
+	for _, maxOutputTokens := range []int{64000, 1024, 0} {
+		completer := &fakeCompleter{response: "summary"}
+		model := &ai.Model{Capabilities: ai.ModelCapabilities{ContextWindow: 200000, MaxOutputTokens: maxOutputTokens}}
+		result := GenerateBranchSummary(context.Background(), makeTestEntries(), GenerateBranchSummaryOptions{
+			Model:         model,
+			Completer:     completer,
+			ReserveTokens: 16384,
 		})
+		if result.Error != "" || result.Aborted {
+			t.Fatalf("unexpected result: %+v", result)
+		}
+		if !slices.Equal(completer.maxTokens, []int{0}) {
+			t.Fatalf("output limit %d: maxTokens = %v, want none set", maxOutputTokens, completer.maxTokens)
+		}
+	}
+}
+
+// makeAssistantEntry builds an assistant "message" SessionEntry with one text block.
+func makeAssistantEntry(id, parentID, text, stopReason string) codingagent.SessionEntry {
+	message := map[string]any{
+		"role":       "assistant",
+		"content":    []any{map[string]any{"type": "text", "text": text}},
+		"api":        "faux",
+		"provider":   "faux",
+		"model":      "faux-model",
+		"stopReason": stopReason,
+		"timestamp":  2,
+		"usage": map[string]any{
+			"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+			"cost": map[string]any{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0},
+		},
+	}
+	if stopReason == "error" {
+		message["errorMessage"] = "lost"
+	}
+	raw, _ := json.Marshal(map[string]any{"type": "message", "id": id, "parentId": parentID, "timestamp": "1970-01-01T00:00:00.002Z", "message": message})
+	return sessionentry.DecodeSessionEntry(raw)
+}
+
+// makeContextEditEntry builds a context_edit SessionEntry; a nil replacement omits the target.
+func makeContextEditEntry(id, parentID, targetID string, replacement map[string]any) codingagent.SessionEntry {
+	raw, _ := json.Marshal(map[string]any{"type": "context_edit", "id": id, "parentId": parentID, "timestamp": "1970-01-01T00:00:00.003Z", "targetId": targetID, "replacement": replacement})
+	return sessionentry.DecodeSessionEntry(raw)
+}
+
+// TestPrepareBranchEntries_AppliesContextEdits: an omitted assistant entry is dropped and a replaced one carries its replacement content.
+// Pi: packages/coding-agent/test/branch-summarization.test.ts "applies context edits to branch entries"; packages/coding-agent/src/core/compaction/branch-summarization.ts:196 (prepareBranchEntries).
+func TestPrepareBranchEntries_AppliesContextEdits(t *testing.T) {
+	user, err := json.Marshal(map[string]any{"type": "message", "id": "u1", "parentId": nil, "timestamp": "1970-01-01T00:00:00.001Z", "message": map[string]any{"role": "user", "content": "Investigate login", "timestamp": 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := []codingagent.SessionEntry{
+		sessionentry.DecodeSessionEntry(user),
+		makeAssistantEntry("failed", "u1", "FAILED_ATTEMPT", "error"),
+		makeContextEditEntry("e1", "failed", "failed", nil),
+		makeAssistantEntry("ok", "e1", "ORIGINAL_TEXT", "stop"),
+		makeContextEditEntry("e2", "ok", "ok", map[string]any{"content": "REPLACED_TEXT"}),
+	}
+
+	prep, err := PrepareBranchEntries(branch, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serialized, err := json.Marshal(prep.Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(serialized)
+	if !strings.Contains(got, "Investigate login") {
+		t.Errorf("user entry missing from %s", got)
+	}
+	if strings.Contains(got, "FAILED_ATTEMPT") {
+		t.Errorf("omitted entry present in %s", got)
+	}
+	if strings.Contains(got, "ORIGINAL_TEXT") {
+		t.Errorf("replaced entry kept its original text in %s", got)
+	}
+	if !strings.Contains(got, "REPLACED_TEXT") {
+		t.Errorf("replacement missing from %s", got)
 	}
 }

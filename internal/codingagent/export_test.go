@@ -10,6 +10,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
 	"github.com/MichaelKinsy/PiG/tui"
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
@@ -27,25 +28,27 @@ type TestHarness struct {
 // NewTestHarness builds a mode around opts.SessionHandle and starts its owner
 // loop. onEvent, when non-nil, runs on the loop after the mode handles each
 // Session event.
-func NewTestHarness(t testing.TB, opts InteractiveOptions, onEvent func(h *TestHarness, ev agent.AgentEvent)) *TestHarness {
+func NewTestHarness(t testing.TB, opts InteractiveModeOptions, onEvent func(h *TestHarness, ev agent.AgentEvent)) *TestHarness {
 	t.Helper()
 	restoreStartupTheme(t)
-	m := NewInteractiveMode(opts)
+	m := NewInteractiveMode(nil, opts)
 	m.chatContainer = tui.NewContainer()
 	m.loadedResourcesContainer = tui.NewContainer()
 	m.editorContainer = tui.NewContainer()
 	m.statusContainer = tui.NewContainer()
 	m.pendingMessagesContainer = tui.NewContainer()
+	m.widgetContainer = tui.NewContainer(tui.NewSpacer(1))
+	m.widgetContainerBelow = tui.NewContainer()
 	m.rendererOut = io.Discard
 	m.tuiInst = tui.NewWithOutput(m.rendererOut, 100, 30)
-	m.statusLine = NewStatusLine(opts.Model, "", nil)
+	m.statusLine = NewFooterComponent(opts.Model, "", nil)
 	m.editor = tui.NewEditor()
 	m.editorContainer.Add(m.editor)
 	m.layout = tui.NewContainer(m.loadedResourcesContainer, m.chatContainer, m.editorContainer)
 	m.tuiInst.SetFocus(m.editor)
 	m.newRunner = opts.ExtensionRunner
 	m.wireInprocContextActions()
-	m.keybindings = DefaultKeybindingsManager()
+	m.keybindings = NewKeybindingsManagerFromBindings(harnessUserBindings, "")
 	m.slashRegistry = NewSlashRegistry()
 	m.agent = opts.SessionHandle.Agent()
 	m.installRunPromptTurnRefresh()
@@ -90,6 +93,20 @@ func (h *TestHarness) RebindToReplacement(ctx context.Context, session Interacti
 	return h.m.rebindFromRuntime(ctx, session)
 }
 
+// ReplaceExtensionRunner swaps in a runner over exts as /reload does and returns the errors that reload reports.
+func (h *TestHarness) ReplaceExtensionRunner(exts []extension.Extension) []error {
+	var errs []error
+	h.Do(func() { errs = h.m.replaceExtensionRunner(exts) })
+	return errs
+}
+
+// Runner is the in-process runner the mode currently binds.
+func (h *TestHarness) Runner() *inproc.Runner {
+	var runner *inproc.Runner
+	h.Do(func() { runner = h.m.newRunner })
+	return runner
+}
+
 // Do runs fn on the owner loop and waits for it.
 func (h *TestHarness) Do(fn func()) {
 	finished := make(chan struct{})
@@ -117,6 +134,35 @@ func (h *TestHarness) SubmitInitialMessages(messages []string) {
 func (h *TestHarness) Key(data string) {
 	_ = h.m.dispatchKey(h.ctx, data)
 }
+
+// PendingDisplay returns the pending-messages rows as plain text.
+func (h *TestHarness) PendingDisplay() string {
+	var text string
+	h.Do(func() {
+		lines := h.m.pendingMessagesContainer.Render(100)
+		for i, line := range lines {
+			lines[i] = widthx.StripAnsi(line)
+		}
+		text = strings.Join(lines, "\n")
+	})
+	return text
+}
+
+// BelowEditor returns the rows under the editor as plain text.
+func (h *TestHarness) BelowEditor() string {
+	var text string
+	h.Do(func() {
+		lines := h.m.widgetContainerBelow.Render(100)
+		for i, line := range lines {
+			lines[i] = widthx.StripAnsi(line)
+		}
+		text = strings.Join(lines, "\n")
+	})
+	return text
+}
+
+// SetEditorText replaces the editor's text. Call it on the owner loop.
+func (h *TestHarness) SetEditorText(text string) { h.m.editor.SetText(text) }
 
 // EditorText returns the editor's text.
 func (h *TestHarness) EditorText() string {
@@ -191,4 +237,100 @@ func (h *TestHarness) QueuedMessages() (steering, followUp int) {
 func ToolCard(t *testing.T, name, toolCallID string, args json.RawMessage, definition extension.ToolDefinition) func(width int) []string {
 	t.Helper()
 	return toolComponentRaw(t, name, toolCallID, args, &definition).card.Render
+}
+
+// RecordProgramStatus points the mode's program-status reporter at a terminal that records its reports, and returns a reader that copies the reports on the owner loop.
+func (h *TestHarness) RecordProgramStatus(sessionName string) func() []tui.ProgramStatus {
+	var terminal *programStatusTerminal
+	h.Do(func() { terminal = recordProgramStatus(h.m, sessionName) })
+	return func() []tui.ProgramStatus {
+		var reports []tui.ProgramStatus
+		h.Do(func() { reports = append(reports, terminal.reports...) })
+		return reports
+	}
+}
+
+// InitSnapshot is the state Init leaves behind, for the pty test that drives the real startup sequence.
+type InitSnapshot struct {
+	Initialized          bool
+	EditorPaddingX       int
+	AutocompleteMax      int
+	SteeringMode         string
+	FollowUpMode         string
+	AutoCompact          bool
+	StatusName           string
+	HasUI                bool
+	ExtensionSession     bool
+	TimingsBound         bool
+	StartupHeaderPending bool
+	HideThinking         bool
+	ChatChildren         int
+	WidgetChildren       int
+	Teardowns            int
+	KeybindingsSet       bool
+	SlashRegistrySet     bool
+	FocusIsEditor        bool
+	SlashCommands        []string
+	PromptTemplates      []string
+	ResourceSourceInfo   int
+	FooterCwd            string
+}
+
+// InitSnapshot reads the state of m after Init.
+func (m *InteractiveMode) InitSnapshot() InitSnapshot {
+	snapshot := InitSnapshot{
+		Initialized: m.isInitialized, EditorPaddingX: m.editor.PaddingX(), AutocompleteMax: m.editor.AutocompleteMaxVisible(),
+		AutoCompact: m.statusLine.autoCompactEnabled, StatusName: m.statusLine.name, TimingsBound: m.statusLine.timings != nil,
+		StartupHeaderPending: m.startupHeaderPending, HideThinking: m.hideThinking, ChatChildren: len(m.chatContainer.Children()),
+		WidgetChildren: len(m.widgetContainer.Children()), Teardowns: len(m.teardowns), KeybindingsSet: m.keybindings != nil, SlashRegistrySet: m.slashRegistry != nil,
+	}
+	snapshot.FocusIsEditor = m.tuiInst.GetFocusedComponent() == tui.Component(m.editor)
+	for _, command := range m.slashRegistry.All() {
+		snapshot.SlashCommands = append(snapshot.SlashCommands, command.Name)
+	}
+	for _, template := range m.promptTemplates {
+		snapshot.PromptTemplates = append(snapshot.PromptTemplates, template.Name)
+	}
+	snapshot.ResourceSourceInfo = len(m.resourceSourceInfo)
+	if m.statusLine.FooterDataProvider != nil {
+		snapshot.FooterCwd = m.statusLine.cwd
+	}
+	if m.agent != nil {
+		snapshot.SteeringMode, snapshot.FollowUpMode = string(m.agent.SteeringMode()), string(m.agent.FollowUpMode())
+	}
+	if m.extCtx != nil {
+		snapshot.HasUI, snapshot.ExtensionSession = m.extCtx.HasUI, m.extCtx.Session != nil
+	}
+	return snapshot
+}
+
+// ApplyScopedSelection runs the /scoped-models selector's scope update over the given available models, as the catalog refresh does when the user changed nothing (interactive-mode.ts showModelsSelector updateSessionModels).
+func (h *TestHarness) ApplyScopedSelection(models []tui.ModelItem, enabled []string) {
+	h.Do(func() {
+		selection, _ := newScopedModelsSelection(models, nil, nil)
+		selection.apply(h.m, enabled)
+	})
+}
+
+// HostDequeueInputs are the legacy terminal inputs for the host platform's default app.message.dequeue key: Alt+Up (CSI 1;3A, or ESC p as a terminal in
+// application mode sends it) except with Windows keybindings (native Windows and WSL), where it is Alt+Q, as upstream keybindings.ts.
+func HostDequeueInputs() []string {
+	if key := keybindingDefinitionsFor(tui.HostKeybindingPlatform())["app.message.dequeue"].DefaultKeys[0]; key != "alt+up" {
+		return []string{"\x1bq"}
+	}
+	return []string{"\x1b[1;3A", "\x1bp"}
+}
+
+// HostFollowUpInput is the legacy terminal input for the host platform's default app.message.followUp key (Alt+Enter, Ctrl+Q with Windows keybindings).
+func HostFollowUpInput() string { return hostFollowUpInput() }
+
+// harnessUserBindings are the user bindings the next TestHarness starts with.
+var harnessUserBindings map[string][]KeyID
+
+// BindDequeueToAltUp makes the harnesses of the test bind app.message.dequeue to Alt+Up, its default except with Windows keybindings. The Terminal.app
+// divergence D228 acts only while the action is bound to the key Option+Up stands for.
+func BindDequeueToAltUp(t *testing.T) {
+	t.Helper()
+	harnessUserBindings = map[string][]KeyID{"app.message.dequeue": {"alt+up"}}
+	t.Cleanup(func() { harnessUserBindings = nil })
 }

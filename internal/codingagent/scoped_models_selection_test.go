@@ -50,7 +50,7 @@ func TestScopedModelStartupResolvesConfiguredPatterns(t *testing.T) {
 	clearAllAuthEnv(t)
 	t.Setenv("PI_OFFLINE", "1")
 	registry := NewModelRegistry(t.TempDir())
-	m := NewInteractiveMode(InteractiveOptions{ModelRegistry: registry, Settings: Settings{EnabledModels: []string{"unavailable-one", "unavailable-two"}}})
+	m := NewInteractiveMode(nil, InteractiveModeOptions{ModelRegistry: registry, Settings: Settings{EnabledModels: []string{"unavailable-one", "unavailable-two"}}})
 	m.initScopedModels()
 	if len(m.scopedModelIDs) != 0 {
 		t.Fatalf("unmatched settings leaked into the session scope: %v", m.scopedModelIDs)
@@ -61,7 +61,7 @@ func TestScopedModelStartupUsesSessionScope(t *testing.T) {
 	one := &ai.Model{ID: "one", ProviderMeta: ai.ProviderMetadata{ProviderID: "fixture"}}
 	two := &ai.Model{ID: "two", ProviderMeta: ai.ProviderMetadata{ProviderID: "fixture"}}
 	handle := &recordingCompactHandle{scopedModels: []extension.ScopedModel{{Model: two}, {Model: one}}}
-	m := NewInteractiveMode(InteractiveOptions{
+	m := NewInteractiveMode(nil, InteractiveModeOptions{
 		SessionHandle: handle,
 		Settings:      Settings{EnabledModels: []string{"fixture/one"}},
 	})
@@ -75,7 +75,7 @@ func TestScopedModelStartupUsesSessionScope(t *testing.T) {
 func TestScopedModelStartupKeepsProviderPrefixedIDs(t *testing.T) {
 	auto := &ai.Model{ID: "fixture/auto", ProviderMeta: ai.ProviderMetadata{ProviderID: "fixture"}}
 	handle := &recordingCompactHandle{scopedModels: []extension.ScopedModel{{Model: auto}}}
-	m := NewInteractiveMode(InteractiveOptions{SessionHandle: handle})
+	m := NewInteractiveMode(nil, InteractiveModeOptions{SessionHandle: handle})
 	m.initScopedModels()
 	if want := []string{"fixture/fixture/auto"}; !reflect.DeepEqual(m.scopedModelIDs, want) {
 		t.Fatalf("interactive scope = %v, want %v", m.scopedModelIDs, want)
@@ -91,9 +91,9 @@ func TestScopedSelectionKeepsProviderPrefixedIDsInSessionScope(t *testing.T) {
 	}
 	models := []tui.ModelItem{{FullID: "fixture/fixture/auto", Provider: "fixture"}, {FullID: "fixture/two", Provider: "fixture"}, {FullID: "fixture/three", Provider: "fixture"}}
 	selection, _ := newScopedModelsSelection(models, nil, nil)
-	handle := &recordingCompactHandle{}
-	m := &InteractiveMode{opts: InteractiveOptions{ModelRegistry: NewModelRegistry(dir), SessionHandle: handle}}
-	m.statusLine = NewStatusLine(nil, "test", nil)
+	handle := &recordingCompactHandle{available: NewModelRegistry(dir).GetAvailableModelData()}
+	m := &InteractiveMode{opts: InteractiveModeOptions{SessionHandle: handle}}
+	m.statusLine = NewFooterComponent(nil, "test", nil)
 	selection.apply(m, []string{"fixture/fixture/auto", "fixture/two"})
 	if got := len(handle.ScopedModels()); got != 2 {
 		t.Fatalf("Session scope has %d models, want 2: the provider-prefixed model was dropped", got)
@@ -114,9 +114,9 @@ func TestScopedSelectionSynchronizesSessionScope(t *testing.T) {
 	registry := NewModelRegistry(dir)
 	models := []tui.ModelItem{{FullID: "fixture/one", Provider: "fixture"}, {FullID: "fixture/two", Provider: "fixture"}, {FullID: "fixture/three", Provider: "fixture"}}
 	selection, _ := newScopedModelsSelection(models, nil, nil)
-	handle := &recordingCompactHandle{}
-	m := &InteractiveMode{opts: InteractiveOptions{ModelRegistry: registry, SessionHandle: handle}}
-	m.statusLine = NewStatusLine(nil, "test", nil)
+	handle := &recordingCompactHandle{available: registry.GetAvailableModelData()}
+	m := &InteractiveMode{opts: InteractiveModeOptions{ModelRegistry: registry, SessionHandle: handle}}
+	m.statusLine = NewFooterComponent(nil, "test", nil)
 	for _, tc := range []struct {
 		name    string
 		enabled []string

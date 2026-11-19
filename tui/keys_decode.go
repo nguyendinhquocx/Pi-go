@@ -6,7 +6,6 @@ package tui
 // packages/tui/src/keys.ts used by pi-tui's Input component.
 
 import (
-	"strconv"
 	"strings"
 	"unicode"
 
@@ -27,6 +26,12 @@ const kittyPrintableAllowedModifiers = kittyModifierShift | kittyLockMask
 
 var kittyCSIURegex = lazyregexp.New(`^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$`)
 var modifyOtherKeysRegex = lazyregexp.New(`^\x1b\[27;(\d+);(\d+)~$`)
+
+// Kitty reserves this Private Use Area range for functional keys (F13-F35, media keys, modifier keys, ...). CSI-u codepoints in it are never text.
+const (
+	kittyFunctionalPUAStart = 57344
+	kittyFunctionalPUAEnd   = 63743
+)
 
 var kittyFunctionalKeyEquivalents = map[int]int{
 	57399: 48, // KP_0 -> 0
@@ -65,17 +70,6 @@ func normalizeKittyFunctionalCodepoint(codepoint int) int {
 	return codepoint
 }
 
-func parseOptionalInt(s string) (int, bool) {
-	if s == "" {
-		return 0, false
-	}
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		return 0, false
-	}
-	return n, true
-}
-
 // DecodeKittyPrintable decodes a printable Kitty CSI-u sequence into the
 // corresponding character. Mirrors upstream decodeKittyPrintable().
 func DecodeKittyPrintable(data string) (string, bool) {
@@ -83,20 +77,16 @@ func DecodeKittyPrintable(data string) (string, bool) {
 	if match == nil {
 		return "", false
 	}
-	codepoint, err := strconv.Atoi(match[1])
-	if err != nil {
-		return "", false
+	codepoint := keyCodepoint(keyNumber(match[1]))
+	shiftedKey, hasShiftedKey := 0, match[2] != ""
+	if hasShiftedKey {
+		shiftedKey = keyCodepoint(keyNumber(match[2]))
 	}
-	shiftedKey, hasShiftedKey := parseOptionalInt(match[2])
-	modValue := 1
+	modValue := 1.0
 	if match[4] != "" {
-		parsed, err := strconv.Atoi(match[4])
-		if err != nil {
-			return "", false
-		}
-		modValue = parsed
+		modValue = keyNumber(match[4])
 	}
-	modifier := modValue - 1
+	modifier := jsInt32(modValue - 1)
 	if modifier&^kittyPrintableAllowedModifiers != 0 {
 		return "", false
 	}
@@ -108,13 +98,17 @@ func DecodeKittyPrintable(data string) (string, bool) {
 		if hasShiftedKey {
 			effectiveCodepoint = shiftedKey
 		} else if codepoint >= 'a' && codepoint <= 'z' {
-			// Shift+letter is layout-independent: uppercase the base when the
-			// terminal reports the base codepoint without a shifted alternate
-			// (e.g. \x1b[97;2u for Shift+a). Otherwise capital letters are lost.
+			// pig divergence (D185): Shift+letter with no shifted alternate (\x1b[97;2u)
+			// decodes as the uppercase letter; Pi keeps the base letter. Without it a
+			// terminal that omits the shifted key loses every capital letter.
 			effectiveCodepoint = codepoint - 32
 		}
 	}
 	effectiveCodepoint = normalizeKittyFunctionalCodepoint(effectiveCodepoint)
+	// Drop unmapped Kitty functional keys (F13-F35, media keys, ...).
+	if effectiveCodepoint >= kittyFunctionalPUAStart && effectiveCodepoint <= kittyFunctionalPUAEnd {
+		return "", false
+	}
 	return printableCodepoint(effectiveCodepoint)
 }
 
@@ -128,15 +122,7 @@ func parseModifyOtherKeysSequence(data string) (parsedModifyOtherKeysSequence, b
 	if match == nil {
 		return parsedModifyOtherKeysSequence{}, false
 	}
-	modValue, err := strconv.Atoi(match[1])
-	if err != nil {
-		return parsedModifyOtherKeysSequence{}, false
-	}
-	codepoint, err := strconv.Atoi(match[2])
-	if err != nil {
-		return parsedModifyOtherKeysSequence{}, false
-	}
-	return parsedModifyOtherKeysSequence{codepoint: codepoint, modifier: modValue - 1}, true
+	return parsedModifyOtherKeysSequence{codepoint: keyCodepoint(keyNumber(match[2])), modifier: jsInt32(keyNumber(match[1]) - 1)}, true
 }
 
 func decodeModifyOtherKeysPrintable(data string) (string, bool) {
@@ -214,5 +200,41 @@ func IsKeyRelease(data string) bool {
 		strings.Contains(data, ":3C") ||
 		strings.Contains(data, ":3D") ||
 		strings.Contains(data, ":3H") ||
-		strings.Contains(data, ":3F")
+		strings.Contains(data, ":3F") ||
+		strings.Contains(data, ":3P") ||
+		strings.Contains(data, ":3Q") ||
+		strings.Contains(data, ":3S")
+}
+
+// KeyID is upstream's KeyId (keys.ts:152): a key name such as "enter", "ctrl+c" or "ctrl+shift+f5". Upstream's template-literal union is
+// open here; use the Key helper to build identifiers.
+type KeyID = string
+
+// KeyEventType is the Kitty key event kind of an input sequence (keys.ts:505). Upstream's parser records it only in write-only module
+// state (keys.ts:521 _lastEventType); IsKeyRepeat and IsKeyRelease answer the observable questions.
+type KeyEventType string
+
+// The KeyEventType values.
+const (
+	KeyEventPress   KeyEventType = "press"
+	KeyEventRepeat  KeyEventType = "repeat"
+	KeyEventRelease KeyEventType = "release"
+)
+
+// IsKeyRepeat reports whether a raw input chunk is a Kitty key-repeat event (flag 2, ":2" variants). Bracketed-paste content is never treated as a repeat even when it contains ":2" byte patterns. Mirrors upstream isKeyRepeat.
+func IsKeyRepeat(data string) bool {
+	if strings.Contains(data, "\x1b[200~") {
+		return false
+	}
+	return strings.Contains(data, ":2u") ||
+		strings.Contains(data, ":2~") ||
+		strings.Contains(data, ":2A") ||
+		strings.Contains(data, ":2B") ||
+		strings.Contains(data, ":2C") ||
+		strings.Contains(data, ":2D") ||
+		strings.Contains(data, ":2H") ||
+		strings.Contains(data, ":2F") ||
+		strings.Contains(data, ":2P") ||
+		strings.Contains(data, ":2Q") ||
+		strings.Contains(data, ":2S")
 }

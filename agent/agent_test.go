@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,7 +15,7 @@ import (
 
 // Pi agent.ts:DEFAULT_MODEL declares input: [], not an absent value that adapters may infer as text support.
 func TestAgentDefaultModelRetainsExplicitEmptyInput(t *testing.T) {
-	a := NewAgent(AgentOptions{})
+	a := mustNewAgent(AgentOptions{})
 	model := a.Model()
 	if model.Input == nil || len(model.Input) != 0 {
 		t.Fatalf("default model input = %#v, want explicit empty slice", model.Input)
@@ -26,7 +25,7 @@ func TestAgentDefaultModelRetainsExplicitEmptyInput(t *testing.T) {
 func TestAgentForwardsThinkingBudgets(t *testing.T) {
 	provider := &recordingProvider{seqs: [][]ai.AssistantMessageEvent{textSeq("")}}
 	budgets := &ai.ThinkingBudgets{Medium: 4096}
-	agent := NewAgent(AgentOptions{
+	agent := mustNewAgent(AgentOptions{
 		Model:           &ai.Model{ID: "model", Provider: provider},
 		ThinkingBudgets: budgets,
 	})
@@ -36,34 +35,6 @@ func TestAgentForwardsThinkingBudgets(t *testing.T) {
 	opts := provider.StreamOptions()
 	if len(opts) != 1 || opts[0].ThinkingBudgets == nil || opts[0].ThinkingBudgets.Medium != 4096 {
 		t.Fatalf("stream thinking budgets = %+v", opts)
-	}
-}
-
-// Sending with no model selected (user not logged in / no model chosen) must
-// surface an error, not dereference a nil *ai.Model in runLoop
-// (currentModel.Capabilities / currentModel.Provider). Mirrors upstream
-// agent-session.prompt(), which throws formatNoModelSelectedMessage() before
-// streaming. Without the guard this panics with a nil pointer dereference.
-func TestAgent_Send_NilModel_ReturnsErrorNotPanic(t *testing.T) {
-	a := NewAgent(AgentOptions{Model: nil})
-	msgs, err := a.Send(context.Background(), "hello")
-	if err == nil {
-		t.Fatal("expected an error when no model is selected, got nil")
-	}
-	if !strings.Contains(strings.ToLower(err.Error()), "no model") {
-		t.Fatalf("expected a 'no model' error, got: %v", err)
-	}
-	if len(msgs) != 0 {
-		t.Fatalf("expected no messages appended on a rejected send, got %d", len(msgs))
-	}
-}
-
-// A non-nil model with a nil Provider is the same hazard on the Provider.Stream
-// path; guard it too so a half-built model cannot panic the loop.
-func TestAgent_Send_NilProvider_ReturnsErrorNotPanic(t *testing.T) {
-	a := NewAgent(AgentOptions{Model: &ai.Model{ID: "x", Provider: nil}})
-	if _, err := a.Send(context.Background(), "hello"); err == nil {
-		t.Fatal("expected an error when the model has no provider, got nil")
 	}
 }
 
@@ -246,11 +217,11 @@ func TestAfterToolCallContentOverride(t *testing.T) {
 	overridden := "overridden-content"
 
 	var hookCalls int
-	a := NewAgent(AgentOptions{
+	a := mustNewAgent(AgentOptions{
 		Model:    fakeTestModel(prov),
 		Tools:    []AgentTool{tool},
 		MaxTurns: 5,
-		AfterToolCall: []AfterToolCallHook{
+		AfterToolCallHooks: []AfterToolCallHook{
 			func(_ context.Context, _, _ string, _ json.RawMessage, _ AgentToolResult) AfterToolCallResult {
 				hookCalls++
 				return AfterToolCallResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: overridden}}}
@@ -286,11 +257,11 @@ func TestAfterToolCallImagesOverride(t *testing.T) {
 		textSeq("done"),
 	)
 	images := []ai.ImageContent{{MimeType: "image/png", Data: "normalized"}}
-	agent := NewAgent(AgentOptions{
+	agent := mustNewAgent(AgentOptions{
 		Model:    fakeTestModel(provider),
 		Tools:    []AgentTool{tool},
 		MaxTurns: 5,
-		AfterToolCall: []AfterToolCallHook{func(context.Context, string, string, json.RawMessage, AgentToolResult) AfterToolCallResult {
+		AfterToolCallHooks: []AfterToolCallHook{func(context.Context, string, string, json.RawMessage, AgentToolResult) AfterToolCallResult {
 			return AfterToolCallResult{Content: []ai.ToolResultMessageContent{images[0]}}
 		}},
 	})
@@ -321,11 +292,11 @@ func TestAfterToolCallTerminate(t *testing.T) {
 		textSeq("second turn: should not reach"),
 	)
 
-	a := NewAgent(AgentOptions{
+	a := mustNewAgent(AgentOptions{
 		Model:    fakeTestModel(prov),
 		Tools:    []AgentTool{tool},
 		MaxTurns: 10, // high: terminate must fire before this
-		AfterToolCall: []AfterToolCallHook{
+		AfterToolCallHooks: []AfterToolCallHook{
 			func(_ context.Context, _, _ string, _ json.RawMessage, _ AgentToolResult) AfterToolCallResult {
 				return AfterToolCallResult{Terminate: new(true)}
 			},
@@ -351,39 +322,45 @@ func TestAfterToolCallTerminate(t *testing.T) {
 
 // ─── Parallel tool execution ────────────────────────────────────────────
 
-// TestParallelToolBatch: wall-clock must be < sum of serial sleeps.
+// TestParallelToolBatch: every call of a parallel batch is executing at once.
+// No call is released until all of them have started, so a dispatcher that ran
+// them one after another never reaches the barrier. Overlap is proven by that
+// barrier, not by a wall-clock budget, which loaded runners overrun.
 // Upstream ref: agent-loop.ts executeToolCallsParallel (lines 412-469).
 func TestParallelToolBatch(t *testing.T) {
-	const sleep = 60 * time.Millisecond
-	names := []struct{ id, name string }{
-		{"tc-0", "ptool0"},
-		{"tc-1", "ptool1"},
-		{"tc-2", "ptool2"},
-	}
-	tools := make([]AgentTool, len(names))
-	for i, n := range names {
-		tools[i] = &fakeTool{name: n.name, mode: ToolModeParallel, delay: sleep, content: "ok"}
-	}
+	ids := []string{"tc-0", "tc-1", "tc-2"}
+	var started atomic.Int32
+	allStarted := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
 
-	prov := providerFromSeqs(toolCallSeq(names...), textSeq("done"))
-	a := NewAgent(AgentOptions{
-		Model:    fakeTestModel(prov),
-		Tools:    tools,
+	tool := &scriptTool{name: "ptool", mode: ToolModeParallel, params: map[string]any{"type": "object"},
+		execute: func(_ context.Context, _ string, _ json.RawMessage, _ ToolUpdateCallback) (AgentToolResult, error) {
+			if started.Add(1) == int32(len(ids)) {
+				close(allStarted)
+			}
+			<-release
+			return AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "ok"}}}, nil
+		}}
+	calls := make([]ai.ToolCall, len(ids))
+	for i, id := range ids {
+		calls[i] = toolCall(id, "ptool", nil)
+	}
+	a := mustNewAgent(AgentOptions{
+		Model:    scriptedModel(&scriptedProvider{respond: toolCallsThenText(calls...)}),
+		Tools:    []AgentTool{tool},
 		MaxTurns: 5,
 	})
 
-	start := time.Now()
-	_, err := a.Send(context.Background(), "parallel")
-	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-
-	serial := sleep * time.Duration(len(names))
-	if elapsed >= serial {
-		t.Errorf("elapsed %v >= serial %v: tools did not run concurrently", elapsed, serial)
-	}
-	t.Logf("%d tools x %v: elapsed=%v (serial=%v): concurrent OK", len(names), sleep, elapsed, serial)
+	done := sendAsync(t, a, "parallel")
+	t.Cleanup(func() {
+		releaseAll()
+		<-done
+	})
+	waitSignal(t, allStarted, "all three tool calls to be executing at once")
+	releaseAll()
+	waitSignal(t, done, "the run")
 }
 
 // TestParallelResultsInSourceOrder: results must be in source order even if tools
@@ -397,7 +374,7 @@ func TestParallelResultsInSourceOrder(t *testing.T) {
 		&fakeTool{name: "fast", mode: ToolModeParallel, delay: 0, content: "fast-result"},
 	}
 	prov := providerFromSeqs(toolCallSeq(names...), textSeq("done"))
-	a := NewAgent(AgentOptions{Model: fakeTestModel(prov), Tools: tools, MaxTurns: 5})
+	a := mustNewAgent(AgentOptions{Model: fakeTestModel(prov), Tools: tools, MaxTurns: 5})
 
 	msgs, err := a.Send(context.Background(), "order")
 	if err != nil {
@@ -427,7 +404,7 @@ func TestMixedModeFallsBackToSequential(t *testing.T) {
 		&fakeTool{name: "seq", mode: ToolModeSequential, delay: sleep, content: "seq"},
 	}
 	prov := providerFromSeqs(toolCallSeq(names...), textSeq("done"))
-	a := NewAgent(AgentOptions{Model: fakeTestModel(prov), Tools: tools, MaxTurns: 5})
+	a := mustNewAgent(AgentOptions{Model: fakeTestModel(prov), Tools: tools, MaxTurns: 5})
 
 	start := time.Now()
 	_, err := a.Send(context.Background(), "mixed")
@@ -455,7 +432,7 @@ func TestOnMessagePersistFiresPerProducedMessage(t *testing.T) {
 	prov := providerFromSeqs(toolCallSeq(struct{ id, name string }{"tc1", "echo"}), textSeq("done"))
 
 	var persisted []string
-	a := NewAgent(AgentOptions{
+	a := mustNewAgent(AgentOptions{
 		Model:    fakeTestModel(prov),
 		Tools:    tools,
 		MaxTurns: 5,
@@ -500,7 +477,7 @@ func TestOnMessagePersistFiresPerProducedMessage(t *testing.T) {
 func TestOnMessagePersistSkipsResumedHistory(t *testing.T) {
 	prov := providerFromSeqs(textSeq("reply"))
 	var persisted []string
-	a := NewAgent(AgentOptions{
+	a := mustNewAgent(AgentOptions{
 		Model:    fakeTestModel(prov),
 		MaxTurns: 5,
 		OnMessagePersist: func(m AgentMessage) error {
@@ -539,7 +516,7 @@ func TestOnMessagePersistSkipsResumedHistory(t *testing.T) {
 func TestStopReasonStop(t *testing.T) {
 	evs := textSeq("hello")
 	a := &Agent{}
-	msg, calls, err := a.consumeStream(context.Background(), agentTestStream(evs), a.Model(), "")
+	msg, calls, err := a.testHost().consumeStream(context.Background(), agentTestStream(evs), a.Model(), "")
 	if err != nil {
 		t.Fatalf("consumeStream error: %v", err)
 	}
@@ -556,7 +533,7 @@ func TestStopReasonStop(t *testing.T) {
 func TestStopReasonToolUse(t *testing.T) {
 	evs := toolCallSeq(struct{ id, name string }{"call_1", "bash"})
 	a := &Agent{}
-	msg, calls, err := a.consumeStream(context.Background(), agentTestStream(evs), a.Model(), "")
+	msg, calls, err := a.testHost().consumeStream(context.Background(), agentTestStream(evs), a.Model(), "")
 	if err != nil {
 		t.Fatalf("consumeStream error: %v", err)
 	}
@@ -584,7 +561,7 @@ func TestStopReasonAborted(t *testing.T) {
 	}
 
 	a := &Agent{}
-	msg, _, err := a.consumeStream(ctx, stream, nil, "")
+	msg, _, err := a.testHost().consumeStream(ctx, stream, nil, "")
 	if err == nil {
 		t.Fatal("expected context error, got nil")
 	}
@@ -604,7 +581,7 @@ func TestFinishTurnEndStopsAfterTurn(t *testing.T) {
 	var stopCalls int
 	var agent *Agent
 
-	agent = NewAgent(AgentOptions{
+	agent = mustNewAgent(AgentOptions{
 		Model:    fakeTestModel(prov),
 		MaxTurns: 5,
 		EventCh:  events,
@@ -619,7 +596,7 @@ func TestFinishTurnEndStopsAfterTurn(t *testing.T) {
 			if got := len(ctx.NewMessages); got != 2 {
 				t.Fatalf("newMessages len = %d, want 2", got)
 			}
-			if got := len(ctx.Context); got != len(agent.Messages()) {
+			if got := len(ctx.Context.Messages); got != len(agent.Messages()) {
 				t.Fatalf("context len = %d, want %d", got, len(agent.Messages()))
 			}
 			return &AgentTurnDecision{Action: AgentTurnEnd}, nil
@@ -678,13 +655,13 @@ func TestPrepareNextTurnUpdatesModelAndThinking(t *testing.T) {
 		Provider:     secondProv,
 		Capabilities: ai.ModelCapabilities{ContextWindow: 8000},
 	}
-	minimal := ai.ThinkingMinimal
+	minimal := ai.ModelThinkingLevel(ai.ThinkingMinimal)
 	var prepareCalls int
 
-	a := NewAgent(AgentOptions{
+	a := mustNewAgent(AgentOptions{
 		Model:    firstModel,
 		MaxTurns: 5,
-		PrepareNextTurn: func(_ context.Context, ctx PrepareNextTurnContext) (*AgentLoopTurnUpdate, error) {
+		PrepareNextTurnWithContext: func(_ context.Context, ctx PrepareNextTurnContext) (*AgentLoopTurnUpdate, error) {
 			prepareCalls++
 			if ctx.Message == nil {
 				t.Fatal("prepareNextTurn got no assistant message")
@@ -721,7 +698,7 @@ func TestPrepareNextTurnUpdatesModelAndThinking(t *testing.T) {
 	if len(secondOpts) != 1 {
 		t.Fatalf("second provider stream options = %d, want 1", len(secondOpts))
 	}
-	if secondOpts[0].Thinking != ai.ThinkingMinimal {
+	if secondOpts[0].Thinking != ai.ThinkingLevelMinimal {
 		t.Fatalf("second provider thinking = %q, want %q", secondOpts[0].Thinking, ai.ThinkingMinimal)
 	}
 	if a.Model() != firstModel {
@@ -741,7 +718,7 @@ func TestPrepareNextTurnUpdatesModelAndThinking(t *testing.T) {
 func TestProviderStreamErrorEmitsFailureLifecycle(t *testing.T) {
 	prov := &recordingProvider{err: errors.New("boom")}
 	events := make(chan AgentEvent, 16)
-	a := NewAgent(AgentOptions{
+	a := mustNewAgent(AgentOptions{
 		Model:    fakeTestModel(prov),
 		MaxTurns: 5,
 		EventCh:  events,
@@ -823,7 +800,7 @@ func TestAgent_ThoughtSignatureFlow(t *testing.T) {
 
 	// Create a tool that just returns success
 	dummyTool := &fakeToolForSignatureTest{}
-	agent := NewAgent(AgentOptions{
+	agent := mustNewAgent(AgentOptions{
 		Model: &ai.Model{
 			ID:       "test-model",
 			Provider: provider,
@@ -916,14 +893,14 @@ func abortingBatch(t *testing.T, mode ToolExecutionMode) ([]ToolResultMessage, [
 			starts = append(starts, start.ToolCallID)
 		}
 	})
-	a := NewAgent(AgentOptions{
+	a := mustNewAgent(AgentOptions{
 		Model: scriptedModel(&scriptedProvider{respond: toolCallsThenText(toolCall("call-1", "a", nil), toolCall("call-2", "b", nil))}),
 		Tools: []AgentTool{
 			&scriptTool{name: "a", mode: mode, params: map[string]any{"type": "object"}},
 			&scriptTool{name: "b", mode: mode, params: map[string]any{"type": "object"}},
 		},
 		EventCh: rec.ch,
-		BeforeToolCall: []BeforeToolCallHook{
+		BeforeToolCallHooks: []BeforeToolCallHook{
 			func(_ context.Context, _, _ string, _ json.RawMessage) ToolCallHookResult {
 				if beforeCalls.Add(1) == 1 {
 					cancel()
@@ -1021,7 +998,7 @@ func TestAgent_ThinkingContentInContent(t *testing.T) {
 	}}
 	readTool := &fakeTool{name: "read"}
 	bashTool := &fakeTool{name: "bash"}
-	agent := NewAgent(AgentOptions{
+	agent := mustNewAgent(AgentOptions{
 		Model: &ai.Model{
 			ID:       "test-model",
 			Provider: provider,

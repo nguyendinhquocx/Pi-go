@@ -53,13 +53,29 @@ impl ToolExposure {
 /// Upstream `ToolAnnotations` (`types.ts:515`): unverified hints about what a tool does, with the meaning of MCP tool annotations.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolAnnotations {
-    #[serde(default, rename = "readOnlyHint", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "readOnlyHint",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub read_only_hint: Option<bool>,
-    #[serde(default, rename = "destructiveHint", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "destructiveHint",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub destructive_hint: Option<bool>,
-    #[serde(default, rename = "idempotentHint", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "idempotentHint",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub idempotent_hint: Option<bool>,
-    #[serde(default, rename = "openWorldHint", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "openWorldHint",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub open_world_hint: Option<bool>,
 }
 
@@ -68,6 +84,10 @@ pub struct ToolAnnotations {
 pub struct ToolNamespace {
     /// For example `mcp__docs`.
     pub name: String,
+    /// Other names that refer to the namespace where tools look it up by name (codemode's `describeNamespace()` and the
+    /// `namespace` option of `searchTools()`), for example `docs` for `mcp__docs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
     /// A short summary shown once with the group in model-facing tool listings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -87,11 +107,23 @@ pub struct AgentTool {
     pub description: String,
     #[serde(default)]
     pub parameters: Value,
-    #[serde(default, rename = "outputSchema", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "outputSchema",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub output_schema: Option<Value>,
-    #[serde(default, rename = "constrainedSampling", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "constrainedSampling",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub constrained_sampling: Option<Value>,
-    #[serde(default, rename = "executionMode", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "executionMode",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub execution_mode: Option<String>,
 }
 
@@ -106,18 +138,27 @@ pub struct ToolLoadout {
     pub registered: Vec<AgentTool>,
     exposures: HashMap<String, ToolExposure>,
     namespaces: HashMap<String, ToolNamespace>,
+    prompt_guidelines: HashMap<String, Vec<String>>,
 }
 
 impl ToolLoadout {
-    /// A loadout with the exposure and namespace tables the host sent.
+    /// A loadout with the exposure, namespace and prompt guideline tables the host sent.
     pub fn new(
         declared: Vec<AgentTool>,
         callable: Vec<AgentTool>,
         registered: Vec<AgentTool>,
         exposures: HashMap<String, ToolExposure>,
         namespaces: HashMap<String, ToolNamespace>,
+        prompt_guidelines: HashMap<String, Vec<String>>,
     ) -> Self {
-        Self { declared, callable, registered, exposures, namespaces }
+        Self {
+            declared,
+            callable,
+            registered,
+            exposures,
+            namespaces,
+            prompt_guidelines,
+        }
     }
 
     /// Upstream `getExposure`: a tool the host does not list is `direct`, as `_getToolExposure` defaults (`agent-session.ts:1481`).
@@ -129,6 +170,15 @@ impl ToolLoadout {
     pub fn get_namespace(&self, name: &str) -> Option<&ToolNamespace> {
         self.namespaces.get(name)
     }
+
+    /// Upstream `getPromptGuidelines`: a tool's `promptGuidelines` as the system prompt has them (trimmed, without
+    /// duplicates); empty for a tool without any. Hidden declarations leave them out of the system prompt.
+    pub fn get_prompt_guidelines(&self, name: &str) -> &[String] {
+        self.prompt_guidelines
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
 }
 
 /// Upstream `ToolLoadoutChanges` (`types.ts:554`): what `prepare_loadout` changes about what the model sees.
@@ -138,11 +188,26 @@ pub struct ToolLoadoutChanges {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub descriptions: Option<HashMap<String, String>>,
     /// Declared tools whose declarations requests leave out. They stay active and callable.
-    #[serde(default, rename = "hiddenDeclarations", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "hiddenDeclarations",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub hidden_declarations: Option<Vec<String>>,
 }
 
 /// Upstream `ToolDefinition.prepareLoadout` (`types.ts:607`). `None` leaves the loadout as it is (upstream returns `undefined`).
+/// What a tool's `reaches_tools` answers (upstream `reachesTools`, `types.ts:621`, `"all" | readonly string[]`): every tool, or the words
+/// of the input that may name them, where a word refers to a tool or namespace whose name contains it, so words may over-match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolReach {
+    All,
+    Words(Vec<String>),
+}
+
+/// A tool's `reaches_tools`: which tools a call with the given input may reach.
+pub type ToolReachesTools = Box<dyn Fn(&Value) -> ToolReach + Send + Sync>;
+
 pub type ToolPrepareLoadout = Box<dyn Fn(&ToolLoadout) -> Option<ToolLoadoutChanges> + Send + Sync>;
 
 /// Upstream `AgentToolCall`: the tool call block a nested call ran for. `id` is `<calling id>/<n>`.
@@ -165,7 +230,11 @@ pub struct AgentToolResult {
     #[serde(default)]
     pub details: Value,
     /// Machine-readable result matching the tool's `outputSchema`.
-    #[serde(default, rename = "structuredContent", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "structuredContent",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub structured_content: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Value>,
@@ -185,6 +254,9 @@ pub struct AgentToolCallOutcome {
     pub result: AgentToolResult,
     #[serde(default, rename = "isError")]
     pub is_error: bool,
+    /// Milliseconds `execute()` took, measured with a monotonic clock; absent when the tool did not run (`types.ts:454`).
+    #[serde(default, rename = "durationMs")]
+    pub duration_ms: Option<i64>,
 }
 
 /// Partial results of a nested tool, in order.
@@ -248,7 +320,8 @@ pub struct ModelRoute {
 }
 
 /// Upstream `ExtensionVirtualModel.route` (`types.ts:1866`).
-pub type ModelRouteFn = Box<dyn Fn(&Context, ModelRouteRequest) -> Result<ModelRoute, String> + Send + Sync>;
+pub type ModelRouteFn =
+    Box<dyn Fn(&Context, ModelRouteRequest) -> Result<ModelRoute, String> + Send + Sync>;
 
 /// Upstream `ExtensionVirtualModel`: a selectable catalog entry that routes each request to a physical model.
 pub struct VirtualModel {
@@ -273,7 +346,10 @@ impl VirtualModel {
         provider: impl Into<String>,
         id: impl Into<String>,
         name: impl Into<String>,
-        route: impl Fn(&Context, ModelRouteRequest) -> Result<ModelRoute, String> + Send + Sync + 'static,
+        route: impl Fn(&Context, ModelRouteRequest) -> Result<ModelRoute, String>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self {
             provider: provider.into(),
@@ -314,7 +390,10 @@ pub(crate) struct ApiState {
 impl ApiState {
     /// Applies a state snapshot (the ready state or a `state_update`): each field present replaces the replica. The host encodes an empty Go slice as `null`, which is an empty list; a field that does not decode leaves the replica as it was.
     pub(crate) fn apply_state(&mut self, state: &serde_json::Map<String, Value>) {
-        if let Some(settings) = state.get("settings").filter(|settings| settings.is_object()) {
+        if let Some(settings) = state
+            .get("settings")
+            .filter(|settings| settings.is_object())
+        {
             self.settings = Some(settings.clone());
         }
         if let Some(servers) = decode_list(state.get("mcpServers")) {
@@ -366,11 +445,20 @@ pub(crate) struct ToolLoadoutPayload {
     exposures: HashMap<String, ToolExposure>,
     #[serde(default)]
     namespaces: HashMap<String, ToolNamespace>,
+    #[serde(default, rename = "promptGuidelines")]
+    prompt_guidelines: HashMap<String, Vec<String>>,
 }
 
 impl From<ToolLoadoutPayload> for ToolLoadout {
     fn from(payload: ToolLoadoutPayload) -> Self {
-        ToolLoadout::new(payload.declared, payload.callable, payload.registered, payload.exposures, payload.namespaces)
+        ToolLoadout::new(
+            payload.declared,
+            payload.callable,
+            payload.registered,
+            payload.exposures,
+            payload.namespaces,
+            payload.prompt_guidelines,
+        )
     }
 }
 

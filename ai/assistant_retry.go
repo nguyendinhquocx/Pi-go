@@ -4,13 +4,15 @@ import (
 	"context"
 	"errors"
 	"math"
-	"regexp"
 	"strings"
 	"time"
+
+	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
 )
 
-func buildProviderErrorPattern(patterns []string) *regexp.Regexp {
-	return regexp.MustCompile("(?i)" + strings.Join(patterns, "|"))
+// buildProviderErrorPattern is retry.ts buildProviderErrorPattern: new RegExp(patterns.join("|"), "i").
+func buildProviderErrorPattern(patterns []string) *lazyregexp.Regexp {
+	return lazyregexp.NewJSIgnoreCase(strings.Join(patterns, "|"))
 }
 
 var nonRetryableProviderLimitErrorPattern = buildProviderErrorPattern([]string{
@@ -27,28 +29,41 @@ var nonRetryableProviderLimitErrorPattern = buildProviderErrorPattern([]string{
 	"billing",
 	// Sign in with ChatGPT: the subscription's shared usage limit, which resets after hours rather than seconds (utils/retry.ts).
 	"subscription_sharing_usage_limit_exceeded",
+	// Sign in with ChatGPT on a ChatGPT Business plan: a usage limit set by the workspace admin. Only the admin can raise it (utils/retry.ts, Pi cedefc5326).
+	"subscription_sharing_workplace_individual_usage_limit_exceeded",
+	// Zhipu/Z.ai (open.bigmodel.cn) error code 1308: the plan's usage limit is reached, sent as HTTP 429. It resets after hours, not seconds (utils/retry.ts, #11537).
+	// Upstream's `(?![0-9])` lookahead is `([^0-9]|$)` under RE2; \s is the JavaScript class (Go's is ASCII-only).
+	`"code"` + jsSpaceClass + `*:` + jsSpaceClass + `*"?1308([^0-9]|$)`,
 })
 
 var retryableProviderErrorPattern = buildProviderErrorPattern([]string{
 	// Generic provider load, HTTP status, and server-side transient failures.
 	"overloaded",
+	// #10543: a provider that answers server_busy or "servers are currently busy" is transient (utils/retry.ts).
+	"server_busy",
+	"servers are currently busy",
 	"currently experiencing high demand",
 	"model is at capacity",
 	"rate.?limit",
 	"too many requests",
-	"429",
-	"500",
-	"502",
-	"503",
-	"504",
-	"520",
-	"524",
-	"service.?unavailable",
+	// Status codes must not be part of a longer word or number, e.g. a request id or byte count (#11057, Pi 6e491cfa).
+	// Pi spells it (?<![a-z0-9])(?:429|500|502|503|504|520|524)(?![a-z0-9]); RE2 has no lookaround, so the neighbours are matched, which a boolean test cannot tell apart.
+	"(?:^|[^a-z0-9])(?:429|500|502|503|504|520|524)(?:[^a-z0-9]|$)",
+	// Also matches "The service is temporarily unavailable" (#10965, utils/retry.ts).
+	"service.?(?:is.?)?(?:temporarily.?)?unavailable",
 	"server.?error",
 	"internal.?error",
-	// Wrapper/provider text for transient upstream failures.
-	"provider.?returned.?error",
+	// Wrapper/provider text for transient upstream failures: "Provider returned error" (#2264) and gateway wording such as
+	// "The upstream provider returned an error" (#10842, utils/retry.ts).
+	"provider.?returned.?(?:an.?)?error",
 	"exceeded request buffer limit while retrying upstream",
+	// Gateway failure relaying the upstream response stream, sent as an OpenAI Responses response.failed event without an error code (#10920, Pi 7efebff1).
+	"unable to forward upstream",
+	// Other gateway upstream failures relayed as response.failed error codes (#10920, Pi 698a2d23).
+	"upstream.?request.?failed",
+	"upstream_stream_read_error",
+	"stream was interrupted",
+	"http/?2 stream failed",
 	// Network, proxy, and fetch transport failures.
 	"network.?error",
 	"connection.?error",
@@ -56,6 +71,8 @@ var retryableProviderErrorPattern = buildProviderErrorPattern([]string{
 	"connection.?lost",
 	"other side closed",
 	"fetch failed",
+	// node-fetch system errors, e.g. the Google ADC OAuth token refresh used by google-vertex; the reason is often empty (#10996, Pi 0fbdbd3f).
+	"request to \\S+ failed, reason:",
 	"getaddrinfo",
 	"ENOTFOUND",
 	"EAI_AGAIN",
@@ -74,6 +91,10 @@ var retryableProviderErrorPattern = buildProviderErrorPattern([]string{
 	"stream ended before message_stop",
 	"stream ended before a terminal response event",
 	"http2 request did not get a response",
+	// Codex CLI mid-stream disconnect, relayed by proxies that wrap the Codex CLI, e.g. "stream disconnected before completion: stream closed before response.completed" (#11057, Pi 29057ece).
+	"stream disconnected before completion",
+	// Node ERR_HTTP2_STREAM_CANCEL: the HTTP/2 session died before the request was sent, for example after the Bedrock SDK's 5-minute session timeout (utils/retry.ts, #10379).
+	"pending stream has been canceled",
 	// Provider-requested retry delay cap failures flow through the outer policy.
 	"retry delay",
 	// Explicit retry guidance emitted mid-stream.
@@ -104,17 +125,17 @@ const DefaultMaxAgentRetryDelayMs = 60_000
 // maxSafeInteger is JavaScript's Number.MAX_SAFE_INTEGER.
 const maxSafeInteger = 1<<53 - 1
 
-// RetryDelayMs returns the capped exponential delay for a 1-based attempt.
+// RetryDelayMs returns the capped exponential delay for a 1-based attempt from the policy base delay and agent cap (only BaseDelayMs and MaxAgentDelayMs are read).
 // Overflowing products saturate at Number.MAX_SAFE_INTEGER before the cap.
-func RetryDelayMs(baseDelayMs int, maxAgentDelayMs *int, attempt int) int {
-	delay := float64(baseDelayMs) * math.Pow(2, max(0, float64(attempt)-1))
+func RetryDelayMs(policy RetryPolicy, attempt int) int {
+	delay := float64(policy.BaseDelayMs) * math.Pow(2, max(0, float64(attempt)-1))
 	safeDelay := maxSafeInteger
 	if math.Abs(delay) <= maxSafeInteger && delay == math.Trunc(delay) {
 		safeDelay = int(delay)
 	}
 	limit := DefaultMaxAgentRetryDelayMs
-	if maxAgentDelayMs != nil {
-		limit = *maxAgentDelayMs
+	if policy.MaxAgentDelayMs != nil {
+		limit = *policy.MaxAgentDelayMs
 	}
 	return min(safeDelay, limit)
 }
@@ -181,7 +202,7 @@ func RetryAssistantCall(ctx context.Context, produce func() (AssistantMessage, e
 		if lastRetryMessage == "" {
 			lastRetryMessage = "Unknown error"
 		}
-		delayMs := RetryDelayMs(policy.BaseDelayMs, policy.MaxAgentDelayMs, attempt)
+		delayMs := RetryDelayMs(*policy, attempt)
 		if callbacks.OnRetryScheduled != nil {
 			if err := callbacks.OnRetryScheduled(attempt, maxAttempts, delayMs, lastRetryMessage); err != nil {
 				return AssistantMessage{}, err

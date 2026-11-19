@@ -1,14 +1,11 @@
 package subprocess
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
-	"github.com/MichaelKinsy/PiG/agent"
 	extsource "github.com/MichaelKinsy/PiG/coding/extension/source"
 )
 
@@ -52,9 +49,8 @@ func Extension() *sdk.Extension {
 // its own cell (never packed with current-SDK factories), builds against the
 // current SDK, registers, and executes.
 func TestHost_LegacySDKFactoryLoadsBesideCurrentSDKFactory(t *testing.T) {
-	keepGoBuildCaches(t)
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHome(t, home)
 	t.Setenv("PIG_HOME", filepath.Join(home, ".pig"))
 	legacy, legacyDefinition, err := ResolveExtConfigWithIdentity(writeLegacySDKAskModule(t), "ask")
 	if err != nil {
@@ -78,7 +74,7 @@ func TestHost_LegacySDKFactoryLoadsBesideCurrentSDKFactory(t *testing.T) {
 	h := NewHost(t.TempDir())
 	h.SetConfigLoader(func() ([]ExtConfig, error) { return []ExtConfig{legacy, current}, nil })
 	t.Cleanup(func() { h.Shutdown("test done") })
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := buildContext(t)
 	defer cancel()
 	if _, err := h.Reload(ctx); err != nil {
 		t.Fatalf("reload: %v", err)
@@ -97,7 +93,7 @@ func TestHost_LegacySDKFactoryLoadsBesideCurrentSDKFactory(t *testing.T) {
 		if err != nil {
 			t.Fatalf("execute legacy tool: %v", err)
 		}
-		if got, ok := result.(agent.AgentToolResult); !ok || got.Text() != "legacy ask ok" {
+		if got, ok := result, true; !ok || got.Text() != "legacy ask ok" {
 			t.Fatalf("legacy tool result = %#v", result)
 		}
 	}

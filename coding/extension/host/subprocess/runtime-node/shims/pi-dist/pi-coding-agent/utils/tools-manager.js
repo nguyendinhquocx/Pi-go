@@ -4,8 +4,9 @@ import { arch, platform } from "os";
 import { join } from "path";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
-import { APP_NAME, getBinDir } from "../config.js";
+import { getBinDir, VERSION } from "../config.js";
 import { fetchWithRetry } from "./management-http.js";
+import { getPiUserAgent } from "./pi-user-agent.js";
 const TOOLS_DIR = getBinDir();
 const NETWORK_TIMEOUT_MS = 10_000;
 const DOWNLOAD_TIMEOUT_MS = 120_000;
@@ -15,6 +16,21 @@ function isOfflineModeEnabled() {
         return false;
     return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
 }
+// Map Node's platform/arch to the release target suffix shared by fd and ripgrep.
+// Only x64 and arm64 are mapped. Other architectures (e.g. ARM32 `arm`, `ia32`)
+// must not fall back to x86-64 binaries (#11209).
+function getReleaseTarget(plat, architecture) {
+    const archStr = architecture === "arm64" ? "aarch64" : architecture === "x64" ? "x86_64" : undefined;
+    if (!archStr)
+        return undefined;
+    if (plat === "darwin")
+        return `${archStr}-apple-darwin.tar.gz`;
+    if (plat === "linux")
+        return `${archStr}-unknown-linux-musl.tar.gz`;
+    if (plat === "win32")
+        return `${archStr}-pc-windows-msvc.zip`;
+    return undefined;
+}
 const TOOLS = {
     fd: {
         name: "fd",
@@ -22,42 +38,14 @@ const TOOLS = {
         binaryName: "fd",
         systemBinaryNames: ["fd", "fdfind"],
         tagPrefix: "v",
-        getAssetName: (version, plat, architecture) => {
-            if (plat === "darwin") {
-                const archStr = architecture === "arm64" ? "aarch64" : "x86_64";
-                return `fd-v${version}-${archStr}-apple-darwin.tar.gz`;
-            }
-            else if (plat === "linux") {
-                const archStr = architecture === "arm64" ? "aarch64" : "x86_64";
-                return `fd-v${version}-${archStr}-unknown-linux-musl.tar.gz`;
-            }
-            else if (plat === "win32") {
-                const archStr = architecture === "arm64" ? "aarch64" : "x86_64";
-                return `fd-v${version}-${archStr}-pc-windows-msvc.zip`;
-            }
-            return null;
-        },
+        getAssetName: (version, target) => `fd-v${version}-${target}`,
     },
     rg: {
         name: "ripgrep",
         repo: "BurntSushi/ripgrep",
         binaryName: "rg",
         tagPrefix: "",
-        getAssetName: (version, plat, architecture) => {
-            if (plat === "darwin") {
-                const archStr = architecture === "arm64" ? "aarch64" : "x86_64";
-                return `ripgrep-${version}-${archStr}-apple-darwin.tar.gz`;
-            }
-            else if (plat === "linux") {
-                const archStr = architecture === "arm64" ? "aarch64" : "x86_64";
-                return `ripgrep-${version}-${archStr}-unknown-linux-musl.tar.gz`;
-            }
-            else if (plat === "win32") {
-                const archStr = architecture === "arm64" ? "aarch64" : "x86_64";
-                return `ripgrep-${version}-${archStr}-pc-windows-msvc.zip`;
-            }
-            return null;
-        },
+        getAssetName: (version, target) => `ripgrep-${version}-${target}`,
     },
 };
 // Check if a command exists in PATH by trying to run it
@@ -98,7 +86,7 @@ export function getToolPath(tool) {
 // and lives on the same origin as the binary download itself.
 export async function getLatestVersion(repo) {
     const response = await fetchWithRetry(`https://github.com/${repo}/releases/latest`, {
-        headers: { "User-Agent": `${APP_NAME}-coding-agent` },
+        headers: { "User-Agent": getPiUserAgent(VERSION) },
         redirect: "manual",
     }, { timeoutMs: NETWORK_TIMEOUT_MS });
     // Only the status and headers matter here. Discard the body so the
@@ -178,7 +166,7 @@ function extractTarGzArchive(archivePath, extractDir, assetName) {
     }
 }
 function getWindowsTarCommand() {
-    const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
+    const systemRoot = process.env.SystemRoot;
     if (systemRoot) {
         const systemTar = join(systemRoot, "System32", "tar.exe");
         if (existsSync(systemTar)) {
@@ -231,13 +219,13 @@ async function downloadTool(tool) {
         throw new Error(`Unknown tool: ${tool}`);
     const plat = platform();
     const architecture = arch();
-    // fd is pinned on darwin/x64, so skip the version lookup there.
-    const version = tool === "fd" && plat === "darwin" && architecture === "x64" ? "10.3.0" : await getLatestVersion(config.repo);
-    // Get asset name for this platform
-    const assetName = config.getAssetName(version, plat, architecture);
-    if (!assetName) {
+    const target = getReleaseTarget(plat, architecture);
+    if (!target) {
         throw new Error(`Unsupported platform: ${plat}/${architecture}`);
     }
+    // fd is pinned on darwin/x64, so skip the version lookup there.
+    const version = tool === "fd" && plat === "darwin" && architecture === "x64" ? "10.3.0" : await getLatestVersion(config.repo);
+    const assetName = config.getAssetName(version, target);
     // Create tools directory
     mkdirSync(TOOLS_DIR, { recursive: true });
     const downloadUrl = `https://github.com/${config.repo}/releases/download/${config.tagPrefix}${version}/${assetName}`;
@@ -314,6 +302,14 @@ export async function ensureTool(tool, onStatus) {
     if (platform() === "android") {
         const pkgName = TERMUX_PACKAGES[tool] ?? tool;
         onStatus?.({ type: "warning", message: `${config.name} not found. Install with: pkg install ${pkgName}` });
+        return undefined;
+    }
+    // Prebuilt downloads only exist for the targets mapped in getReleaseTarget.
+    if (!getReleaseTarget(platform(), arch())) {
+        onStatus?.({
+            type: "warning",
+            message: `${config.name} not found. Automatic download is not supported on ${platform()}/${arch()}. Install ${config.name} with your system package manager.`,
+        });
         return undefined;
     }
     // Tool not found - download it

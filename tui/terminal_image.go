@@ -6,16 +6,18 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
-	"net/url"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/linkerexec"
+	"github.com/MichaelKinsy/PiG/internal/nodebase64"
+	"github.com/MichaelKinsy/PiG/internal/nodepath"
+	"github.com/MichaelKinsy/PiG/internal/nodeurl"
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
 
@@ -135,10 +137,10 @@ func tmuxTermfeaturesIncludeHyperlinks(termfeatures string) bool {
 // detectCapabilitiesFromEnvironment mirrors upstream
 // detectCapabilitiesFromEnvironment. goos stands in for process.platform.
 func detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink func() bool, goos string) TerminalCapabilities {
-	termProgram := strings.ToLower(os.Getenv("TERM_PROGRAM"))
-	terminalEmulator := strings.ToLower(os.Getenv("TERMINAL_EMULATOR"))
-	term := strings.ToLower(os.Getenv("TERM"))
-	colorTerm := strings.ToLower(os.Getenv("COLORTERM"))
+	termProgram := jsstring.ToLower(os.Getenv("TERM_PROGRAM"))
+	terminalEmulator := jsstring.ToLower(os.Getenv("TERMINAL_EMULATOR"))
+	term := jsstring.ToLower(os.Getenv("TERM"))
+	colorTerm := jsstring.ToLower(os.Getenv("COLORTERM"))
 	hasTrueColorHint := colorTerm == "truecolor" || colorTerm == "24bit" || strings.HasSuffix(term, "-direct")
 	isWindowsConsole := goos == "windows"
 
@@ -152,11 +154,28 @@ func detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink func() bool, goos s
 		return TerminalCapabilities{Images: "", TrueColor: hasTrueColorHint, Hyperlinks: false}
 	}
 	// pig divergence (D44): require Herdr's explicit image-forwarding signal at the immediate terminal boundary.
+	if os.Getenv("HERDR_ENV") == "1" && os.Getenv("HERDR_KITTY_GRAPHICS") == "1" {
+		return TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: true, Hyperlinks: true}
+	}
+	// Herdr forwards OSC 8 hyperlinks and supports the Kitty graphics protocol. Check it before
+	// outer-terminal detection because variables like KITTY_WINDOW_ID can leak into its panes.
+	if termProgram == "herdr" {
+		return TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: hasTrueColorHint, Hyperlinks: true}
+	}
+	// Rex supports OSC 8 hyperlinks and only partially implements the Kitty graphics protocol
+	// (no Unicode placeholders), but enough to support Pi.
+	// Ports packages/tui/src/terminal-image.ts detectCapabilitiesFromEnvironment (396ecd7b).
+	if termProgram == "rex" {
+		return TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: true, Hyperlinks: true}
+	}
+	// pig divergence (D44): without Herdr's positive graphics signal, ignore inherited outer-terminal image hints.
 	if os.Getenv("HERDR_ENV") == "1" {
-		if os.Getenv("HERDR_KITTY_GRAPHICS") == "1" {
-			return TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: true, Hyperlinks: true}
-		}
 		return TerminalCapabilities{Images: "", TrueColor: hasTrueColorHint, Hyperlinks: false}
+	}
+	// Orca supports Kitty graphics but only advertises it through ORCA_IMAGE_PROTOCOL. Require both signals so Orca releases
+	// predating that advertisement keep the text fallback instead of reserving image rows that nothing renders.
+	if termProgram == "orca" && os.Getenv("ORCA_IMAGE_PROTOCOL") == "kitty" {
+		return TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: true, Hyperlinks: true}
 	}
 	if os.Getenv("KITTY_WINDOW_ID") != "" || termProgram == "kitty" {
 		return TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: true, Hyperlinks: true}
@@ -218,7 +237,7 @@ func DetectCapabilities(tmuxForwardsHyperlink func() bool) TerminalCapabilities 
 		probe = func() bool { return *hyperlinks }
 	}
 	detected := detectCapabilitiesFromEnvironment(probe, capabilityDetectGOOS)
-	switch imageProtocol := strings.ToLower(os.Getenv("PI_IMAGE_PROTOCOL")); imageProtocol {
+	switch imageProtocol := jsstring.ToLower(os.Getenv("PI_IMAGE_PROTOCOL")); imageProtocol {
 	case "kitty", "iterm2":
 		detected.Images = ImageProtocol(imageProtocol)
 	case "none", "0":
@@ -266,16 +285,30 @@ func ApplyCapabilityOverrides(caps TerminalCapabilities, overrides CapabilityOve
 	return caps
 }
 
-// GetTerminalColorMode is the color depth the terminal supports: truecolor when capabilities report it, else 256 colors. Upstream defaults the argument to getCapabilities(); omit it for that default.
+// GetTerminalColorMode is the color depth the terminal supports: truecolor when capabilities report it, else 256 colors. Without an argument it
+// reads TrueColor as getCapabilities() would, without the tmux probe.
 func GetTerminalColorMode(capabilities ...TerminalCapabilities) TerminalColorMode {
-	caps := GetCapabilities()
+	var trueColor bool
 	if len(capabilities) > 0 {
-		caps = capabilities[0]
+		trueColor = capabilities[0].TrueColor
+	} else {
+		trueColor = currentTrueColor()
 	}
-	if caps.TrueColor {
+	if trueColor {
 		return TerminalColorModeTrueColor
 	}
 	return TerminalColorMode256
+}
+
+// The tmux probe decides only Hyperlinks.
+func currentTrueColor() bool {
+	if cached := cachedCapabilities.Load(); cached != nil {
+		return cached.TrueColor
+	}
+	capabilityMu.Lock()
+	overrides := capabilityOverrides
+	capabilityMu.Unlock()
+	return ApplyCapabilityOverrides(DetectCapabilities(func() bool { return false }), overrides).TrueColor
 }
 
 func ResetCapabilitiesCache() {
@@ -318,26 +351,35 @@ func EncodeKitty(base64Data string, columns, rows, imageID int, moveCursor ...bo
 	if len(moveCursor) > 0 && !moveCursor[0] {
 		params = append(params, "C=1")
 	}
-	if columns > 0 {
+	if columns != 0 {
 		params = append(params, fmt.Sprintf("c=%d", columns))
 	}
-	if rows > 0 {
+	if rows != 0 {
 		params = append(params, fmt.Sprintf("r=%d", rows))
 	}
-	if imageID > 0 {
+	if imageID != 0 {
 		params = append(params, fmt.Sprintf("i=%d", imageID))
 	}
-	if len(base64Data) <= chunkSize {
+	// Pi measures and slices base64Data in UTF-16 units. Real base64 is ASCII, one unit per byte, so a payload whose
+	// unit count equals its byte count is sliced by byte.
+	length := jsstring.Length(base64Data)
+	if length <= chunkSize {
 		return "\x1b_G" + strings.Join(params, ",") + ";" + base64Data + "\x1b\\"
 	}
+	ascii := length == len(base64Data)
 	var chunks []string
-	for off := 0; off < len(base64Data); off += chunkSize {
-		end := min(off+chunkSize, len(base64Data))
-		chunk := base64Data[off:end]
+	for off := 0; off < length; off += chunkSize {
+		end := min(off+chunkSize, length)
+		var chunk string
+		if ascii {
+			chunk = base64Data[off:end]
+		} else {
+			chunk = jsstring.Slice(base64Data, off, off+chunkSize)
+		}
 		switch {
 		case off == 0:
 			chunks = append(chunks, "\x1b_G"+strings.Join(params, ",")+",m=1;"+chunk+"\x1b\\")
-		case end == len(base64Data):
+		case end == length:
 			chunks = append(chunks, "\x1b_Gm=0;"+chunk+"\x1b\\")
 		default:
 			chunks = append(chunks, "\x1b_Gm=1;"+chunk+"\x1b\\")
@@ -357,8 +399,19 @@ func DeleteAllKittyImages() string { return "\x1b_Ga=d,d=A,q=2\x1b\\" }
 // deleteAllKittyPlacements.
 func DeleteAllKittyPlacements() string { return "\x1b_Ga=d,d=a,q=2\x1b\\" }
 
+// ITerm2Options mirrors the options object of upstream encodeITerm2. A nil Width or Height, an empty Name and a nil pointer are the absent fields.
+// Width and Height are a number or a string, as in upstream.
+type ITerm2Options struct {
+	Width               any
+	Height              any
+	Name                string
+	PreserveAspectRatio *bool
+	Inline              *bool
+}
+
 // EncodeITerm2 includes the decoded payload byte length in OSC 1337 metadata.
-func EncodeITerm2(base64Data string, width any, height any, name string, preserveAspect bool) string {
+func EncodeITerm2(base64Data string, options ITerm2Options) string {
+	width, height, name := options.Width, options.Height, options.Name
 	// Node Buffer.byteLength(value, "base64") counts UTF-16 units and trailing padding without decoding the payload.
 	size := utf16Length(base64Data)
 	if strings.HasSuffix(base64Data, "=") {
@@ -367,7 +420,11 @@ func EncodeITerm2(base64Data string, width any, height any, name string, preserv
 	if strings.HasSuffix(base64Data, "==") {
 		size--
 	}
-	params := []string{"inline=1", fmt.Sprintf("size=%d", size/4*3+size%4*3/4)}
+	inline := 1
+	if options.Inline != nil && !*options.Inline {
+		inline = 0
+	}
+	params := []string{fmt.Sprintf("inline=%d", inline), fmt.Sprintf("size=%d", size*3>>2)}
 	if width != nil {
 		params = append(params, fmt.Sprintf("width=%v", width))
 	}
@@ -377,7 +434,7 @@ func EncodeITerm2(base64Data string, width any, height any, name string, preserv
 	if name != "" {
 		params = append(params, "name="+base64.StdEncoding.EncodeToString([]byte(name)))
 	}
-	if !preserveAspect {
+	if options.PreserveAspectRatio != nil && !*options.PreserveAspectRatio {
 		params = append(params, "preserveAspectRatio=0")
 	}
 	return "\x1b]1337;File=" + strings.Join(params, ";") + ":" + base64Data + "\x07"
@@ -403,7 +460,9 @@ func CalculateImageCellSize(imageDimensions ImageDimensions, maxWidthCells int, 
 
 	scaledWidthPx := float64(imageWidth) * scale
 	scaledHeightPx := float64(imageHeight) * scale
+	//portlint:allow numbers cell dimensions are positive (SetCellDimensions takes only the positive terminal response and the 9x18 default), so the quotient is finite and at most maxWidth cells wide after the min
 	columns := max(1, min(maxWidth, int(math.Ceil(scaledWidthPx/float64(dims.WidthPx)))))
+	//portlint:allow numbers same positive cell dimensions, so the quotient is finite
 	rows := max(1, int(math.Ceil(scaledHeightPx/float64(dims.HeightPx))))
 	if maxHeightCells > 0 {
 		rows = min(maxHeightCells, rows)
@@ -442,8 +501,8 @@ func CalculateImageRows(imageDimensions ImageDimensions, targetWidthCells int, d
 }
 
 func GetPNGDimensions(base64Data string) *ImageDimensions {
-	buf, err := base64.StdEncoding.DecodeString(base64Data)
-	if err != nil || len(buf) < 24 {
+	buf := nodebase64.Decode(base64Data)
+	if len(buf) < 24 {
 		return nil
 	}
 	if buf[0] != 0x89 || buf[1] != 0x50 || buf[2] != 0x4e || buf[3] != 0x47 {
@@ -455,8 +514,8 @@ func GetPNGDimensions(base64Data string) *ImageDimensions {
 }
 
 func GetJPEGDimensions(base64Data string) *ImageDimensions {
-	buf, err := base64.StdEncoding.DecodeString(base64Data)
-	if err != nil || len(buf) < 2 || buf[0] != 0xff || buf[1] != 0xd8 {
+	buf := nodebase64.Decode(base64Data)
+	if len(buf) < 2 || buf[0] != 0xff || buf[1] != 0xd8 {
 		return nil
 	}
 	for offset := 2; offset < len(buf)-9; {
@@ -483,8 +542,8 @@ func GetJPEGDimensions(base64Data string) *ImageDimensions {
 }
 
 func GetGIFDimensions(base64Data string) *ImageDimensions {
-	buf, err := base64.StdEncoding.DecodeString(base64Data)
-	if err != nil || len(buf) < 10 {
+	buf := nodebase64.Decode(base64Data)
+	if len(buf) < 10 {
 		return nil
 	}
 	sig := string(buf[:6])
@@ -497,8 +556,8 @@ func GetGIFDimensions(base64Data string) *ImageDimensions {
 }
 
 func GetWebPDimensions(base64Data string) *ImageDimensions {
-	buf, err := base64.StdEncoding.DecodeString(base64Data)
-	if err != nil || len(buf) < 30 {
+	buf := nodebase64.Decode(base64Data)
+	if len(buf) < 30 {
 		return nil
 	}
 	if string(buf[:4]) != "RIFF" || string(buf[8:12]) != "WEBP" {
@@ -565,8 +624,7 @@ func RenderImage(base64Data string, imageDimensions ImageDimensions, options Ima
 		seq := EncodeKitty(base64Data, size.Columns, size.Rows, options.ImageID, options.MoveCursor == nil || *options.MoveCursor)
 		return &renderedImage{Sequence: seq, Columns: size.Columns, Rows: size.Rows, ImageID: options.ImageID}
 	case ImageProtocolITerm2:
-		preserve := options.PreserveAspectRatio == nil || *options.PreserveAspectRatio
-		seq := EncodeITerm2(base64Data, size.Columns, "auto", "", preserve)
+		seq := EncodeITerm2(base64Data, ITerm2Options{Width: size.Columns, Height: "auto", PreserveAspectRatio: options.PreserveAspectRatio})
 		return &renderedImage{Sequence: seq, Columns: size.Columns, Rows: size.Rows}
 	default:
 		return nil
@@ -585,18 +643,8 @@ func ImageFallback(mimeType string, dimensions *ImageDimensions, filename string
 		if home, err := os.UserHomeDir(); err == nil && home != "" && (filename == home || strings.HasPrefix(filename, home+"/") || strings.HasPrefix(filename, home+"\\")) {
 			display = "~" + filename[len(home):]
 		}
-		if GetCapabilities().Hyperlinks && filepath.IsAbs(filename) {
-			path := filepath.ToSlash(filepath.Clean(filename))
-			fileURL := url.URL{Scheme: "file", Path: path}
-			if runtime.GOOS == "windows" {
-				if strings.HasPrefix(path, "//") {
-					fileURL.Host, fileURL.Path, _ = strings.Cut(path[2:], "/")
-					fileURL.Path = "/" + fileURL.Path
-				} else {
-					fileURL.Path = "/" + path
-				}
-			}
-			display = Hyperlink(display, fileURL.String())
+		if GetCapabilities().Hyperlinks && nodepath.IsAbsolute(filename) {
+			display = Hyperlink(display, nodeurl.PathToFileURL(filename, runtime.GOOS == "windows"))
 		}
 		parts = append(parts, display)
 	}

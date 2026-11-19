@@ -2,20 +2,7 @@
  * Proxy stream function for apps that route LLM calls through a server.
  * The server manages auth and proxies requests to LLM providers.
  */
-// Internal import for JSON parsing utility
-import { EventStream, parseStreamingJson, } from "../pi-ai/sdk-bundle/index.js";
-// Create stream class matching ProxyMessageEventStream
-class ProxyMessageEventStream extends EventStream {
-    constructor() {
-        super((event) => event.type === "done" || event.type === "error", (event) => {
-            if (event.type === "done")
-                return event.message;
-            if (event.type === "error")
-                return event.error;
-            throw new Error("Unexpected event type");
-        });
-    }
-}
+import { createAssistantMessageEventStream, ToolCallArgumentsStream, } from "../pi-ai/sdk-bundle/index.js";
 /**
  * Stream function that proxies through a server instead of calling LLM providers directly.
  * The server strips the partial field from delta events to reduce bandwidth.
@@ -51,7 +38,7 @@ function buildProxyRequestOptions(options) {
     };
 }
 export function streamProxy(model, context, options) {
-    const stream = new ProxyMessageEventStream();
+    const stream = createAssistantMessageEventStream();
     (async () => {
         // Initialize the partial message that we'll build up from events
         const partial = {
@@ -111,6 +98,8 @@ export function streamProxy(model, context, options) {
             const decoder = new TextDecoder();
             let buffer = "";
             let sawTerminalEvent = false;
+            // Argument streams of open tool calls by content index, kept off the content blocks.
+            const toolArguments = new Map();
             const processLine = (line) => {
                 if (!line.startsWith("data: "))
                     return;
@@ -118,7 +107,7 @@ export function streamProxy(model, context, options) {
                 if (!data)
                     return;
                 const proxyEvent = JSON.parse(data);
-                const event = processProxyEvent(proxyEvent, partial);
+                const event = processProxyEvent(proxyEvent, partial, toolArguments);
                 if (event) {
                     if (event.type === "done" || event.type === "error")
                         sawTerminalEvent = true;
@@ -185,7 +174,7 @@ export function streamProxy(model, context, options) {
 /**
  * Process a proxy event and update the partial message.
  */
-function processProxyEvent(proxyEvent, partial) {
+function processProxyEvent(proxyEvent, partial, toolArguments) {
     switch (proxyEvent.type) {
         case "start":
             return { type: "start", partial };
@@ -253,15 +242,15 @@ function processProxyEvent(proxyEvent, partial) {
                 id: proxyEvent.id,
                 name: proxyEvent.toolName,
                 arguments: {},
-                partialJson: "",
             };
+            toolArguments.set(proxyEvent.contentIndex, new ToolCallArgumentsStream());
             return { type: "toolcall_start", contentIndex: proxyEvent.contentIndex, partial };
         case "toolcall_delta": {
             const content = partial.content[proxyEvent.contentIndex];
-            if (content?.type === "toolCall") {
-                content.partialJson += proxyEvent.delta;
-                content.arguments = parseStreamingJson(content.partialJson) || {};
-                partial.content[proxyEvent.contentIndex] = { ...content }; // Trigger reactivity
+            const args = toolArguments.get(proxyEvent.contentIndex);
+            if (content?.type === "toolCall" && args !== undefined) {
+                // A new block object, so reactive consumers see the change.
+                partial.content[proxyEvent.contentIndex] = { ...content, arguments: args.append(proxyEvent.delta) };
                 return {
                     type: "toolcall_delta",
                     contentIndex: proxyEvent.contentIndex,
@@ -275,7 +264,7 @@ function processProxyEvent(proxyEvent, partial) {
             const content = partial.content[proxyEvent.contentIndex];
             if (content?.type === "toolCall") {
                 Object.assign(content, proxyEvent.toolCall);
-                delete content.partialJson;
+                toolArguments.delete(proxyEvent.contentIndex);
                 return {
                     type: "toolcall_end",
                     contentIndex: proxyEvent.contentIndex,

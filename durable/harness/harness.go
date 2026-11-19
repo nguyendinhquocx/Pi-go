@@ -5,6 +5,7 @@ package harness
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -65,8 +66,15 @@ func (conversation *conversationImpl) Submit(ctx context.Context, submission dur
 	return conversation.host.submissions.Submit(ctx, conversation.id, submission)
 }
 
+// SubmitIn admits a submission inside the caller's commit tx, with the same rules as Submit.
+func (conversation *conversationImpl) SubmitIn(tx durable.Tx, submission durable.SubmissionDraft) (durable.SubmissionId, error) {
+	return conversation.host.submissions.Admit(tx, conversation.id, submission)
+}
+
 func (conversation *conversationImpl) Compact(ctx context.Context, instructions *string) (durable.TaskId, error) {
-	conversation.host.tasks.Resume()
+	if err := conversation.host.tasks.TryResume(); err != nil {
+		return 0, err
+	}
 	input := CompactionInput{Reason: durable.CompactionManual, Instructions: instructions}
 	result, err := conversation.host.harness.CommitWith(ctx, func(tx *session.Transaction) (any, error) {
 		return CreateCompaction(tx, conversation.id, input, nil)
@@ -86,21 +94,25 @@ func (conversation *conversationImpl) Reset(ctx context.Context, handoff *string
 	return err
 }
 
-func (conversation *conversationImpl) Commit(ctx context.Context, change func(tx durable.Tx) (any, error)) (any, error) {
+func (conversation *conversationImpl) Commit(ctx context.Context, change func(tx durable.Tx) (any, error), options ...durable.CommitOptions) (any, error) {
 	id := conversation.id
 	return conversation.host.harness.CommitWith(ctx, func(tx *session.Transaction) (any, error) {
 		return change(tx)
-	}, session.TransactionScope{ConversationId: &id})
+	}, session.TransactionScope{ConversationId: &id}, options...)
 }
 
-func (conversation *conversationImpl) Context(ctx context.Context) (durable.ContextView, error) {
-	return ReadContext(ctx, conversation.host.harness.line, conversation.host.storage, conversation.id, nil)
+func (conversation *conversationImpl) Context(ctx context.Context, options *durable.ContextOptions) (durable.ContextView, error) {
+	var at *durable.EntryId
+	if options != nil {
+		at = options.At
+	}
+	return ReadContext(ctx, conversation.host.harness.line, conversation.host.storage, conversation.id, at)
 }
 
 func (conversation *conversationImpl) Entries(ctx context.Context, query durable.EntryQuery, limit int, cursor durable.Cursor) (durable.Page[durable.EntryRecord, durable.Cursor], error) {
-	bounded := durable.EntryQuery{ConversationId: conversation.id, MinEntryId: query.MinEntryId, MaxEntryId: query.MaxEntryId}
-	page, err := conversation.host.harness.ReadOnLine(func() (any, error) {
-		return conversation.host.storage.ScanEntries(ctx, bounded, limit, cursor)
+	bounded := conversationEntries(conversation.id, query)
+	page, err := conversation.host.harness.ReadOnLineCtx(ctx, func(storage durable.Storage) (any, error) {
+		return storage.ScanEntries(ctx, bounded, limit, cursor)
 	})
 	if err != nil {
 		return durable.Page[durable.EntryRecord, durable.Cursor]{}, err
@@ -114,22 +126,22 @@ func (conversation *conversationImpl) Fork(ctx context.Context, at durable.Entry
 }
 
 func (conversation *conversationImpl) Abort(ctx context.Context, options *durable.ConversationAbortOptions) error {
-	conversation.host.tasks.Resume()
+	if err := conversation.host.tasks.TryResume(); err != nil {
+		return err
+	}
 	return conversation.host.tasks.AbortConversation(ctx, conversation.id, options != nil && options.Background)
 }
 
 func (conversation *conversationImpl) WaitForIdle(ctx context.Context) error {
-	conversation.host.tasks.Resume()
+	if err := conversation.host.tasks.TryResume(); err != nil {
+		return err
+	}
 	id := conversation.id
 	return conversation.host.tasks.WaitForIdle(ctx, &id)
 }
 
-func (conversation *conversationImpl) ViewState(ctx context.Context) (durable.AttachedReplicatedState[ConversationView], error) {
-	return conversation.host.views.State(ctx, conversation.id)
-}
-
-func (conversation *conversationImpl) Watch(ctx context.Context) (ConversationWatch, error) {
-	return conversation.host.views.Watch(ctx, conversation.id)
+func (conversation *conversationImpl) Watch(ctx context.Context, window *ConversationWindow) (ConversationWatch, error) {
+	return conversation.host.views.Watch(ctx, conversation.id, window)
 }
 
 // harnessImpl is the Session kernel extended with conversation handles and a registry.
@@ -138,12 +150,36 @@ type harnessImpl struct {
 	line        sessionLine
 	storage     durable.Storage
 	options     HarnessOptions
-	report      func(error)
+	report      func(ctx context.Context, err error, info durable.ReportInfo)
 	host        *conversationHost
 	tasks       *TaskScheduler
 	submissions *Submissions
 	taskGraph   *TaskGraphView
 	closed      atomic.Bool
+}
+
+// documentRetentionMs is settings.documentRetentionMs, read at each use, as all settings are, but only this field: the
+// Session reads it on every commit (harness.ts: `super(rawStorage, now, () => options.settings?.documentRetentionMs)`).
+func (harness *harnessImpl) documentRetentionMs() *float64 {
+	if harness.options.Settings == nil {
+		return nil
+	}
+	if settings := harness.options.Settings(); settings != nil {
+		return settings.DocumentRetentionMs
+	}
+	return nil
+}
+
+// persistWithinMs is settings.progress.persistWithinMs, read at each use, as all settings are, but only this field: the Session
+// reads it for each deferred commit without a window of its own (harness.ts: `() => hostSettings()?.progress?.persistWithinMs`).
+func (harness *harnessImpl) persistWithinMs() *float64 {
+	if harness.options.Settings == nil {
+		return nil
+	}
+	if settings := harness.options.Settings(); settings != nil && settings.Progress != nil {
+		return settings.Progress.PersistWithinMs
+	}
+	return nil
 }
 
 func (harness *harnessImpl) settings() durable.Settings {
@@ -163,7 +199,9 @@ func (harness *harnessImpl) resolveAgent(ctx context.Context, id durable.Convers
 	if err != nil {
 		return durable.Agent{}, err
 	}
-	return ResolveAgent(state, registry, harness.settings(), harness.report), nil
+	return ResolveAgent(state, registry, harness.settings(), func(err error, extension string) {
+		harness.report(ctx, err, durable.ReportInfo{Kind: durable.ReportExtensionError, ConversationId: &id, Extension: extension})
+	}), nil
 }
 
 // buildEnv builds a conversation's environment from its current cwd; nil without an Env option.
@@ -188,8 +226,13 @@ func (harness *harnessImpl) Resume() {
 	harness.tasks.Resume()
 }
 
+func (harness *harnessImpl) Wake() Wake {
+	harness.assertOpen()
+	return harness.tasks.Wake()
+}
+
 func (harness *harnessImpl) GetTask(ctx context.Context, id durable.TaskId) (*durable.TaskRecord[durable.JsonValue, durable.JsonValue, durable.JsonValue], error) {
-	record, err := harness.ReadOnLine(func() (any, error) { return harness.storage.Task(ctx, id) })
+	record, err := harness.ReadOnLineCtx(ctx, func(storage durable.Storage) (any, error) { return storage.Task(ctx, id) })
 	if err != nil {
 		return nil, err
 	}
@@ -197,14 +240,14 @@ func (harness *harnessImpl) GetTask(ctx context.Context, id durable.TaskId) (*du
 }
 
 func (harness *harnessImpl) Inspect(ctx context.Context) (HarnessInspection, error) {
-	result, err := harness.ReadOnLine(func() (any, error) {
+	result, err := harness.ReadOnLineCtx(ctx, func(storage durable.Storage) (any, error) {
 		scheduling, tasks, err := harness.tasks.Inspect(harness.options.Registry.Snapshot())
 		if err != nil {
 			return nil, err
 		}
 		scan := func(status durable.SubmissionStatus) ([]durable.SubmissionRecord, error) {
 			return ScanAll(func(cursor durable.Cursor) (durable.Page[durable.SubmissionRecord, durable.Cursor], error) {
-				return harness.storage.ScanSubmissions(ctx, durable.SubmissionQuery{Status: &status}, harnessScanPageSize, cursor)
+				return storage.ScanSubmissions(ctx, durable.SubmissionQuery{Status: &status}, harnessScanPageSize, cursor)
 			})
 		}
 		queued, err := scan(durable.SubmissionQueued)
@@ -237,24 +280,28 @@ func (harness *harnessImpl) AbortSubmission(ctx context.Context, id durable.Subm
 }
 
 func (harness *harnessImpl) AbortTask(ctx context.Context, id durable.TaskId) (string, error) {
-	return harness.tasks.Abort(ctx, id)
+	return harness.tasks.Abort(ctx, id, false)
 }
 
 func (harness *harnessImpl) WaitForTask(ctx context.Context, id durable.TaskId) (durable.SettledTask[durable.JsonValue], error) {
-	harness.tasks.Resume()
+	if err := harness.tasks.TryResume(); err != nil {
+		return durable.SettledTask[durable.JsonValue]{}, err
+	}
 	return harness.tasks.WaitForTask(ctx, id)
 }
 
 func (harness *harnessImpl) WaitForIdle(ctx context.Context) error {
-	harness.tasks.Resume()
+	if err := harness.tasks.TryResume(); err != nil {
+		return err
+	}
 	return harness.tasks.WaitForIdle(ctx, nil)
 }
 
 // Usage sums every conversation's committed pi.usage. Each document is read at its own point; totals only grow.
 func (harness *harnessImpl) Usage(ctx context.Context) (UsageState, error) {
-	listed, err := harness.ReadOnLine(func() (any, error) {
+	listed, err := harness.ReadOnLineCtx(ctx, func(storage durable.Storage) (any, error) {
 		return ScanAll(func(cursor durable.Cursor) (durable.Page[durable.ConversationRecord, durable.Cursor], error) {
-			return harness.storage.ScanConversations(ctx, durable.ConversationQuery{}, harnessScanPageSize, cursor)
+			return storage.ScanConversations(ctx, durable.ConversationQuery{}, harnessScanPageSize, cursor)
 		})
 	})
 	if err != nil {
@@ -273,8 +320,18 @@ func (harness *harnessImpl) Usage(ctx context.Context) (UsageState, error) {
 	return total, nil
 }
 
-func (harness *harnessImpl) TaskGraph(ctx context.Context) (durable.AttachedReplicatedState[TaskGraph], error) {
-	return harness.taskGraph.State(ctx)
+func (harness *harnessImpl) ObserveTaskGraph(ctx context.Context, observer durable.Observer[TaskGraph]) (durable.Observation[TaskGraph], error) {
+	if err := harness.checkOpen(); err != nil {
+		return nil, err
+	}
+	return harness.taskGraph.Observe(ctx, observer)
+}
+
+func (harness *harnessImpl) ObserveConversation(ctx context.Context, id durable.ConversationId, observer durable.Observer[ConversationView], window *ConversationWindow) (durable.Observation[ConversationView], error) {
+	if err := harness.checkOpen(); err != nil {
+		return nil, err
+	}
+	return harness.host.views.Observe(ctx, id, observer, window)
 }
 
 func (harness *harnessImpl) WatchTaskGraph(ctx context.Context) (TaskGraphWatch, error) {
@@ -293,7 +350,7 @@ func (harness *harnessImpl) Conversation(ctx context.Context, id durable.Convers
 	if err := harness.checkOpen(); err != nil {
 		return nil, err
 	}
-	record, err := harness.ReadOnLine(func() (any, error) { return harness.storage.Conversation(ctx, id) })
+	record, err := harness.ReadOnLineCtx(ctx, func(storage durable.Storage) (any, error) { return storage.Conversation(ctx, id) })
 	if err != nil {
 		return nil, err
 	}
@@ -308,7 +365,7 @@ func (harness *harnessImpl) CreateConversation(ctx context.Context, options Conv
 	return harness.create(ctx, createTarget{kind: createIndependent, ownership: options.Ownership}, RootOptions{Agent: options.Agent, Init: options.Init})
 }
 
-// Close seals the Harness; later root, conversation, and creation calls fail with ErrClosed.
+// Close seals the Harness; later root, conversation, and creation calls fail with session.ErrSessionClosed.
 func (harness *harnessImpl) Close(ctx context.Context) error {
 	harness.closed.Store(true)
 	return harness.SessionImpl.Close(ctx)
@@ -375,9 +432,14 @@ func (harness *harnessImpl) conversationCreated(tx *session.Transaction, record 
 	return nil
 }
 
+// checkOpen is SessionImpl.assertUsable (session.ts:657-660), which harness.ts resume, conversation, and create call:
+// SessionFailed once the Session failed, else "Session is closed" once close began.
 func (harness *harnessImpl) checkOpen() error {
+	if failure := harness.Failure(); failure != nil {
+		return durable.NewSessionFailed(failure)
+	}
 	if harness.closed.Load() {
-		return ErrClosed
+		return session.ErrSessionClosed
 	}
 	return nil
 }
@@ -402,11 +464,34 @@ func (bound *boundConversation) bind(ctx context.Context) context.Context {
 
 func (bound *boundConversation) Id() durable.ConversationId { return bound.id }
 
-func (bound *boundConversation) Submit(ctx context.Context, draft durable.InputSubmissionDraft) (durable.Submission, error) {
+// SubmitIn is the transaction form of Submit. The caller's commit carries its own context, so the invocation's abort is
+// checked here.
+func (bound *boundConversation) SubmitIn(tx durable.Tx, draft durable.SubmissionDraft) (durable.SubmissionId, error) {
+	if err := bound.binding.Check(); err != nil {
+		return 0, err
+	}
+	if err := bound.binding.Signal.Err(); err != nil {
+		return 0, context.Cause(bound.binding.Signal)
+	}
+	return bound.submissions.Admit(tx, bound.id, draft)
+}
+
+func (bound *boundConversation) Submit(ctx context.Context, draft durable.SubmissionDraft) (durable.Submission, error) {
 	if err := bound.binding.Check(); err != nil {
 		return nil, err
 	}
-	submission, err := bound.submissions.Submit(bound.bind(ctx), bound.id, draft)
+	// Cancellation is checked when the job starts, not while it runs (group commit §2, session.ts commit): a submit queued
+	// behind another job is rejected if the invocation ended before it starts, and once it started it runs without the signal.
+	linked := bound.bind(ctx)
+	if err := linked.Err(); err != nil {
+		return nil, context.Cause(linked)
+	}
+	submission, err := bound.submissions.SubmitUnlessCancelled(context.WithoutCancel(linked), func() error {
+		if linked.Err() != nil {
+			return context.Cause(linked)
+		}
+		return nil
+	}, bound.id, draft)
 	if err != nil {
 		return nil, err
 	}
@@ -471,7 +556,7 @@ func OpenHarness(ctx context.Context, storage durable.Storage, options HarnessOp
 	snapshot := options.Registry.Snapshot()
 	var missing []string
 	for _, task := range BuiltinTasks() {
-		if snapshot.Task(task.AnyDefinition().Name) == nil {
+		if snapshot.Task(task.Definition.Name).Definition == nil {
 			missing = append(missing, task.AnyDefinition().Name)
 		}
 	}
@@ -480,13 +565,54 @@ func OpenHarness(ctx context.Context, storage durable.Storage, options HarnessOp
 	}
 	harness := newHarness(ctx, storage, options)
 	if err := harness.tasks.Open(ctx); err != nil {
-		// The caller's context may be what failed open: close without it, and rethrow the open error.
-		if closeErr := harness.Close(context.WithoutCancel(ctx)); closeErr != nil && options.OnReport != nil {
-			options.OnReport(closeErr)
-		}
+		// The caller's context may be what failed open: close without it, and rethrow the open error. A failing Storage close
+		// fails the Session, which reports it.
+		_ = harness.Close(context.WithoutCancel(ctx))
 		return nil, err
 	}
 	return harness, nil
+}
+
+// SafeReport is onReport that cannot fail: it is the last place an error goes, so its own panic is dropped. Ports harness.ts
+// safeReport; the Harness over the core wraps its OnReport with it too.
+func SafeReport(onReport func(report durable.Report)) func(err error, info durable.ReportInfo) {
+	return func(err error, info durable.ReportInfo) {
+		defer func() {
+			// upstream: packages/durable/src/harness/harness.ts:safeReport
+			_ = recover()
+		}()
+		if onReport != nil {
+			onReport(durable.Report{ReportInfo: info, Error: err})
+		}
+	}
+}
+
+// SafeNow is the host clock, falling back to the wall clock when it panics: a broken clock must not stop commits. The first
+// failure is reported; the clock is read in every task change, so later ones are not. Ports harness.ts safeNow; the Harness
+// over the core wraps its Now with it too.
+func SafeNow(now func() float64, report func(err error, info durable.ReportInfo)) func() float64 {
+	wall := func() float64 { return float64(time.Now().UnixMilli()) }
+	if now == nil {
+		return wall
+	}
+	var reported atomic.Bool
+	return func() (value float64) {
+		defer func() {
+			// upstream: packages/durable/src/harness/harness.ts:safeNow
+			if recovered := recover(); recovered != nil {
+				// Set first: a report handler that reads the clock again must not report again.
+				if reported.CompareAndSwap(false, true) {
+					err, ok := recovered.(error)
+					if !ok {
+						err = fmt.Errorf("%v", recovered)
+					}
+					report(err, durable.ReportInfo{Kind: durable.ReportHostError, Callback: durable.HostCallbackNow})
+				}
+				value = wall()
+			}
+		}()
+		return now()
+	}
 }
 
 func joinNames(names []string) string {
@@ -501,36 +627,51 @@ func joinNames(names []string) string {
 }
 
 func newHarness(ctx context.Context, storage durable.Storage, options HarnessOptions) *harnessImpl {
-	harness := &harnessImpl{storage: storage, options: options, report: options.OnReport}
-	if harness.report == nil {
-		harness.report = func(error) {}
-	}
-	now := options.Now
-	if now == nil {
-		now = func() float64 { return float64(time.Now().UnixMilli()) }
-	}
+	options = options.WithModelsView() // a plain Models is wrapped once (harness.ts currentModels)
+	harness := &harnessImpl{storage: storage, options: options, report: telemetryReport(SafeReport(options.OnReport), rootTelemetry(options.Telemetry))}
+	// A clock failure reports without a phase context.
+	now := SafeNow(options.Now, func(err error, info durable.ReportInfo) { harness.report(context.Background(), err, info) })
 	harness.SessionImpl = session.NewSessionImpl(storage, session.Hooks{
 		ConversationCreated: harness.conversationCreated,
 		// Join task invocations after admission is sealed and before Storage closes; writes no task outcome.
 		BeforeClose: func() { harness.tasks.Join() },
-	})
+		// The ownership memberships a commit's task changes write, from the scheduler's index.
+		MembershipKeys:  func(tx *session.Transaction) ([]string, error) { return harness.tasks.MembershipKeys(tx) },
+		Report:          harness.report,
+		SetTimer:        options.SetTimer,
+		ReadOnly:        options.ReadOnly,
+		PersistWithinMs: harness.persistWithinMs,
+	}, now, harness.documentRetentionMs)
+	// Every component reads and writes through the Session's failure guard (session.ts: the Harness uses `this.storage`).
+	storage = harness.Storage()
+	harness.storage = storage
 	harness.line = sessionLine{harness.SessionImpl}
 	harness.tasks = NewTaskScheduler(TaskSchedulerOptions{
-		Session:  harness.SessionImpl,
-		Storage:  storage,
-		Registry: options.Registry,
-		Models:   options.Models,
+		Telemetry: options.Telemetry,
+		Session:   harness.SessionImpl,
+		Storage:   storage,
+		Registry:  options.Registry,
+		Models:    options.CurrentModels,
 		Agent: func(callCtx context.Context, id durable.ConversationId, snapshot durable.RegistrySnapshot) (durable.Agent, error) {
 			return harness.resolveAgent(callCtx, id, snapshot)
 		},
-		Settings:       harness.settings,
-		Env:            harness.buildEnv,
-		Now:            now,
+		Settings: harness.settings,
+		Env:      harness.buildEnv,
+		Now:      now,
+		OnWake:   options.OnWake,
+		Timers: durable.HostTimers(options.SetTimer, func(err error) {
+			harness.report(context.Background(), err, durable.ReportInfo{Kind: durable.ReportHostError, Callback: durable.HostCallbackSetTimer})
+		}),
+		WriteAtClose: func(writes func() []durable.StorageWrite) error {
+			// A close writes what it stops straight to Storage, off the published changes, with no caller to cancel it.
+			return harness.WriteAtClose(context.WithoutCancel(ctx), writes)
+		},
 		Report:         harness.report,
+		LimitsRestarts: func(kind string) bool { return limitsRestarts[kind] },
 		SettleOutcome:  SettleSchedulerOutcome,
 		WithdrawInputs: WithdrawQueuedInputs,
 		Conversation: func(callCtx context.Context, id durable.ConversationId, binding InvocationBinding) (durable.ConversationHandle, error) {
-			record, err := harness.ReadOnLine(func() (any, error) { return storage.Conversation(callCtx, id) })
+			record, err := harness.ReadOnLineCtx(callCtx, func(line durable.Storage) (any, error) { return line.Conversation(callCtx, id) })
 			if err != nil {
 				return nil, err
 			}
@@ -539,16 +680,20 @@ func newHarness(ctx context.Context, storage durable.Storage, options HarnessOpt
 			}
 			return &boundConversation{id: id, binding: binding, submissions: harness.submissions, tasks: harness.tasks}, nil
 		},
-		Context: context.WithoutCancel(ctx),
+		Context:  context.WithoutCancel(ctx),
+		ReadOnly: options.ReadOnly,
 	})
-	harness.submissions = NewSubmissions(harness.SessionImpl, storage, now, func() QueueModes { return QueueModesOf(harness.settings()) }, func() { harness.tasks.Resume() })
-	harness.taskGraph = NewTaskGraphView(harness.SessionImpl, storage)
+	harness.submissions = NewSubmissions(harness.SessionImpl, now, func() QueueModes { return QueueModesOf(harness.settings()) }, harness.tasks.TryResume, options.Telemetry)
+	harness.taskGraph = NewTaskGraphView(harness.SessionImpl, TaskGraphBlocking{
+		Blocked:          harness.tasks.BlockedReason,
+		SubscribeBlocked: harness.tasks.SubscribeBlocked,
+	})
 	harness.host = &conversationHost{
 		harness:     harness,
 		storage:     storage,
 		tasks:       harness.tasks,
 		submissions: harness.submissions,
-		views:       NewConversationViews(harness.SessionImpl, storage),
+		views:       NewConversationViews(harness.SessionImpl),
 		now:         now,
 	}
 	return harness
@@ -557,6 +702,6 @@ func newHarness(ctx context.Context, storage durable.Storage, options HarnessOpt
 // sessionLine adapts the Session kernel to the context-taking line reader ReadContext declares.
 type sessionLine struct{ *session.SessionImpl }
 
-func (line sessionLine) ReadOnLine(_ context.Context, read func() (any, error)) (any, error) {
-	return line.SessionImpl.ReadOnLine(read)
+func (line sessionLine) ReadOnLine(ctx context.Context, read func(storage durable.Storage) (any, error)) (any, error) {
+	return line.ReadOnLineCtx(ctx, read)
 }

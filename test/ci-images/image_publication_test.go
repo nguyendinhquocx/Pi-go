@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
 // SPDX-License-Identifier: MIT
 package ciimages
 
@@ -6,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -27,7 +27,7 @@ type imageWorkflow struct {
 	Permissions map[string]string
 	Jobs        map[string]struct {
 		If          string
-		Needs       string
+		Needs       any
 		Permissions map[string]string
 		Environment struct{ Name string }
 		Steps       []imageWorkflowStep
@@ -70,6 +70,10 @@ func TestCIImagePublicationIsEnvironmentProtected(t *testing.T) {
 			continue
 		}
 		for scope, permission := range config.Permissions {
+			// The proposal jobs write a branch and a pull request, never a package: only publish owns packages: write.
+			if (job == "propose-lock" || job == "propose-pin") && (scope == "contents" || scope == "pull-requests") && permission == "write" {
+				continue
+			}
 			if permission != "read" && permission != "none" {
 				t.Errorf("%s has %s: %s outside publication", job, scope, permission)
 			}
@@ -81,7 +85,7 @@ func TestCIImagePublicationIsEnvironmentProtected(t *testing.T) {
 		}
 	}
 	publish := workflow.Jobs["publish"]
-	if publish.Environment.Name != "release" || publish.Permissions["packages"] != "write" || publish.Needs != "build" {
+	if publish.Environment.Name != "release" || publish.Permissions["packages"] != "write" || !slices.Equal(needsOf(publish.Needs), []string{"plan", "build"}) {
 		t.Fatal("publication must depend on all builds and own packages: write behind the release environment")
 	}
 	const gate = "github.event_name == 'workflow_dispatch' && inputs.publish == true && github.ref == 'refs/heads/main'"

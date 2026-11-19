@@ -12,7 +12,6 @@ package codingagent
 
 import (
 	"context"
-	"os"
 	"slices"
 	"strings"
 
@@ -20,15 +19,6 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/internal/configvalue"
 )
-
-// testFauxProviderID is the scripted provider the parity harness registers
-// from an extension under Pi (test/parity/testdata/test-faux-provider.ts, apiKey
-// "unused") and PiG builds in under PIG_TEST_FAUX.
-const testFauxProviderID = "test-faux"
-
-func testFauxProvider(providerID string) bool {
-	return providerID == testFauxProviderID && os.Getenv("PIG_TEST_FAUX") == "1"
-}
 
 // ExtensionModelRegistryState returns the registry snapshot for extension
 // processes: the catalog under "models", each provider's display name, base
@@ -38,35 +28,45 @@ func testFauxProvider(providerID string) bool {
 // getAll, getAvailable, hasConfiguredAuth, getProviderAuthStatus, getProvider,
 // getProviderDisplayName, isUsingOAuth and getError from them.
 func ExtensionModelRegistryState(registry *ModelRegistry, catalog []*ai.Model) map[string]any {
-	models := make([]map[string]any, 0, len(catalog))
-	var providerIDs []string
+	ordered := make([]*ai.Model, 0, len(catalog))
+	providerIDs := make([]string, 0, len(catalog))
 	for _, model := range catalog {
-		info := extension.ModelInfo(model)
-		if info == nil {
+		if model == nil {
 			continue
 		}
-		models = append(models, info)
-		providerID, _ := info["provider"].(string)
-		providerIDs = append(providerIDs, providerID)
+		ordered = append(ordered, model)
+		providerIDs = append(providerIDs, model.ProviderID())
 	}
 	if registry != nil {
-		registry.orderExtensionModels(models)
+		registry.orderExtensionModels(ordered)
+	}
+	models := make([]extension.ModelValue, len(ordered))
+	for i, model := range ordered {
+		models[i] = extension.ModelValue{Model: model}
 	}
 	var typed any
 	var typedProviders []string
 	if registry != nil {
 		list := registry.extensionTypedModels()
-		typed, typedProviders = list, typedModelProviders(list)
+		typed, typedProviders = modelValues(list), typedModelProviders(list)
 	}
 	return extensionRegistryState(registry, models, providerIDs, typed, typedProviders)
 }
 
+// modelValues is each model as its extension model object.
+func modelValues(models []ai.AnyModel) []extension.ModelValue {
+	values := make([]extension.ModelValue, len(models))
+	for i, model := range models {
+		values[i] = extension.ModelValue{Model: model}
+	}
+	return values
+}
+
 // typedModelProviders lists the provider of each typed model.
-func typedModelProviders(typed []map[string]any) []string {
+func typedModelProviders(typed []ai.AnyModel) []string {
 	ids := make([]string, 0, len(typed))
 	for _, model := range typed {
-		providerID, _ := model["provider"].(string)
-		ids = append(ids, providerID)
+		ids = append(ids, model.ProviderID())
 	}
 	return ids
 }
@@ -100,12 +100,12 @@ func extensionRegistryState(registry *ModelRegistry, models any, catalogProvider
 }
 
 // extensionTypedModels lists every image and classifier model, in provider order, as the extension wire carries them under "typedModels". The chat catalog stays under "models" because Pi's getAll is chat only (model-registry.ts:51-53); an extension's synchronous getModelsOfType, getModelOfType and findOfType answer from both lists (model-registry.ts:145-161).
-func (r *ModelRegistry) extensionTypedModels() []map[string]any {
-	typed := []map[string]any{}
+func (r *ModelRegistry) extensionTypedModels() []ai.AnyModel {
+	typed := []ai.AnyModel{}
 	for _, id := range r.typedModelProviderIDs() {
 		for _, model := range r.GetProviderAllModelData(id) {
 			if !ai.IsModelType(model, ai.ModelTypeChat) {
-				typed = append(typed, extension.AnyModelInfo(model))
+				typed = append(typed, model)
 			}
 		}
 	}
@@ -116,17 +116,13 @@ func (r *ModelRegistry) extensionTypedModels() []map[string]any {
 // registered after every other model, in registration order and each
 // provider's definition order, as upstream ModelRuntime composes providers:
 // built-ins, models.json, then extension registrations.
-func (r *ModelRegistry) orderExtensionModels(models []map[string]any) {
+func (r *ModelRegistry) orderExtensionModels(models []*ai.Model) {
 	compare := r.extensionModelOrder()
 	if compare == nil {
 		return
 	}
-	slices.SortStableFunc(models, func(a, b map[string]any) int {
-		aProvider, _ := a["provider"].(string)
-		aID, _ := a["id"].(string)
-		bProvider, _ := b["provider"].(string)
-		bID, _ := b["id"].(string)
-		return compare(aProvider, aID, bProvider, bID)
+	slices.SortStableFunc(models, func(a, b *ai.Model) int {
+		return compare(a.ProviderID(), a.ID, b.ProviderID(), b.ID)
 	})
 }
 
@@ -140,7 +136,7 @@ func (r *ModelRegistry) extensionModelOrder() func(string, string, string, strin
 				continue
 			}
 		}
-		if len(ai.ListModels(providerID)) > 0 {
+		if len(builtinChatCatalog(providerID)) > 0 {
 			continue
 		}
 		rank[providerID] = index + 1
@@ -201,7 +197,7 @@ func (r *ModelRegistry) extensionProviderState(providerID string) map[string]any
 	if status.Label != "" {
 		authStatus["label"] = status.Label
 	}
-	configured := r.HasConfiguredAuth(providerID) || testFauxProvider(providerID)
+	configured := r.HasConfiguredAuth(providerID)
 	state := map[string]any{
 		"name":       r.GetProviderDisplayName(providerID),
 		"authStatus": authStatus,
@@ -268,12 +264,9 @@ func (r *ModelRegistry) ExtensionProviderAuthStatus(providerID string) ai.AuthSt
 	if r.hasStoredCredential(providerID) {
 		return ai.AuthStatus{Configured: true, Source: ai.AuthSourceStored}
 	}
-	if testFauxProvider(providerID) {
-		// The harness registration's literal apiKey is upstream's "fallback".
-		return ai.AuthStatus{Configured: true, Source: ai.AuthSourceFallback}
-	}
 	r.mu.RLock()
 	value, fromExtension := "", false
+	// pig divergence (D203): an empty apiKey is no key (Pi keeps "" as a configured raw key, provider-composer.ts:397,723-736).
 	if dynamic, ok := r.dynamic[providerID]; ok && dynamic.APIKey != "" {
 		value, fromExtension = dynamic.APIKey, true
 	} else if r.config != nil {
@@ -327,12 +320,10 @@ func (r *ModelRegistry) ExtensionProviderAuth(ctx context.Context, providerID st
 	if r.NativeProvider(providerID) != nil {
 		return r.NativeProviderAuth(ctx, providerID, ai.AuthResolutionOverrides{})
 	}
-	if testFauxProvider(providerID) {
-		return &ai.AuthResult{Auth: ai.ModelAuth{APIKey: "unused"}, Source: "configured API key"}, nil
-	}
 	r.mu.Lock()
 	credentials := r.runtimeCredentialsLocked()
 	value := ""
+	// pig divergence (D203): an empty apiKey is no key (Pi keeps "" as a configured raw key, provider-composer.ts:397,450-457).
 	if dynamic, ok := r.dynamic[providerID]; ok && dynamic.APIKey != "" {
 		value = dynamic.APIKey
 	} else if r.config != nil {

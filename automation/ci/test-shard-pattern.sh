@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
 # SPDX-License-Identifier: MIT
 #
 # Usage: test-shard-pattern.sh <shard> <shards> <package>
@@ -26,7 +25,15 @@ shard=$1 shards=$2 package=$3
 
 # Capture the listing in the shell itself: a go test failure inside a pipeline
 # or process substitution would not stop the script and would read as no tests.
-listing=$(go test -list . "$package")
+# TEST_SHARD_BINARY names the package's prebuilt test binary (go test -c), run
+# from the package directory as go test runs it: the Windows CI jobs list and
+# run that way because go test can hang there before the binary starts
+# (golang/go#81368).
+if [[ -n ${TEST_SHARD_BINARY:-} ]]; then
+  listing=$(cd "$package" && "$TEST_SHARD_BINARY" -test.list .)
+else
+  listing=$(go test -list . "$package")
+fi
 names=()
 while IFS= read -r line; do
   if [[ $line =~ ^(Test|Example|Fuzz)[A-Za-z0-9_]*$ ]]; then
@@ -53,8 +60,21 @@ fnv1a32() {
   done
 }
 
-# Read the pins that apply to this package and shard count.
-declare -A pinned=()
+# Read the pins that apply to this package and shard count. Bash 3.2 has no
+# associative arrays; the pins are few, so keep parallel name/shard arrays.
+PINNED_NAMES=()
+PINNED_SHARDS=()
+pinned_get() {
+  local wanted=$1 i
+  if [[ ${#PINNED_NAMES[@]} -gt 0 ]]; then
+    for i in "${!PINNED_NAMES[@]}"; do
+      [[ "${PINNED_NAMES[$i]}" == "$wanted" ]] && { printf '%s\n' "${PINNED_SHARDS[$i]}"; return 0; }
+    done
+  fi
+  return 1
+}
+pinned_has() { pinned_get "$1" >/dev/null; }
+pinned_set() { PINNED_NAMES+=("$1"); PINNED_SHARDS+=("$2"); }
 weights=${TEST_SHARD_WEIGHTS:-$(dirname -- "${BASH_SOURCE[0]}")/test-shard-weights.txt}
 if [[ -f $weights ]]; then
   w_package='' w_shards=''
@@ -68,17 +88,17 @@ if [[ -f $weights ]]; then
           echo "test-shard-pattern: bad line in $weights: $first $second" >&2
           exit 1
         fi
-        # CI passes ./cmd/pig, make passes the import path; both name the package.
+        # CI passes ./coding/cli, make passes the import path; both name the package.
         if [[ ( $package == "$w_package" || $package == */"${w_package#./}" ) && $w_shards == "$shards" ]]; then
           if ((first > shards)); then
             echo "test-shard-pattern: $weights pins $second to shard $first of $shards" >&2
             exit 1
           fi
-          if [[ -n ${pinned[$second]:-} ]]; then
+          if pinned_has "$second"; then
             echo "test-shard-pattern: $weights pins $second twice" >&2
             exit 1
           fi
-          pinned[$second]=$first
+          pinned_set "$second" "$first"
         fi
         ;;
     esac
@@ -87,8 +107,8 @@ fi
 
 selected=()
 for name in "${names[@]}"; do
-  if [[ -n ${pinned[$name]:-} ]]; then
-    place=${pinned[$name]}
+  if pinned_has "$name"; then
+    place=$(pinned_get "$name")
   else
     fnv1a32 "$name"
     place=$((hash % shards + 1))

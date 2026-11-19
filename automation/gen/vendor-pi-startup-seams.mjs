@@ -12,7 +12,7 @@ const theme = join(process.argv[2], "modes/interactive/theme/theme.js");
 let source = readFileSync(theme, "utf8");
 for (const [before, after] of [
   ['import { backgroundAnsi, colorToHex, colorToOklch, foregroundAnsi, getTerminalColorMode, indexedColor, mixColors, parseColor, rgbColor, styleTextWithAnsi, } from "../../../../../pi-tui.mjs";', 'import { backgroundAnsi, colorToHex, colorToOklch, foregroundAnsi, indexedColor, mixColors, parseColor, rgbColor, styleTextWithAnsi, } from "../../../../pi-tui/colors.js";\nimport { getTerminalColorMode, } from "../../../../pi-tui/terminal-image.js";'],
-  ['import { highlight, supportsLanguage } from "../../../utils/syntax-highlight.js";', 'import { highlight, supportsLanguage } from "../../../../../syntax-highlight.mjs";'],
+  ['import { getHighlightLanguageCount, highlight, supportsLanguage } from "../../../utils/syntax-highlight.js";', 'import { getHighlightLanguageCount, highlight, supportsLanguage } from "../../../../../syntax-highlight.mjs";'],
 ]) {
   if (source.split(before).length !== 2) throw new Error(`Pi startup import changed: ${before}`);
   source = source.replace(before, after);
@@ -24,7 +24,7 @@ for (const root of [process.argv[2], join(dirname(process.argv[2]), "pi-agent-co
   for (const file of readdirSync(root, { recursive: true }).filter(file => file.endsWith(".js") && !file.replaceAll("\\", "/").startsWith("sdk-bundle/"))) {
     const path = join(root, file);
     const original = readFileSync(path, "utf8");
-    const rewritten = original.replaceAll('/pi-ai/index.js"', '/pi-ai/sdk-bundle/index.js"').replaceAll('/pi-ai/compat.js"', '/pi-ai/sdk-bundle/compat.js"').replaceAll('/pi-ai/providers/all.js"', '/pi-ai/sdk-bundle/providers.js"');
+    const rewritten = original.replaceAll('/pi-ai/index.js"', '/pi-ai/sdk-bundle/index.js"').replaceAll('/pi-ai/compat.js"', '/pi-ai/sdk-bundle/compat.js"').replaceAll('/pi-ai/providers/all.js"', '/pi-ai/sdk-bundle/providers.js"').replaceAll('/pi-ai/providers/openrouter.js"', '/pi-ai/sdk-bundle/openrouter.js"');
     if (rewritten !== original) writeFileSync(path, rewritten);
   }
 }

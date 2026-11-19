@@ -15,6 +15,7 @@ func TestSessionQueueOperationsPreserveModesAndEmitUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_ = sess.Events()
 	defer func() {
 		if err := sess.Close(); err != nil {
 			t.Errorf("close session: %v", err)
@@ -70,7 +71,7 @@ func TestSessionQueueOperationsPreserveModesAndEmitUpdates(t *testing.T) {
 
 func TestSessionThinkingLevelUsesModelCapabilities(t *testing.T) {
 	model := fakeModel()
-	model.Capabilities.MaxThinking = ai.ThinkingHigh
+	model.Capabilities.MaxThinking = ai.ThinkingLevelHigh
 	sess, err := NewSession(newTestServices(t), SessionOptions{Model: model})
 	if err != nil {
 		t.Fatal(err)
@@ -111,6 +112,7 @@ func (p *retryUntilCancelledProvider) Stream(context.Context, ai.TranscriptConte
 	), nil
 }
 
+// Pi: packages/coding-agent/src/core/agent-session.ts:1381 (Session.abortRetry).
 func TestSessionAbortRetryCancelsDelay(t *testing.T) {
 	services := newTestServices(t)
 	enabled := true

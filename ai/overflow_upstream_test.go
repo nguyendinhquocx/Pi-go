@@ -18,6 +18,8 @@ func TestOverflowUpstream(t *testing.T) {
 		{"detects Together AI context length errors", "400 The input (516368 tokens) is longer than the model's context length (262144 tokens).", "ollama", 262144, true},
 		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:51
 		{"detects LiteLLM-wrapped OpenAI maximum context length errors", "Error: 503 litellm.ServiceUnavailableError: litellm.MidStreamFallbackError: litellm.APIConnectionError: APIConnectionError: OpenAIException - Requested token count exceeds the model's maximum context length of 131072 tokens.", "ollama", 131072, true},
+		// Pi 36ae26b4 overflow.test.ts:94 (#11492)
+		{"detects LiteLLM pre-call ContextWindowExceededError", "400: {\"message\":\"litellm.ContextWindowExceededError: litellm.BadRequestError: litellm._pre_call_checks: Context Window exceeded for given call. No models have context window large enough for this call.\\nModel=Qwen3.8-Flash-Next, Max Input Tokens=262144, Got=265262\\nmodel=Qwen3.8-Flash-Next. context_window_fallbacks=None. fallbacks=[].\"}", "ollama", 262144, true},
 		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:58
 		{"detects OpenAI-compatible parenthesized maximum context length errors", "Error: 400 Input length (265330) exceeds model's maximum context length (262144).", "ollama", 262144, true},
 		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:65
@@ -28,11 +30,9 @@ func TestOverflowUpstream(t *testing.T) {
 		{"detects DS4 configured context size errors/commas", "Prompt has 5,958,968 tokens, but the configured context size is 256,000 tokens", "ollama", 256000, true},
 		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:84
 		{"does not treat generic non-overflow Ollama errors as overflow", "500 `model runner crashed unexpectedly`", "ollama", 32768, false},
-		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:89
-		{"only treats bodyless 400 and 413 errors as overflow for Cerebras/400/cerebras", "400 status code (no body)", "cerebras", 131072, true},
-		{"only treats bodyless 400 and 413 errors as overflow for Cerebras/413/cerebras", "413 status code (no body)", "cerebras", 131072, true},
-		{"only treats bodyless 400 and 413 errors as overflow for Cerebras/400/opencode-go", "400 status code (no body)", "opencode-go", 1000000, false},
-		{"only treats bodyless 400 and 413 errors as overflow for Cerebras/413/opencode-go", "413 status code (no body)", "opencode-go", 1000000, false},
+		// .upstream/v1.3.0+73f8de80/packages/ai/test/overflow.test.ts:125 (Pi 73f8de80: HTTP 413 is request-size overflow for every provider, a bodyless 400 only for Cerebras)
+		{"only treats bodyless 400 errors as overflow for Cerebras/cerebras", "400 status code (no body)", "cerebras", 131072, true},
+		{"only treats bodyless 400 errors as overflow for Cerebras/opencode-go", "400 status code (no body)", "opencode-go", 1000000, false},
 		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:97
 		{"does not treat Bedrock throttling 'Too many tokens' as overflow", "Throttling error: Too many tokens, please wait before trying again.", "ollama", 200000, false},
 		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:104
@@ -60,7 +60,7 @@ func TestOverflowLengthStopsUpstream(t *testing.T) {
 		provider, model                             string
 	}{
 		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:148
-		{name: "detects Xiaomi-style overflow (length stop with zero output and filled context)", input: 58, cacheRead: 1048512, limit: 1048576, want: true, provider: "xiaomi", model: "mimo-v2.5-pro"},
+		{name: "detects Xiaomi-style overflow (length stop with zero output and filled context)", input: 58, cacheRead: 1048512, limit: 1048576, want: true, provider: "xiaomi", model: "mimo-v2.6-pro"},
 		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:159
 		{name: "treats a length stop below the desired output limit as recoverable", input: 3, cacheRead: 253584, cacheWrite: 25554, output: 16, limit: 128000, recoverable: true, want: true, api: APIOpenAIResponses, provider: "openai", model: "gpt-5.6-sol"},
 		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:172
@@ -93,4 +93,46 @@ func TestOverflowLengthStopsUpstream(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Ports packages/ai/test/overflow.test.ts (Pi 73f8de80): the 413 pattern is provider-agnostic, so one Copilot-prefixed string and one
+// non-Copilot string cover both branches of the regex, and the bare forms cover the raw SDK output.
+func TestOverflowRequestSizeUpstream(t *testing.T) {
+	for _, errorMessage := range []string{
+		`github-copilot API error (413): {"message":"failed to parse request","code":""}`, // formatProviderError prefix
+		"custom-provider API error (413): Payload Too Large",                              // any provider, not just Copilot
+		`413 {"error":{"message":"failed to parse request","code":""}}`,                   // raw SDK error
+		"413", // bare status at end of string
+	} {
+		t.Run("detects provider-independent request-size overflow: "+errorMessage, func(t *testing.T) {
+			// The request can exceed the byte limit even with zero usage and a large token window.
+			message := overflowErrorMessage(errorMessage, "ollama")
+			if !IsContextOverflow(message, 1_000_000) || !IsContextOverflow(message, 0) {
+				t.Fatal("HTTP 413 is not request-size overflow")
+			}
+		})
+	}
+	for _, errorMessage := range []string{
+		`github-copilot API error (400): {"message":"failed to parse request","code":""}`,           // other status, same body
+		"custom-provider API error (429): Too many requests",                                        //
+		`github-copilot API error (400): {"message":"failed to parse request: invalid value 413"}`,  // 413 in the body only
+		"custom-provider API error (400): upstream mentioned OpenAI API error (413): invalid input", // 413 not at start
+		"custom-provider API error (4130): invalid input",                                           // 413 is a prefix, not the status
+		"4130 failed to parse request",                                                              // bare 4130 is not 413
+	} {
+		t.Run("does not mistake unrelated errors for request-size overflow: "+errorMessage, func(t *testing.T) {
+			if IsContextOverflow(overflowErrorMessage(errorMessage, "ollama"), 0) {
+				t.Fatal("classified as overflow")
+			}
+		})
+	}
+	t.Run("limits HTTP-status matching to failed responses", func(t *testing.T) {
+		message := overflowErrorMessage(`OpenAI API error (413): {"message":"failed to parse request"}`, "ollama")
+		for _, stop := range []StopReason{StopReasonAborted, StopReasonStop} {
+			message.StopReason = stop
+			if IsContextOverflow(message, 0) {
+				t.Fatalf("stopReason %s classified as overflow", stop)
+			}
+		}
+	})
 }

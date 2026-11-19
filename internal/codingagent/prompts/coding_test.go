@@ -1,7 +1,6 @@
 package prompts
 
 import (
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -13,37 +12,12 @@ var piSnippets = map[string]string{
 	"write": "Create or overwrite files",
 }
 
-// The expected text is upstream Pi 0.87.1's rendering for the same inputs,
-// with only the product name and documentation location changed (D22).
-func TestBuildDefaultPromptMatchesUpstreamLayout(t *testing.T) {
-	docs := filepath.Join("/home", "u", ".pig", "docs")
-	got := BuildDefaultPrompt(Options{
-		Cwd:            "/work/app",
-		Tools:          []string{"read", "bash", "edit", "write"},
-		ToolHints:      piSnippets,
-		ToolGuidelines: map[string][]string{"read": {"Use read to examine files instead of cat or sed."}, "write": {"Use write only for new files or complete rewrites."}},
-		PigDocsPath:    docs,
-	})
-	want := preamble + "\n\n<tools>\n" +
-		"- read: Read file contents\n- bash: Execute bash commands (ls, grep, find, etc.)\n" +
-		"- edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call\n- write: Create or overwrite files\n\n" +
-		"In addition to the tools above, you may have access to other custom tools depending on the project.\n</tools>\n\n<rules>\n" +
-		"- Use bash for file operations like ls, rg, find\n- Use read to examine files instead of cat or sed.\n- Use write only for new files or complete rewrites.\n" +
-		"- Be concise in your responses\n- Show file paths clearly when working with files\n</rules>\n\n<docs>\n" + docsSection(docs) + "\n</docs>\n\n<cwd>\n/work/app\n</cwd>"
-	if got != want {
-		t.Fatalf("prompt mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
-	}
-	if !strings.Contains(got, "- Main documentation: "+filepath.Join(docs, "README.md")+"\n- Additional docs: "+docs+"\n") {
-		t.Errorf("docs section does not point at the local bundle:\n%s", got)
-	}
-}
-
 func TestToolsWithoutSnippetsAreNotListed(t *testing.T) {
 	got := BuildDefaultPrompt(Options{Tools: []string{"read", "custom"}, ToolHints: map[string]string{"read": "Read file contents"}})
 	if strings.Contains(got, "- custom") || !strings.Contains(got, "<tools>\n- read: Read file contents\n\n") {
 		t.Fatalf("tools section:\n%s", got)
 	}
-	if none := BuildDefaultPrompt(Options{}); !strings.Contains(none, "<tools>\n(none)\n\nIn addition") {
+	if none := BuildDefaultPrompt(Options{}); !strings.Contains(none, "<tools>\n(none)\n\nAdditional tools") {
 		t.Fatalf("empty tools section:\n%s", none)
 	}
 }
@@ -99,7 +73,7 @@ func TestSkillsSectionMatchesUpstreamFormat(t *testing.T) {
 	got := BuildDefaultPrompt(Options{Tools: []string{"bash"}, Skills: skills})
 	want := "<skills>\nThe following skills provide specialized instructions for specific tasks.\n" +
 		"Use bash to load a skill's file when the task matches its description.\n" +
-		"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n" +
+		"Resolve relative paths against the skill's directory (parent of SKILL.md). Use absolute paths in tool calls.\n\n" +
 		"<available_skills>\n  <skill>\n    <name>pdf</name>\n    <description>Read &lt;PDF&gt; &amp; forms</description>\n    <location>/s/pdf/SKILL.md</location>\n  </skill>\n</available_skills>\n</skills>"
 	if !strings.Contains(got, want) || strings.Contains(got, "hidden") {
 		t.Fatalf("skills section:\n%s", got)

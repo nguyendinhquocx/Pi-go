@@ -1,5 +1,4 @@
 <!--
-SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
 SPDX-License-Identifier: MIT
 -->
 
@@ -31,7 +30,8 @@ Reviewers compare scanner output with these authoritative inputs:
 - npm packages in every `package.json` and lock file;
 - Python project metadata and resolved distributions;
 - Rust crates in every `Cargo.toml` and `Cargo.lock` pair;
-- embedded JavaScript, fonts, images, schemas, and generated tables;
+- embedded JavaScript, the embedded Node runtime archive, fonts, images, schemas, and generated tables;
+- vendored forks under `third_party/` (`awssdk`, `goldmark`, `jsonschema`, `semver`), which are packages of the root module, so `go.sum` does not list them; each fork's `FORK.md` names the upstream version and the changes;
 - copied or translated upstream source identified by `NOTICE`, SPDX metadata, and `docs/parity/PORT_MAP.md`;
 - files included in each source or binary archive;
 - operating-system packages in each published OCI image.
@@ -76,7 +76,7 @@ The project can use more than one tool for independent evidence:
 - Grype, OSV-Scanner, `govulncheck`, `npm audit`, and `pip-audit` for vulnerability evidence;
 - Code Insight, FOSSology, `go-licenses`, and REUSE for license evidence;
 - Gitleaks and TruffleHog for secret detection;
-- CodeQL, `staticcheck`, `golangci-lint`, Ruff, Bandit, and ShellCheck for source analysis.
+- CodeQL, `staticcheck`, `golangci-lint`, Ruff, Bandit, ShellCheck, and rustfmt with Clippy (`make lint-rust`, every Rust crate) for source analysis.
 
 No tool name is part of the compliance claim. The claim is that the final inventory is complete, accurate, reviewed, and bound to the exact artifact.
 

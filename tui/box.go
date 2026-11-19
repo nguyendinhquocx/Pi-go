@@ -10,11 +10,12 @@ import (
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
 
-// boxRenderCache holds the unpadded child lines and the padding they were rendered with. Upstream box.ts padding is fixed at construction; Box's exported padding fields can change between frames, so the padding is part of the cache key.
+// boxRenderCache holds the unpadded child lines and the padding they were rendered with. Upstream box.ts padding is fixed at construction; Box's exported padding fields can change between frames, so the padding is part of the cache key. The background is keyed by its sample and by whether there is one, as box.ts keys undefined and an empty string apart.
 type boxRenderCache struct {
 	childLines         []string
 	width              int
 	paddingX, paddingY int
+	hasBg              bool
 	bgSample           string
 	lines              []string
 }
@@ -38,10 +39,12 @@ func NewPaddedBox(paddingX, paddingY int, bgFn func(string) string) *Box {
 	return &Box{PaddingX: paddingX, PaddingY: paddingY, BgFn: bgFn}
 }
 
+// AddChild, RemoveChild and Clear drop the render cache and mark the box dirty; they do not invalidate the children (box.ts addChild, removeChild,
+// clear call only invalidateCache).
 func (b *Box) AddChild(component Component) {
 	b.children = append(b.children, component)
 	b.cache = nil
-	b.Invalidate()
+	b.invalidatable.Invalidate()
 }
 
 func (b *Box) RemoveChild(component Component) {
@@ -49,7 +52,7 @@ func (b *Box) RemoveChild(component Component) {
 		if child == component {
 			b.children = append(b.children[:i], b.children[i+1:]...)
 			b.cache = nil
-			b.Invalidate()
+			b.invalidatable.Invalidate()
 			return
 		}
 	}
@@ -58,11 +61,21 @@ func (b *Box) RemoveChild(component Component) {
 func (b *Box) Clear() {
 	b.children = nil
 	b.cache = nil
-	b.Invalidate()
+	b.invalidatable.Invalidate()
 }
 
+// SetBgFn sets the background. box.ts setBgFn invalidates nothing, because Pi's Container renders every child on every frame and the render cache is keyed by the
+// background's output; a type that embeds the Box is a child a Go container may serve from its own cache, so the Box's dirty flag is set.
 func (b *Box) SetBgFn(bgFn func(string) string) {
 	b.BgFn = bgFn
+	b.invalidatable.Invalidate()
+}
+
+// SetPaddingX sets the horizontal padding and drops the render cache (box.ts setPaddingX); it sets the Box's dirty flag for the reason SetBgFn does.
+func (b *Box) SetPaddingX(paddingX int) {
+	b.PaddingX = paddingX
+	b.cache = nil
+	b.invalidatable.Invalidate()
 }
 
 func (b *Box) Invalidate() {
@@ -73,9 +86,9 @@ func (b *Box) Invalidate() {
 	}
 }
 
-func (b *Box) matchCache(width int, childLines []string, bgSample string) bool {
+func (b *Box) matchCache(width int, childLines []string, hasBg bool, bgSample string) bool {
 	cache := b.cache
-	if cache == nil || cache.width != width || cache.paddingX != b.PaddingX || cache.paddingY != b.PaddingY || cache.bgSample != bgSample || len(cache.childLines) != len(childLines) {
+	if cache == nil || cache.width != width || cache.paddingX != b.PaddingX || cache.paddingY != b.PaddingY || cache.hasBg != hasBg || cache.bgSample != bgSample || len(cache.childLines) != len(childLines) {
 		return false
 	}
 	for i := range childLines {
@@ -108,7 +121,7 @@ func (b *Box) Render(width int) []string {
 	if b.BgFn != nil {
 		bgSample = b.BgFn("test")
 	}
-	if b.matchCache(width, childLines, bgSample) {
+	if b.matchCache(width, childLines, b.BgFn != nil, bgSample) {
 		return b.cache.lines
 	}
 	result := make([]string, 0, capHint(len(childLines), 2*b.PaddingY))
@@ -121,7 +134,7 @@ func (b *Box) Render(width int) []string {
 	for range b.PaddingY {
 		result = append(result, b.applyBg("", width))
 	}
-	b.cache = &boxRenderCache{childLines: childLines, width: width, paddingX: b.PaddingX, paddingY: b.PaddingY, bgSample: bgSample, lines: result}
+	b.cache = &boxRenderCache{childLines: childLines, width: width, paddingX: b.PaddingX, paddingY: b.PaddingY, hasBg: b.BgFn != nil, bgSample: bgSample, lines: result}
 	return result
 }
 

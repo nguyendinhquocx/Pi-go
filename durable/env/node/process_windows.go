@@ -30,18 +30,20 @@ var killProcessTree = func(pid int) error {
 	if err := command.Start(); err != nil {
 		return err
 	}
+	//portlint:allow golifetime reaps taskkill; it returns when taskkill exits
 	go func() { _ = command.Wait() }()
 	return nil
 }
 
 // taskkillCommand is upstream's taskkill spawn with stdio "ignore", detached:
-// true, and windowsHide: true. Upstream joins process.env.SystemRoot ??
-// "C:\\Windows", so only an unset SystemRoot takes the default.
+// true, and windowsHide: true. Upstream joins process.env.SystemRoot ||
+// "C:\\Windows", so an unset or empty SystemRoot takes the default.
 func taskkillCommand(pid int) *exec.Cmd {
-	systemRoot, ok := os.LookupEnv("SystemRoot")
-	if !ok {
+	systemRoot := os.Getenv("SystemRoot")
+	if systemRoot == "" {
 		systemRoot = `C:\Windows`
 	}
+	//nolint:gosec // G204 (class a): program is System32\taskkill.exe under SystemRoot (default C:\Windows), as upstream; args are fixed /F /T /PID plus the pid of a process PiG started.
 	command := exec.Command(filepath.Join(systemRoot, "System32", "taskkill.exe"), "/F", "/T", "/PID", strconv.Itoa(pid))
 	command.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | windows.DETACHED_PROCESS}
 	nodespawn.HideWindow(command, nodespawn.Ignore, nodespawn.Ignore, nodespawn.Ignore)
@@ -68,14 +70,7 @@ func platformShellConfig(ctx context.Context) (shellConfig, error) {
 	for index, candidate := range candidates {
 		searched[index] = "  " + candidate
 	}
-	return shellConfig{}, &durableenv.ExecutionError{
-		Code: durableenv.ExecutionErrorShellUnavailable,
-		Message: "No bash shell found. Options:\n" +
-			"  1. Install Git for Windows: https://git-scm.com/download/win\n" +
-			"  2. Add your bash to PATH (Cygwin, MSYS2, etc.)\n" +
-			"  3. Configure an explicit shellPath\n\n" +
-			"Searched Git Bash in:\n" + strings.Join(searched, "\n"),
-	}
+	return shellConfig{}, durableenv.NewExecutionError(durableenv.ExecutionErrorShellUnavailable, "No bash shell found. Options:\n"+"  1. Install Git for Windows: https://git-scm.com/download/win\n"+"  2. Add your bash to PATH (Cygwin, MSYS2, etc.)\n"+"  3. Configure an explicit shellPath\n\n"+"Searched Git Bash in:\n"+strings.Join(searched, "\n"), nil)
 }
 
 func signalExitCode(syscall.WaitStatus) (int, bool) { return 0, false }

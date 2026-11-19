@@ -23,6 +23,7 @@ package telemetry
 // stubgen:omit CreateTelemetryAdapterConformance
 // stubgen:omit TelemetryAdapterFixture
 // stubgen:omit TelemetryAdapterFixture.GetSpans
+// stubgen:omit TelemetryAdapterFixture.GetMetrics
 // stubgen:omit TelemetryAdapterFixtureFactory
 // stubgen:omit TelemetryAdapterConformanceCase
 // stubgen:omit TelemetryAdapterConformanceCase.Run
@@ -54,22 +55,41 @@ type TelemetryAttributeMetadata struct {
 	Cardinality TelemetryAttributeCardinality `json:"cardinality,omitempty"`
 }
 
-// TelemetryAttributeDefinition declares one attribute's type and optional closed value set.
+// TelemetryAttributeDefinition declares one attribute's type and optional closed value set and examples.
 //
-// Values applies to scalar types and ElementValues to array types; Examples holds values of Type. A nil slice is an
-// absent member and an empty slice serializes as [], as JSON.stringify writes the schema object.
+// Upstream's `values`, `elementValues` and `examples` take the element type of `type` ("string" takes readonly string[],
+// "number[]" takes readonly number[] for elementValues and readonly (readonly number[])[] for examples). Go has no sum of
+// slice types, so each arm is a field of its own element type; the one that applies to Type is the one read and written, and
+// serializes under upstream's member name. A nil slice is an absent member and an empty slice serializes as [], as
+// JSON.stringify writes the schema object.
 type TelemetryAttributeDefinition struct {
 	TelemetryAttributeMetadata
-	Type          TelemetryAttributeType `json:"type"`
-	Values        []AttributeValue       `json:"values,omitzero"`
-	ElementValues []AttributeValue       `json:"elementValues,omitzero"`
-	Examples      []AttributeValue       `json:"examples,omitzero"`
+	Type TelemetryAttributeType
+
+	// Values and Examples are the members of a "string" attribute.
+	Values   []string
+	Examples []string
+	// NumberValues and NumberExamples are the members of a "number" attribute.
+	NumberValues   []float64
+	NumberExamples []float64
+	// BooleanValues and BooleanExamples are the members of a "boolean" attribute.
+	BooleanValues   []bool
+	BooleanExamples []bool
+	// ElementValues and ArrayExamples are the members of a "string[]" attribute.
+	ElementValues []string
+	ArrayExamples [][]string
+	// NumberElementValues and NumberArrayExamples are the members of a "number[]" attribute.
+	NumberElementValues []float64
+	NumberArrayExamples [][]float64
+	// BooleanElementValues and BooleanArrayExamples are the members of a "boolean[]" attribute.
+	BooleanElementValues []bool
+	BooleanArrayExamples [][]bool
 }
 
 // TelemetryStartAttributeDefinition is an attribute supplied when a span starts.
 type TelemetryStartAttributeDefinition struct {
 	TelemetryAttributeDefinition
-	Required bool `json:"required"`
+	Required bool
 }
 
 // TelemetryEventAttributeDefinition is an attribute of a span event; it has the start-attribute shape.
@@ -113,10 +133,12 @@ type TelemetrySpanDefinition struct {
 	Status          TelemetrySpanStatusDefinition                `json:"status"`
 }
 
-// TelemetrySchemaDefinition is serializable telemetry schema data.
+// TelemetrySchemaDefinition is serializable telemetry schema data. A nil Metrics is absent and an empty map serializes
+// as {}.
 type TelemetrySchemaDefinition struct {
-	Version int                                `json:"version"`
-	Spans   map[string]TelemetrySpanDefinition `json:"spans"`
+	Version int                                  `json:"version"`
+	Spans   map[string]TelemetrySpanDefinition   `json:"spans"`
+	Metrics map[string]TelemetryMetricDefinition `json:"metrics,omitzero"`
 }
 
 // DefineTelemetrySchema returns schema unchanged. It is the identity helper for serializable telemetry schema data.
@@ -128,6 +150,22 @@ func DefineTelemetrySchema(schema *TelemetrySchemaDefinition) *TelemetrySchemaDe
 // span and a starter bound to that span for its children.
 type TypedSpanStarter func(name string, attributes SpanAttributes, callback func(span TelemetrySpan, startChildSpan TypedSpanStarter) error) error
 
+// StartTypedSpan starts a schema span through starter and returns the callback's result, as an upstream TypedSpanStarter call resolves
+// to it. A rejected callback returns its error and the zero value. The child starter passed to callback is bound to the new span.
+func StartTypedSpan[R any](starter TypedSpanStarter, name string, attributes SpanAttributes, callback func(span TelemetrySpan, startChildSpan TypedSpanStarter) (R, error)) (R, error) {
+	var result R
+	err := starter(name, attributes, func(span TelemetrySpan, startChildSpan TypedSpanStarter) error {
+		value, err := callback(span, startChildSpan)
+		result = value
+		return err
+	})
+	if err != nil {
+		var zero R
+		return zero, err
+	}
+	return result, nil
+}
+
 func bindTypedSpanStarter(telemetryContext TelemetryContext) TypedSpanStarter {
 	return func(name string, attributes SpanAttributes, callback func(TelemetrySpan, TypedSpanStarter) error) error {
 		return telemetryContext.StartSpan(SpanOptions{Name: name, Attributes: attributes}, func(span TelemetrySpan) error {
@@ -138,6 +176,7 @@ func bindTypedSpanStarter(telemetryContext TelemetryContext) TypedSpanStarter {
 
 // CreateTypedSpanStarter binds an explicit parent context to the combined span vocabulary of one or more schemas.
 // The schemas are not read: as upstream, no runtime schema validation is performed.
-func CreateTypedSpanStarter(telemetryContext TelemetryContext, _ ...*TelemetrySchemaDefinition) TypedSpanStarter {
+// At least one schema is required, as upstream's non-empty TelemetrySchemaTuple.
+func CreateTypedSpanStarter(telemetryContext TelemetryContext, _ *TelemetrySchemaDefinition, _ ...*TelemetrySchemaDefinition) TypedSpanStarter {
 	return bindTypedSpanStarter(telemetryContext)
 }

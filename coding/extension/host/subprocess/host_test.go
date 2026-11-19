@@ -395,10 +395,7 @@ func TestProtocol_RegisterRoundTrip(t *testing.T) {
 				{Name: "subs", Description: "Show sub-agent status"},
 			},
 			Handlers: []HandlerDecl{
-				{Event: "session_start", CanBlock: false, HandlerID: 7},
-			},
-			Widgets: []WidgetDecl{
-				{Key: "subagent-status"},
+				{Event: "session_start", HandlerID: 7},
 			},
 		},
 	}
@@ -491,7 +488,7 @@ func TestResolveSocketDir_TermuxUsesTMPDIRAndKeepsItWithinTheSocketLimit(t *test
 	if got := socketRuntimeBase("linux", dir, 10234, ""); got != dir {
 		t.Fatalf("socketRuntimeBase = %q, want %q kept", got, dir)
 	}
-	if err := validateUnixSocketPath("linux", filepath.Join(dir, "h4294967295", "e-9999.sock")); err != nil {
+	if err := validateUnixSocketPath("linux", filepath.Join(dir, "h4294967295", worstRuntimeSocketLeaf)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -505,6 +502,7 @@ func TestResolveSocketDir_WindowsUsesSystemTemp(t *testing.T) {
 
 // ── Host buildExtension tests ────────────────────────────────────────────────
 
+// Pi: packages/coding-agent/src/core/extensions/types.ts:626 (ToolDefinition.executionMode).
 func TestHost_BuildExtension_Tools(t *testing.T) {
 	h := NewHost("/tmp/test")
 	me := &managedExt{
@@ -534,8 +532,8 @@ func TestHost_BuildExtension_Tools(t *testing.T) {
 			{Key: "ctrl+shift+i", Description: "Toggle info"},
 		},
 		Handlers: []HandlerDecl{
-			{Event: "session_start", CanBlock: false, HandlerID: 1},
-			{Event: "tool_execution_end", CanBlock: true, HandlerID: 2},
+			{Event: "session_start", HandlerID: 1},
+			{Event: "tool_execution_end", HandlerID: 2},
 		},
 	}
 

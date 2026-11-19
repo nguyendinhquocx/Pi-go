@@ -17,6 +17,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/MichaelKinsy/PiG/internal/testenv"
 )
 
 // Every driver copies its cwd fixture under a validated temporary root. Ancestor context discovery remains enabled in both binaries, so the root must be outside the checkout and have no discoverable ancestor context files.
@@ -26,6 +28,9 @@ import (
 // length for pig and pi, so layout, truncation, and the system-prompt size
 // cannot differ between the binaries or between runs.
 const snapshotIDDigits = 10
+
+// extensionSnapshotPrefix names the per-binary copy of an extension fixture (snapshotExtensionPath).
+const extensionSnapshotPrefix = "parity-snap-extension-"
 
 // mkdirTempFixed creates a directory under the canonical, context-free os.TempDir, named prefix followed by snapshotIDDigits random decimal digits.
 func mkdirTempFixed(prefix string) (string, error) {
@@ -81,13 +86,22 @@ func cleanSnapshotRoot(root string) (string, error) {
 // mkdirFixed creates a new directory under root named prefix followed by
 // snapshotIDDigits random decimal digits.
 func mkdirFixed(root, prefix string) (string, error) {
+	return mkdirFixedDigits(root, prefix, snapshotIDDigits)
+}
+
+// mkdirFixedDigits creates a new directory under root named prefix followed by digits random decimal digits.
+func mkdirFixedDigits(root, prefix string, digits int) (string, error) {
 	// On Windows promptPathRoot is \t on the temp directory's drive, which
 	// exists only once a run creates it.
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return "", err
 	}
+	limit := uint64(1)
+	for range digits {
+		limit *= 10
+	}
 	for range 100 {
-		name := fmt.Sprintf("%s%0*d", prefix, snapshotIDDigits, rand.Uint64N(10_000_000_000))
+		name := fmt.Sprintf("%s%0*d", prefix, digits, rand.Uint64N(limit))
 		dir := filepath.Join(root, name)
 		err := os.Mkdir(dir, 0o700)
 		if err == nil {
@@ -111,11 +125,18 @@ func mkdirFixed(root, prefix string) (string, error) {
 // different percentages. The runner therefore places both under the fixed
 // promptPathRoot with lengths that make the two prompts equally long:
 //
-//	3*len(piPackageDir) == 2*(len(pigHome)+len("/docs")) + d22ConstantGap
+//	3*len(piPackageDir) == 2*(len(pigHome)+len("/docs")+pigBundleDirLen) + d22ConstantGap
 //
 // d22ConstantGap is how many more characters pig's fixed docs and preamble
-// text has than Pi's, measured against Pi 0.87.1. TestPromptPathLengthsBalance
-// checks the arithmetic; the rpc get_session_stats scenario checks the
+// text has than Pi's: pig's examples location is a 54-character URL where
+// Pi's README, docs and examples paths each end in a suffix that pig's docs
+// directory and URL do not repeat (40 characters net), and "pig" replaces
+// "pi" in the preamble, the docs heading and the path-resolution sentence
+// (3 characters). Three package directories must equal two pig directories
+// plus that gap, so pigHomeIDDigits is the one free length that makes the
+// equation solvable in whole characters. TestPromptPathLengthsBalance checks
+// the arithmetic, TestPromptPathLengthsMatchRealPrompts measures it against
+// the real prompts, and the rpc get_session_stats scenario checks the
 // estimate itself.
 //
 // promptPathRoot is /tmp on Unix. Pi prints PI_PACKAGE_DIR resolved to an
@@ -140,19 +161,24 @@ func checkPromptPathRoot() error {
 }
 
 const (
-	pigHomePrefix   = "parity-snap-PIG_HOME-"
+	pigHomePrefix = "parity-snap-PIG_HOME-"
+	// pigHomeIDDigits is the random suffix width of pig's PIG_HOME snapshot, which no comparison masks, so it is free to differ from snapshotIDDigits.
+	pigHomeIDDigits = snapshotIDDigits + 2
 	piPackagePrefix = "parity-pi-pkg-"
-	piPackageLink   = "pi-coding-pkg"
-	d22ConstantGap  = 47
+	// piPackageLink is padded so that Pi's three package paths are as long as pig's two docs paths, which name the docs bundle directory.
+	piPackageLink  = "pi-coding-pkg-with-bundle-pad"
+	d22ConstantGap = 43
+	// pigBundleDirLen is len("/bundle-") plus the 16 hex digits of the content hash that names pig's docs bundle directory (internal/pigdocs).
+	pigBundleDirLen = len("/bundle-") + 16
 )
 
 // defaultCWDFixture returns test/parity/testdata/default-cwd.
 func defaultCWDFixture() string {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
+	dir, err := testenv.PackageDirPath()
+	if err != nil {
 		return filepath.Join("test/parity", "testdata", "default-cwd")
 	}
-	return filepath.Join(filepath.Dir(filepath.Dir(thisFile)), "testdata", "default-cwd")
+	return filepath.Join(filepath.Dir(dir), "testdata", "default-cwd")
 }
 
 // defaultCWD returns a fresh per-binary snapshot of the default cwd fixture.
@@ -172,6 +198,7 @@ func initSnapshotGitBranch(ctx context.Context, dir, branch string) error {
 		{"init", "--quiet", dir},
 		{"-C", dir, "symbolic-ref", "HEAD", "refs/heads/" + branch},
 	} {
+		//nolint:gosec // G204 (class a): program is literal git; args are fixed "init --quiet <tmp>" and "-C <tmp> symbolic-ref HEAD refs/heads/<branch>", where the branch is prefixed by "refs/heads/".
 		if out, err := exec.CommandContext(ctx, "git", args...).CombinedOutput(); err != nil {
 			return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 		}
@@ -179,30 +206,29 @@ func initSnapshotGitBranch(ctx context.Context, dir, branch string) error {
 	return nil
 }
 
-// cwdSnapshotID matches the random suffix of a cwd snapshot directory, also
-// when a renderer truncated the path inside it.
-var cwdSnapshotID = regexp.MustCompile(`(parity-snap-cwd-)([0-9]{1,` + fmt.Sprint(snapshotIDDigits) + `})`)
+// snapshotID matches the random suffix of a cwd or extension snapshot
+// directory, also when a renderer truncated the path inside it.
+var snapshotID = regexp.MustCompile(`(parity-snap-(?:cwd|extension)-)([0-9]{1,` + fmt.Sprint(snapshotIDDigits) + `})`)
 
-// maskCWDSnapshotIDs replaces the random digits of every cwd snapshot
-// directory name with zeros of the same count. The digits are the only part
-// of the path that differs between pig and pi, and the equal count keeps
-// padding and truncation byte-identical.
-func maskCWDSnapshotIDs(s string) string {
-	if !strings.Contains(s, "parity-snap-cwd-") {
+// maskSnapshotIDs replaces the random digits of every cwd and extension
+// snapshot directory name with zeros of the same count. The digits are the
+// only part of the path that differs between pig and pi, and the equal count
+// keeps padding and truncation byte-identical.
+func maskSnapshotIDs(s string) string {
+	if !strings.Contains(s, "parity-snap-") {
 		return s
 	}
-	return cwdSnapshotID.ReplaceAllStringFunc(s, func(m string) string {
-		digits := len(m) - len("parity-snap-cwd-")
-		return "parity-snap-cwd-" + strings.Repeat("0", digits)
+	return snapshotID.ReplaceAllStringFunc(s, func(m string) string {
+		prefix := m[:strings.LastIndexByte(m, '-')+1]
+		return prefix + strings.Repeat("0", len(m)-len(prefix))
 	})
 }
 
-// maskResultCWDSnapshotIDs applies maskCWDSnapshotIDs to every compared
-// field of r.
-func maskResultCWDSnapshotIDs(r Result) Result {
-	r.Output = maskCWDSnapshotIDs(r.Output)
-	r.Escaped = maskCWDSnapshotIDs(r.Escaped)
-	r.Artifact = maskCWDSnapshotIDs(r.Artifact)
+// maskResultSnapshotIDs applies maskSnapshotIDs to every compared field of r.
+func maskResultSnapshotIDs(r Result) Result {
+	r.Output = maskSnapshotIDs(r.Output)
+	r.Escaped = maskSnapshotIDs(r.Escaped)
+	r.Artifact = maskSnapshotIDs(r.Artifact)
 	return r
 }
 

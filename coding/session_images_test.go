@@ -1,5 +1,7 @@
 package coding
 
+// pi: packages/coding-agent/src/utils/tool-result-images.ts
+
 import (
 	"bytes"
 	"context"
@@ -25,6 +27,7 @@ func sessionImageFixture(t *testing.T) ai.ImageContent {
 	return ai.ImageContent{Data: base64.StdEncoding.EncodeToString(encoded.Bytes()), MimeType: "image/png"}
 }
 
+// Pi: packages/coding-agent/src/core/extensions/types.ts:917 (BeforeAgentStartEvent.images).
 func TestSessionPromptImagesUseModelSelectedByBeforeHook(t *testing.T) {
 	svcs := newTestServices(t)
 	sess, err := NewSession(svcs, SessionOptions{Model: fakeModel()})

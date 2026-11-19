@@ -17,13 +17,13 @@ import (
 func TestInteractiveModeBindsEveryHostCallback(t *testing.T) {
 	cwd := t.TempDir()
 	model := &ai.Model{ID: "m", DisplayName: "m", Capabilities: ai.ModelCapabilities{ContextWindow: 8000}}
-	m := NewInteractiveMode(InteractiveOptions{CWD: cwd, Model: model})
+	m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: cwd, Model: model})
 	m.chatContainer = tui.NewContainer()
 	m.statusContainer = tui.NewContainer()
 	m.pendingMessagesContainer = tui.NewContainer()
 	m.tuiInst = tui.NewWithOutput(io.Discard, 100, 30)
-	m.statusLine = NewStatusLine(model, "", nil)
-	m.agent = agent.NewAgent(agent.AgentOptions{Model: model})
+	m.statusLine = NewFooterComponent(model, "", nil)
+	m.agent = mustNewAgent(agent.AgentOptions{Model: model})
 	m.newRunner = inproc.NewRunner(nil, cwd)
 	// Production interactive mode always has a Session that owns its replacement actions.
 	m.opts.SessionHandle = &replacementRecordingHandle{recordingCompactHandle: &recordingCompactHandle{agent: m.agent}}
@@ -37,6 +37,8 @@ func TestInteractiveModeBindsEveryHostCallback(t *testing.T) {
 		// Deprecated v0.2.0 fields that no extension call reads.
 		"GetBranch":  "deprecated: extensions read the branch through sessionRead or the session mirror",
 		"GetEntries": "deprecated: extensions read the entries through sessionRead or the session mirror",
+		// The factory builds a session over the AgentSessionServices, which only the coding/cli build holds (cli.BindChildSessions, called from cli_runtime_build.go for every mode that has a bridge).
+		"CreateChildSession": "bound by cli.BindChildSessions over the services the mode was built with; internal/codingagent cannot import it",
 	}
 	field := reflect.ValueOf(bridge).Elem().FieldByName("actions")
 	if !field.IsValid() || field.Kind() != reflect.Pointer || field.IsNil() {

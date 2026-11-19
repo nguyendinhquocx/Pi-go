@@ -22,10 +22,10 @@ func TestSkillFileMetadataRetainsCollisionDiagnostics(t *testing.T) {
 		other:  {Path: other, ResourceType: "skills", Enabled: true, Scope: "user", Origin: "package", Source: "npm:pkg-c"},
 	}
 	m.opts.Skills, m.opts.SkillDiagnostics = DeduplicateSkillsWithDiagnostics([]*SkillDef{
-		{Name: "demo", Path: winner}, {Name: "demo", Path: loser}, {Name: "other", Path: other},
+		{Name: "demo", FilePath: winner}, {Name: "demo", FilePath: loser}, {Name: "other", FilePath: other},
 	})
 	m.showLoadedResources(false, true)
-	want := "[Skill conflicts]\n  \"demo\" collision:\n    ✓ npm:pkg-a (user) skills/demo/SKILL.md\n    ✗ " + filepath.ToSlash(loser) + " (skipped)"
+	want := "[Skill warnings]\n  \"demo\" collision:\n    ✓ npm:pkg-a (user) skills/demo/SKILL.md\n    ✗ " + filepath.ToSlash(loser) + " (skipped)"
 	if got := strings.ReplaceAll(renderListing(m), `\`, "/"); got != want {
 		t.Fatalf("diagnostics =\n%s\nwant\n%s", got, want)
 	}

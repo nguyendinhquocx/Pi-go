@@ -3,17 +3,18 @@ import { Agent, setDefaultStreamFn } from "../../pi-agent-core/index.js";
 import { clampThinkingLevel, streamSimple } from "../../pi-ai/sdk-bundle/compat.js";
 import { getAgentDir } from "../config.js";
 import { resolvePath } from "../utils/paths.js";
-import { AgentSession } from "./agent-session.js";
+import { AgentSession, markRuntimeStreamFunction } from "./agent-session.js";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
 import { CacheWarmer } from "./cache-warmer.js";
+import { getClientIdentity } from "./client-identity.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
+import { createToolNameMatcher } from "./mcp-servers.js";
 import { convertToLlm } from "./messages.js";
 import { findInitialModel } from "./model-resolver.js";
 import { ModelRuntime } from "./model-runtime.js";
-import { mergeProviderAttributionHeaders } from "./provider-attribution.js";
 import { DefaultResourceLoader } from "./resource-loader.js";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.js";
-import { DEFAULT_TOOL_NAMES, SettingsManager } from "./settings-manager.js";
+import { applyToolModifiers, DEFAULT_TOOL_NAMES, getToolListError, isToolModifier, SettingsManager, } from "./settings-manager.js";
 import { time } from "./timings.js";
 import { createBashTool, createCodingTools, createEditTool, createFindTool, createGrepTool, createLsTool, createPowerShellTool, createReadOnlyTools, createReadTool, createWriteTool, withFileMutationQueue, } from "./tools/index.js";
 import { getBranchSelection } from "./virtual-models.js";
@@ -141,11 +142,22 @@ export async function createAgentSession(options = {}) {
     else {
         thinkingLevel = clampThinkingLevel(model, thinkingLevel);
     }
-    const configuredDefaultToolNames = settingsManager.getDefaultTools();
-    const allowedToolNames = options.tools ?? (options.noTools === "all" ? [] : undefined);
+    const toolListError = options.tools ? getToolListError(options.tools) : undefined;
+    if (toolListError)
+        throw new Error(`Invalid tools option: ${toolListError}`);
+    const defaultToolNames = options.noTools ? [] : (settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES);
+    // A `tools` list of only `+name`/`-name` entries changes the default selection instead of
+    // replacing it, like the `defaultTools` setting.
+    const toolModifiers = options.tools?.some(isToolModifier) ? options.tools : undefined;
+    const selectedToolNames = toolModifiers ? applyToolModifiers(defaultToolNames, toolModifiers) : options.tools;
+    const allowedToolNames = toolModifiers
+        ? options.noTools === "all"
+            ? selectedToolNames
+            : undefined
+        : (options.tools ?? (options.noTools === "all" ? [] : undefined));
     const excludedToolNames = options.excludeTools;
-    const excludedToolNameSet = excludedToolNames ? new Set(excludedToolNames) : undefined;
-    const initialActiveToolNames = (options.tools ?? (options.noTools ? [] : (configuredDefaultToolNames ?? DEFAULT_TOOL_NAMES))).filter((name) => !excludedToolNameSet?.has(name));
+    const isExcludedTool = excludedToolNames ? createToolNameMatcher(excludedToolNames) : undefined;
+    const initialActiveToolNames = (selectedToolNames ?? defaultToolNames).filter((name) => !isExcludedTool?.(name));
     // Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
     const convertToLlmWithBlockImages = (messages) => {
         const converted = convertToLlm(messages);
@@ -178,7 +190,7 @@ export async function createAgentSession(options = {}) {
     };
     const extensionRunnerRef = {};
     const cacheWarmer = new CacheWarmer(modelRuntime, sessionManager, () => settingsManager.getCacheWarmingMode(), async (event) => extensionRunnerRef.current?.emitCacheWarmingDecision(event) ?? event.action);
-    const buildRequestOptions = (requestModel, options = {}) => {
+    const buildRequestOptions = (options = {}) => {
         const providerRetrySettings = settingsManager.getProviderRetrySettings();
         const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
         const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
@@ -189,12 +201,11 @@ export async function createAgentSession(options = {}) {
             websocketConnectTimeoutMs: options.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs(),
             maxRetries: options.maxRetries ?? providerRetrySettings.maxRetries,
             maxRetryDelayMs: options.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-            transformHeaders: async (requestHeaders) => {
-                const headers = mergeProviderAttributionHeaders(requestModel, settingsManager, options.sessionId, requestHeaders);
-                return headerRunner?.hasHandlers("before_provider_headers")
-                    ? headerRunner.emitBeforeProviderHeaders(headers ?? {})
-                    : (headers ?? {});
-            },
+            // Replaces the agent loop's default identity; read per request so telemetry changes apply at once.
+            identity: getClientIdentity(settingsManager),
+            transformHeaders: async (headers) => headerRunner?.hasHandlers("before_provider_headers")
+                ? headerRunner.emitBeforeProviderHeaders(headers)
+                : headers,
         };
     };
     // Warm only requests for the selected model. Requests a virtual selection routed, or that an
@@ -248,7 +259,7 @@ export async function createAgentSession(options = {}) {
         },
         convertToLlm: convertToLlmWithBlockImages,
         streamFn: async (model, context, options) => {
-            const requestOptions = buildRequestOptions(model, options);
+            const requestOptions = buildRequestOptions(options);
             // Compaction and summaries use their own routing ids; only session requests
             // replace the cache entry, so warming restarts from them. Keep warming while
             // the current transcript still extends the request's prefix. Agent state may
@@ -275,6 +286,8 @@ export async function createAgentSession(options = {}) {
         thinkingBudgets: settingsManager.getThinkingBudgets(),
         maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
     });
+    // This stream resolves auth through modelRuntime, so summaries must not pre-resolve it (#11520).
+    markRuntimeStreamFunction(agent.streamFunction, modelRuntime);
     // Restore missing settings metadata for older sessions.
     if (hasExistingSession) {
         if (!hasThinkingEntry) {
@@ -299,7 +312,8 @@ export async function createAgentSession(options = {}) {
         modelRuntime,
         cacheWarmer,
         initialActiveToolNames,
-        usesDefaultTools: options.tools === undefined && !options.noTools,
+        usesDefaultTools: (options.tools === undefined || toolModifiers !== undefined) && !options.noTools,
+        defaultToolModifiers: toolModifiers,
         allowedToolNames,
         excludedToolNames,
         extensionRunnerRef,

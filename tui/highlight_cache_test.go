@@ -1,6 +1,9 @@
 package tui
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 // TestHighlightCode_CacheMatchesUncached is the oracle for the highlight
 // memo: the cached HighlightCode must return byte-identical output to the
@@ -15,7 +18,7 @@ func TestHighlightCode_CacheMatchesUncached(t *testing.T) {
 
 	check := func(when string) {
 		for _, s := range samples {
-			want := highlightCodeUncached(highlightRegistry(), s.code, s.lang, false, ActiveTheme())
+			want := highlightCodeUncached(highlightRegistry(), s.code, s.lang, ActiveTheme())
 			// two cached calls to exercise store-then-hit
 			for range 2 {
 				got := HighlightCode(s.code, s.lang)
@@ -42,6 +45,39 @@ func TestHighlightCode_CacheMatchesUncached(t *testing.T) {
 	check("dark-again")
 }
 
+// TestHighlightCodeLinesBelongToTheCaller: theme.ts highlightCode returns a new array on every call, and write.ts
+// updateWriteHighlightCacheIncremental writes into the array it got. The memo and the resume state (D112) keep the lines
+// they computed, so a caller that writes into its lines must not change what a later call returns: neither the same code
+// again (a memo hit) nor a longer prefix of it (a resumed run). The empty block is the one a write card highlights before
+// its content streams in.
+func TestHighlightCodeLinesBelongToTheCaller(t *testing.T) {
+	orig := ActiveTheme().Name
+	defer SetTheme(orig)
+	SetTheme("dark")
+	block := "package main\n\nfunc f(x int) int {\n\treturn x*2 + 1 // doubled\n}\n\nfunc g() string {\n\treturn \"g\"\n}\n\nvar h = f(2)\n"
+	for _, c := range []struct {
+		name      string
+		highlight func(code, lang string) []string
+	}{{"HighlightCode", HighlightCode}} {
+		hlMu.Lock()
+		resetHighlightCacheLocked()
+		hlMu.Unlock()
+		for end := 0; end <= len(block); end += 7 {
+			code := block[:end]
+			want := highlightCodeUncached(highlightRegistry(), code, "go", ActiveTheme())
+			for call := range 2 {
+				got := c.highlight(code, "go")
+				if !slices.Equal(got, want) {
+					t.Fatalf("%s at %d bytes, call %d after the caller wrote into earlier lines:\n got %q\nwant %q", c.name, end, call, got, want)
+				}
+				for i := range got {
+					got[i] = "written by the caller"
+				}
+			}
+		}
+	}
+}
+
 // BenchmarkMarkdownStreamingCached re-runs the streaming benchmark with the
 // highlight memo active. Closed code blocks re-highlight once, not every frame.
 func BenchmarkMarkdownStreamingCached(b *testing.B) {
@@ -52,7 +88,7 @@ func BenchmarkMarkdownStreamingCached(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		hlMu.Lock()
-		clear(hlCache) // cold per iteration, fair vs the uncached bench
+		resetHighlightCacheLocked() // cold per iteration, fair vs the uncached bench
 		hlMu.Unlock()
 		for f := 1; f <= frames; f++ {
 			end := finalLen * f / frames

@@ -1,3 +1,5 @@
+//go:build !pig_strip_node_extensions
+
 package subprocess
 
 import (
@@ -34,6 +36,7 @@ func TestRequiredSDKToolsFailWhenMissing(t *testing.T) {
 		{"TestNodeExtensionModulesLoadLikePinnedPi", "node"},
 		{"TestNodeExtensionSeesPiProcessIdentity", "node"},
 		{"TestNodeRuntimeLoaderServesPiAiCompatAndOAuth", "node"},
+		{"TestNodeExtensionImportsPiAiModelsSubpath", "node"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.test, func(t *testing.T) {

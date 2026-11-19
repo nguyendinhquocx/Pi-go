@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
 // SPDX-FileCopyrightText: Copyright Joyent, Inc. and other Node contributors
 // SPDX-FileCopyrightText: Copyright Node.js contributors
 // SPDX-License-Identifier: MIT
@@ -15,8 +14,7 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
-	"golang.org/x/text/cases"
-	"golang.org/x/text/language"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
 // caseInsensitiveEnv reports that environment names ignore case, as on
@@ -113,10 +111,9 @@ func SetEnvProperties(cmd *exec.Cmd, env []EnvProperty) {
 		slices.SortStableFunc(properties, func(a, b EnvProperty) int {
 			return compareUTF16(a.Name, b.Name)
 		})
-		upperCase := cases.Upper(language.Und)
 		seen := make(map[string]bool, len(properties))
 		properties = slices.DeleteFunc(properties, func(property EnvProperty) bool {
-			upper := upperCase.String(property.Name)
+			upper := jsstring.ToUpper(property.Name)
 			if seen[upper] {
 				return true
 			}

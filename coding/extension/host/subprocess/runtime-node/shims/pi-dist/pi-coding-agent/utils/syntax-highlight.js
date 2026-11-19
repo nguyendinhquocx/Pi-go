@@ -126,7 +126,12 @@ export function renderHighlightedHtml(html, theme = {}) {
             return;
         }
         const formatter = getActiveFormatter(scopes, theme);
-        output += formatter ? formatter(textBuffer) : textBuffer;
+        output += formatter
+            ? textBuffer
+                .split("\n")
+                .map((line) => (line ? formatter(line) : line))
+                .join("\n")
+            : textBuffer;
         textBuffer = "";
     };
     let index = 0;
@@ -175,5 +180,12 @@ export function highlight(code, options = {}) {
 }
 export function supportsLanguage(name) {
     return hljs.getLanguage(name) !== undefined;
+}
+/**
+ * Number of registered grammars. It grows when the deferred grammars load, which can change the highlighting of
+ * code that embeds another language, such as HTML in a JavaScript template literal.
+ */
+export function getHighlightLanguageCount() {
+    return hljs.listLanguages().length;
 }
 //# sourceMappingURL=syntax-highlight.js.map

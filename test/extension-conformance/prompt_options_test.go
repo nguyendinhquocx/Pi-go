@@ -55,7 +55,7 @@ func TestPromptOptionEditsAcrossSDKs(t *testing.T) {
 		}
 		assertPromptOptionEdits(t, *loaded)
 	})
-	for _, language := range []string{"go", "python", "rust", "node"} {
+	for _, language := range []string{"go", "python", "rust", "node", "lisp"} {
 		t.Run(language, func(t *testing.T) {
 			for _, placement := range []string{"isolated", "packed"} {
 				t.Run(placement, func(t *testing.T) {
@@ -104,7 +104,7 @@ func assertPromptOptionEdits(t *testing.T, ext extension.Extension) {
 			ToolGuidelines:     map[string][]string{"read": {"base guideline"}},
 			AppendSystemPrompt: "base append",
 		}
-		result, err := runner.EmitBeforeAgentStart(t.Context(), prompt, nil, "base", base)
+		result, err := runner.EmitBeforeAgentStart(t.Context(), extension.UserPromptTrigger(prompt, nil), base)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -168,17 +168,35 @@ def new_extension():
  e.on_event("before_agent_start",handler)
  return e
 `, name)
+	case "lisp":
+		path = filepath.Join(cfg.Source, name+".lisp")
+		source = fmt.Sprintf(`(defpackage %q (:use "COMMON-LISP"))
+(in-package %q)
+(defun new-extension ()
+  (let ((e (pig:make-extension %q)))
+    (pig:on e "before_agent_start"
+      (lambda (ctx data) (declare (ignore ctx))
+        (let ((o (pig:jget data "systemPromptOptions")))
+          (setf (gethash "read" (pig:jget o "toolSnippets")) "edited read snippet")
+          (setf (gethash "read" (pig:jget o "toolGuidelines")) (vector "edited guideline"))
+          (setf (gethash "appendSystemPrompt" o) (concatenate 'string (pig:jget o "appendSystemPrompt") " + edited append"))
+          (when (equal (pig:jget data "prompt") "error") (error "options failure"))
+          nil)))
+    e))
+`, name, name, name)
 	case "rust":
 		path = filepath.Join(cfg.Source, "src", "lib.rs")
 		source = fmt.Sprintf(`use pig_sdk::{Extension,Schema};
 pub fn new_extension()->Extension {
  let mut e=Extension::new(%q);
- e.on_event_result("before_agent_start",false,|_,data| {
-  let appended=format!("{} + edited append",data["systemPromptOptions"]["appendSystemPrompt"].as_str().unwrap_or(""));
-  data["systemPromptOptions"]["toolSnippets"]["read"]=Schema::String("edited read snippet".into());
-  data["systemPromptOptions"]["toolGuidelines"]["read"]=Schema::Array(vec![Schema::String("edited guideline".into())]);
-  data["systemPromptOptions"]["appendSystemPrompt"]=Schema::String(appended);
-  if data["prompt"]=="error" {return Err("options failure".into())}
+ e.on_before_agent_start(|_,event| {
+  event.edit_system_prompt_options(|options| {
+   let appended=format!("{} + edited append",options["appendSystemPrompt"].as_str().unwrap_or(""));
+   options["toolSnippets"]["read"]=Schema::String("edited read snippet".into());
+   options["toolGuidelines"]["read"]=Schema::Array(vec![Schema::String("edited guideline".into())]);
+   options["appendSystemPrompt"]=Schema::String(appended);
+  });
+  if event.payload()["prompt"]=="error" {return Err("options failure".into())}
   Ok(None)
  });
  e

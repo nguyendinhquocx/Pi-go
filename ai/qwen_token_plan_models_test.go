@@ -1,5 +1,7 @@
 package ai
 
+// pi: packages/ai/src/providers/qwen-token-plan-individual.ts
+
 // Ports packages/ai/test/qwen-token-plan-models.test.ts.
 // The environment-variable case (:130) is TestEnvAPIKeysQwenIndividualReusesInternationalTokenPlanVariable in auth_env_keys_test.go.
 
@@ -83,7 +85,7 @@ func mustGeneratedModel(t *testing.T, provider, modelID string) *GeneratedModel 
 // captureCatalogCompletionsPayload streams one request for a catalog model
 // through the OpenAI Completions provider, configured from the catalog entry
 // as the model runtime does, and returns the serialized request body.
-func captureCatalogCompletionsPayload(t *testing.T, provider, modelID string, level ThinkingLevel) map[string]any {
+func captureCatalogCompletionsPayload(t *testing.T, provider, modelID string, level ModelThinkingLevel) map[string]any {
 	t.Helper()
 	model := mustGeneratedModel(t, provider, modelID)
 	var payload map[string]any
@@ -98,7 +100,7 @@ func captureCatalogCompletionsPayload(t *testing.T, provider, modelID string, le
 			Body:       io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n")),
 		}, nil
 	})}
-	stream, err := p.Stream(context.Background(), NormalizeContext(Context{Messages: []Message{UserMessage{Content: UserText("Hi")}}}), StreamOptions{IsReasoning: true, Thinking: level})
+	stream, err := p.Stream(context.Background(), NormalizeContext(Context{Messages: []Message{UserMessage{Content: UserText("Hi")}}}), StreamOptions{IsReasoning: true, Thinking: level.ReasoningOption()})
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
@@ -155,7 +157,7 @@ func TestQwenTokenPlanOmitsRetiredQwen38MaxPreview(t *testing.T) {
 	}
 }
 
-func assertThinkingLevelMap(t *testing.T, model *GeneratedModel, want map[ThinkingLevel]string) {
+func assertThinkingLevelMap(t *testing.T, model *GeneratedModel, want map[ModelThinkingLevel]string) {
 	t.Helper()
 	for level, value := range want {
 		mapped, ok := model.ThinkingLevelMap[level]
@@ -177,7 +179,7 @@ func TestQwenTokenPlanExposesReasoningEffortLevels(t *testing.T) {
 	// upstream: packages/ai/test/qwen-token-plan-models.test.ts:184
 	for _, test := range qwenReasoningEffortCases() {
 		t.Run("exposes Qwen reasoning_effort levels for "+test.provider+"/"+test.modelID, func(t *testing.T) {
-			assertThinkingLevelPresence(t, mustGeneratedModel(t, test.provider, test.modelID), map[ThinkingLevel]*string{
+			assertThinkingLevelPresence(t, mustGeneratedModel(t, test.provider, test.modelID), map[ModelThinkingLevel]*string{
 				ThinkingMinimal: nil, ThinkingLow: nil, ThinkingMedium: nil, ThinkingHigh: ptrString("high"), ThinkingXHigh: nil, ThinkingMax: ptrString("max"),
 			})
 		})
@@ -185,7 +187,7 @@ func TestQwenTokenPlanExposesReasoningEffortLevels(t *testing.T) {
 	// upstream: packages/ai/test/qwen-token-plan-models.test.ts:202
 	for _, test := range qwen38Cases() {
 		t.Run("exposes qwen3.8 reasoning_effort levels for "+test.provider+"/"+test.modelID, func(t *testing.T) {
-			assertThinkingLevelPresence(t, mustGeneratedModel(t, test.provider, test.modelID), map[ThinkingLevel]*string{
+			assertThinkingLevelPresence(t, mustGeneratedModel(t, test.provider, test.modelID), map[ModelThinkingLevel]*string{
 				ThinkingMinimal: nil, ThinkingLow: ptrString("low"), ThinkingMedium: ptrString("medium"), ThinkingHigh: nil, ThinkingXHigh: ptrString("xhigh"), ThinkingMax: nil,
 			})
 		})

@@ -4,6 +4,36 @@
  * The core only validates and stores registrations. The MCP extension (built in, or another
  * extension that handles `mcp_servers_change`) connects them next to the servers from `mcp.json`.
  */
+/**
+ * Regular expression for a tool name pattern where `*` matches any characters, as `toolExposure`,
+ * `--tools`, and `--exclude-tools` accept them.
+ */
+function toolPatternRegExp(pattern) {
+    const source = pattern
+        .split("*")
+        .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+        .join(".*");
+    return new RegExp(`^${source}$`);
+}
+/** Whether a tool name matches any of the entries, each an exact name or a pattern. */
+export function createToolNameMatcher(entries) {
+    const names = new Set(entries.filter((entry) => !entry.includes("*")));
+    const patterns = entries.filter((entry) => entry.includes("*")).map(toolPatternRegExp);
+    return (name) => names.has(name) || patterns.some((pattern) => pattern.test(name));
+}
+/** MCP resource tools, which reach every server with resources. */
+export const LIST_MCP_RESOURCES_TOOL = "list_mcp_resources";
+export const LIST_MCP_RESOURCE_TEMPLATES_TOOL = "list_mcp_resource_templates";
+export const READ_MCP_RESOURCE_TOOL = "read_mcp_resource";
+const MCP_RESOURCE_TOOLS = new Set([
+    LIST_MCP_RESOURCES_TOOL,
+    LIST_MCP_RESOURCE_TEMPLATES_TOOL,
+    READ_MCP_RESOURCE_TOOL,
+]);
+/** Whether a tool comes from MCP: a server tool (`mcp__<server>__<tool>`) or a resource tool. */
+export function isMcpToolName(name) {
+    return name.startsWith("mcp__") || MCP_RESOURCE_TOOLS.has(name);
+}
 const MCP_EXPOSURES = ["codemode", "deferred", "direct", "hidden"];
 /** Older exposure names, accepted in configs and replaced by their current name when validated. */
 const MCP_EXPOSURE_ALIASES = { "codemode-deferred": "codemode" };
@@ -14,6 +44,16 @@ export function isLoopbackRedirectUri(value) {
         return false;
     const url = new URL(value);
     return url.protocol === "http:" && LOOPBACK_HOSTS.includes(url.hostname) && url.search === "" && url.hash === "";
+}
+/**
+ * Whether pi's Client ID Metadata Documents list a redirect URI for the loopback `callbackUrl`: they list
+ * `/callback` on localhost and 127.0.0.1, on any port. Without `callbackUrl`, pi uses such a URI.
+ */
+export function isClientMetadataDocumentCallback(callbackUrl) {
+    if (callbackUrl === undefined)
+        return true;
+    const url = new URL(callbackUrl);
+    return url.hostname !== "[::1]" && url.pathname === "/callback";
 }
 const SERVER_NAME = /^[A-Za-z0-9_-]+$/;
 /** Namespace of a server's tools: `mcp__<server>` with `-` replaced by `_`, like the tool names. */
@@ -54,14 +94,14 @@ function validateOAuth(value) {
     if (value.clientName !== undefined && (typeof value.clientName !== "string" || !value.clientName.trim())) {
         return "oauth.clientName must be a non-empty string";
     }
-    if (value.clientRegistration !== undefined && value.clientRegistration !== "dcr") {
-        if (value.clientRegistration !== "cimd")
-            return 'oauth.clientRegistration must be "dcr" or "cimd"';
+    const registration = value.clientRegistration;
+    if (registration !== undefined && registration !== "auto" && registration !== "dcr") {
+        if (registration !== "cimd")
+            return 'oauth.clientRegistration must be "auto", "dcr", or "cimd"';
         if (value.clientId !== undefined || value.clientName !== undefined) {
             return 'oauth.clientRegistration "cimd" cannot be combined with oauth.clientId or oauth.clientName';
         }
-        const callback = typeof value.callbackUrl === "string" ? new URL(value.callbackUrl) : undefined;
-        if (callback && (callback.hostname === "[::1]" || callback.pathname !== "/callback")) {
+        if (!isClientMetadataDocumentCallback(typeof value.callbackUrl === "string" ? value.callbackUrl : undefined)) {
             return 'oauth.clientRegistration "cimd" requires oauth.callbackUrl on localhost or 127.0.0.1 with path /callback';
         }
     }
@@ -91,13 +131,6 @@ function resolveExposureAliases(value) {
         resolved.toolExposure = Object.fromEntries(Object.entries(toolExposure).map(([tool, entry]) => [tool, resolveExposureAlias(entry)]));
     }
     return resolved;
-}
-function toolPatternRegExp(pattern) {
-    const source = pattern
-        .split("*")
-        .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
-        .join(".*");
-    return new RegExp(`^${source}$`);
 }
 /** Exposure of one tool of a server: its `toolExposure` entry, else the server's `exposure`. */
 export function getMcpToolExposure(config, toolName) {

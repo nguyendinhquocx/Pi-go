@@ -27,8 +27,9 @@ var piIdentity = regexp.MustCompile(`(?i)(^pi$|^pi[ /(]|pi\.dev|^pi-coding-agent
 // The Go, Python and Rust SDKs make no model request of their own: ModelRegistry
 // Complete is one host call, and the host sends the request through the
 // Services-owned runtime. A model call from each SDK therefore reaches an
-// OpenRouter-, NVIDIA- or OpenCode-shaped endpoint carrying PiG's attribution
-// and never Pi's (D26). The Node SDK's own paths run in the real binary in
+// OpenRouter-, NVIDIA- or OpenCode-shaped endpoint carrying no attribution,
+// which only a Session's identity adds (as under Pi, where the extension runner's
+// model calls pass no identity), and never Pi's identity (D26). The Node SDK's own paths run in the real binary in
 // cmd/pig's TestNodeExtensionModelCallsCarryPiGIdentityNeverPis.
 func TestSDKModelCallsCarryPiGIdentityNeverPis(t *testing.T) {
 	type sdkCase struct {
@@ -39,14 +40,15 @@ func TestSDKModelCallsCarryPiGIdentityNeverPis(t *testing.T) {
 		{"go", "", true},
 		{"python", "testdata/model-call-python", false},
 		{"rust", "testdata/model-call-rust", false},
+		{"lisp", "testdata/model-call-lisp", false},
 	}
 	providers := []struct {
 		id   string
 		want map[string]string
 	}{
-		{"openrouter", map[string]string{"HTTP-Referer": pigidentity.OpenRouterReferer, "X-OpenRouter-Title": pigidentity.OpenRouterTitle, "X-OpenRouter-Categories": pigidentity.OpenRouterCategories}},
-		{"nvidia", map[string]string{"X-BILLING-INVOKE-ORIGIN": pigidentity.NvidiaBillingOrigin}},
-		{"opencode", map[string]string{"x-opencode-session": "sdk-session", "x-opencode-client": pigidentity.OpenCodeClient}},
+		{"openrouter", map[string]string{"HTTP-Referer": "", "X-OpenRouter-Title": "", "X-OpenRouter-Categories": ""}},
+		{"nvidia", map[string]string{"X-BILLING-INVOKE-ORIGIN": ""}},
+		{"opencode", map[string]string{"x-opencode-session": "sdk-session", "x-opencode-client": ""}},
 	}
 	for _, sdk := range sdks {
 		for _, provider := range providers {
@@ -68,7 +70,7 @@ func TestSDKModelCallsCarryPiGIdentityNeverPis(t *testing.T) {
 				if err := os.WriteFile(filepath.Join(agentDir, "models.json"), []byte(config), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				services, err := coding.NewServices(coding.ServicesOptions{CWD: t.TempDir(), AgentDir: agentDir})
+				services, err := coding.CreateAgentSessionServices(coding.CreateAgentSessionServicesOptions{CWD: t.TempDir(), AgentDir: agentDir})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -81,20 +83,27 @@ func TestSDKModelCallsCarryPiGIdentityNeverPis(t *testing.T) {
 				host := subprocess.NewHost(t.TempDir())
 				defer host.Shutdown("test done")
 				bridge := subprocess.NewUIBridge(func() {})
-				detach := icodingagent.WireModelOperations(bridge, icodingagent.ModelOperationBindings{CurrentModel: session.Model, ModelLookup: services.ModelRuntime().GetModel, ModelCatalog: services.ModelRuntime().GetModels, Registry: services.Registry().ModelRegistry, ModelBuilder: func(spec string) (*ai.Model, error) { return coding.BuildModel(spec, services) }, SessionHandle: session})
+				detach := icodingagent.WireModelOperations(bridge, icodingagent.ModelOperationBindings{CurrentModel: session.Model, ModelLookup: services.ModelRuntime().GetModel, ModelCatalog: func(...string) []*ai.Model { return services.ModelRuntime().GetModels() }, Registry: services.Registry().ModelRegistry, ModelBuilder: func(spec string) (*ai.Model, error) { return coding.BuildModel(spec, services) }, SessionHandle: session})
 				defer detach()
 				host.SetUIBridge(bridge)
 				var loaded *extension.Extension
 				if sdk.fused {
 					loaded, err = host.LoadInProcess(t.Context(), subprocess.ExtConfig{Name: "model-call", Enabled: true}, func(conn net.Conn) error { return testfixture.ModelCall().RunWithConn(conn) })
 				} else {
-					source, resolveErr := filepath.Abs(sdk.source)
-					if resolveErr != nil {
-						t.Fatal(resolveErr)
-					}
-					cfg, _, resolveErr := subprocess.ResolveExtConfigWithIdentity(source, "model-call")
-					if resolveErr != nil {
-						t.Fatal(resolveErr)
+					var cfg subprocess.ExtConfig
+					if sdk.name == "lisp" {
+						cfg = lispFixtureConfig(t, "model-call-lisp", "model-call")
+					} else {
+						source, resolveErr := filepath.Abs(sdk.source)
+						if resolveErr != nil {
+							t.Fatal(resolveErr)
+						}
+						var resolved subprocess.ExtConfig
+						resolved, _, resolveErr = subprocess.ResolveExtConfigWithIdentity(source, "model-call")
+						if resolveErr != nil {
+							t.Fatal(resolveErr)
+						}
+						cfg = resolved
 					}
 					cfg.Isolation = "isolated"
 					extensions, loadErrors := host.LoadAll(t.Context(), []subprocess.ExtConfig{cfg})

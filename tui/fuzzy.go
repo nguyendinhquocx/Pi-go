@@ -7,10 +7,6 @@ import (
 	"cmp"
 	"slices"
 	"strings"
-	"unicode"
-
-	"golang.org/x/text/cases"
-	"golang.org/x/text/language"
 
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
@@ -24,25 +20,75 @@ type FuzzyMatch struct {
 
 // FuzzyMatchScore matches an ordered, case-insensitive UTF-16 subsequence and returns Pi's lower-is-better score.
 func FuzzyMatchScore(query, text string) FuzzyMatch {
-	lower := cases.Lower(language.Und)
-	q := lower.String(query)
-	t := jsstring.ToUTF16(lower.String(text))
+	return NewFuzzyText(text).Match(NewFuzzyQuery(query))
+}
 
-	primary := matchQuery(jsstring.ToUTF16(q), t)
-	if primary.Matches {
-		return primary
-	}
+// FuzzyText is a text prepared for matching many queries: its lowercase UTF-16 units.
+type FuzzyText struct{ units []uint16 }
 
+// NewFuzzyText prepares text for Match.
+func NewFuzzyText(text string) FuzzyText {
+	return FuzzyText{units: jsstring.ToUTF16(jsstring.ToLower(text))}
+}
+
+// FuzzyQuery is a query prepared for matching many texts: its lowercase UTF-16 units and those of its letter/digit swap.
+type FuzzyQuery struct {
+	units, swapped []uint16
+	hasSwap        bool
+}
+
+// NewFuzzyQuery prepares query for Match.
+func NewFuzzyQuery(query string) FuzzyQuery {
+	q := jsstring.ToLower(query)
+	prepared := FuzzyQuery{units: jsstring.ToUTF16(q)}
 	// Letter/digit half swap (e.g. user types "5opus" wanting "opus5").
-	swapped := swapAlphaDigit(q)
-	if swapped == "" {
+	if swapped := swapAlphaDigit(q); swapped != "" {
+		prepared.swapped, prepared.hasSwap = jsstring.ToUTF16(swapped), true
+	}
+	return prepared
+}
+
+// Match is FuzzyMatchScore of the query and the text.
+func (t FuzzyText) Match(query FuzzyQuery) FuzzyMatch {
+	primary := matchQuery(query.units, t.units)
+	if primary.Matches || !query.hasSwap {
 		return primary
 	}
-	sw := matchQuery(jsstring.ToUTF16(swapped), t)
+	sw := matchQuery(query.swapped, t.units)
 	if !sw.Matches {
 		return primary
 	}
 	return FuzzyMatch{Matches: true, Score: sw.Score + 5}
+}
+
+// alignmentScore accumulates Pi's scorePositions one matched text index at a time, so the greedy alignment and each
+// contiguous run share the arithmetic.
+type alignmentScore struct {
+	score       float64
+	last        int
+	consecutive int
+}
+
+func newAlignmentScore() alignmentScore { return alignmentScore{last: -1} }
+
+func (a *alignmentScore) add(text []uint16, i int) {
+	// Reward consecutive matches; penalize gaps.
+	if a.last == i-1 {
+		a.consecutive++
+		a.score -= float64(float64(a.consecutive) * 5)
+	} else {
+		a.consecutive = 0
+		if a.last >= 0 {
+			a.score += float64(float64(i-a.last-1) * 2)
+		}
+	}
+	// Reward word boundary matches.
+	if i == 0 || isBoundaryChar(rune(text[i-1])) {
+		a.score -= 10
+	}
+	// float64() forces the product to round before the add: arm64 fuses x*y+z into one FMA rounding, which JS never does.
+	a.score += float64(float64(i) * 0.1)
+	a.last = i
 }
 
 func matchQuery(query, text []uint16) FuzzyMatch {
@@ -53,40 +99,54 @@ func matchQuery(query, text []uint16) FuzzyMatch {
 		return FuzzyMatch{Matches: false}
 	}
 
-	queryIdx := 0
-	score := 0.0
-	lastMatch := -1
-	consecutive := 0
+	// Greedy alignment: each query character at its first occurrence after the previous one.
+	greedy := newAlignmentScore()
+	from := 0
+	for _, q := range query {
+		i := indexUnit(text, q, from)
+		if i < 0 {
+			return FuzzyMatch{Matches: false}
+		}
+		greedy.add(text, i)
+		from = i + 1
+	}
+	score := greedy.score
 
-	for i := 0; i < len(text) && queryIdx < len(query); i++ {
-		if text[i] != query[queryIdx] {
-			continue
+	// The greedy alignment can scatter the query over an earlier, unrelated part of the text, e.g. "opus" in
+	// "openrouter openrouter/anthropic/claude-opus" takes o, p, u from "openrouter". Also score every contiguous
+	// occurrence and keep the best alignment.
+	for start := indexUnits(text, query, 0); start >= 0; start = indexUnits(text, query, start+1) {
+		run := newAlignmentScore()
+		for k := range query {
+			run.add(text, start+k)
 		}
-		isWordBoundary := i == 0 || isBoundaryChar(rune(text[i-1]))
-		if lastMatch == i-1 {
-			consecutive++
-			score -= float64(consecutive) * 5
-		} else {
-			consecutive = 0
-			if lastMatch >= 0 {
-				score += float64(i-lastMatch-1) * 2
-			}
-		}
-		if isWordBoundary {
-			score -= 10
-		}
-		score += float64(i) * 0.1
-		lastMatch = i
-		queryIdx++
+		score = min(score, run.score)
 	}
 
-	if queryIdx < len(query) {
-		return FuzzyMatch{Matches: false}
-	}
 	if slices.Equal(query, text) {
 		score -= 100
 	}
 	return FuzzyMatch{Matches: true, Score: score}
+}
+
+// indexUnit is String.prototype.indexOf for one UTF-16 unit from index from.
+func indexUnit(text []uint16, unit uint16, from int) int {
+	for i := from; i < len(text); i++ {
+		if text[i] == unit {
+			return i
+		}
+	}
+	return -1
+}
+
+// indexUnits is String.prototype.indexOf for a UTF-16 query from index from.
+func indexUnits(text, query []uint16, from int) int {
+	for i := from; i+len(query) <= len(text); i++ {
+		if slices.Equal(text[i:i+len(query)], query) {
+			return i
+		}
+	}
+	return -1
 }
 
 func isBoundaryChar(r rune) bool {
@@ -94,7 +154,7 @@ func isBoundaryChar(r rune) bool {
 	case '-', '_', '.', '/', ':':
 		return true
 	}
-	return isJSWhitespace(r)
+	return jsstring.IsSpace(r)
 }
 
 // swapAlphaDigit handles the upstream convenience case: a query
@@ -149,13 +209,6 @@ func swapAlphaDigit(q string) string {
 	return q[splitAt:] + q[:splitAt]
 }
 
-// isJSWhitespace reports the characters JavaScript's `\s` class and
-// String.prototype.trim treat as whitespace: Unicode White_Space without
-// U+0085 NEXT LINE, plus the U+FEFF byte-order mark.
-func isJSWhitespace(r rune) bool {
-	return r == '\uFEFF' || (r != '\u0085' && unicode.IsSpace(r))
-}
-
 func isASCIILetter(r rune) bool { return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') }
 func isASCIIDigit(r rune) bool  { return r >= '0' && r <= '9' }
 
@@ -165,13 +218,13 @@ func isASCIIDigit(r rune) bool  { return r >= '0' && r <= '9' }
 // reordered text "gpt-5.5 openai-codex". Empty/whitespace-only query returns
 // items unchanged.
 func FuzzyFilter[T any](items []T, query string, getText func(T) string) []T {
-	q := strings.TrimFunc(query, isJSWhitespace)
+	q := strings.TrimFunc(query, jsstring.IsSpace)
 	if q == "" {
 		out := make([]T, len(items))
 		copy(out, items)
 		return out
 	}
-	tokens := strings.FieldsFunc(q, func(r rune) bool { return r == '/' || isJSWhitespace(r) })
+	tokens := strings.FieldsFunc(q, func(r rune) bool { return r == '/' || jsstring.IsSpace(r) })
 	if len(tokens) == 0 {
 		out := make([]T, len(items))
 		copy(out, items)

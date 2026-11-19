@@ -18,9 +18,12 @@ type nodeProbeOutput struct {
 	Scenarios map[string][]string `json:"scenarios"`
 }
 
+// readPinnedNodeVersion is the Node release whose microtask order the goldens record and the Go models replay: testdata/node-microtasks/oracle-node-version.
+// It is not .node-version. CI runs Node 24.22.1, a security release whose Web Streams differ from 24.19.0 in values-buffered/bytes; the
+// models and goldens move to a later Node together, in a change that re-derives the Go replay, and a different live Node skips the live comparison below.
 func readPinnedNodeVersion(t *testing.T) string {
 	t.Helper()
-	content, err := os.ReadFile(filepath.Join("..", ".node-version"))
+	content, err := os.ReadFile(filepath.Join("testdata", "node-microtasks", "oracle-node-version"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,6 +120,14 @@ type microtaskScript struct {
 	executor *continuationExecutor
 	turn     *continuationTurn
 	log      []string
+	// disposers end the readable iterators a replay left suspended: Pi collects them, here each holds a coroutine until it is disposed.
+	disposers []func()
+}
+
+// keep registers an iterator the script created, so runMicrotaskScript disposes it when the script ends.
+func (script *microtaskScript) keep(iterator *jsAsyncGenerator[[]byte]) *jsAsyncGenerator[[]byte] {
+	script.disposers = append(script.disposers, iterator.dispose)
+	return iterator
 }
 
 func runMicrotaskScript(body func(*microtaskScript)) []string {
@@ -125,6 +136,9 @@ func runMicrotaskScript(body func(*microtaskScript)) []string {
 		script.turn = turn
 		body(script)
 	})
+	for _, dispose := range script.disposers {
+		dispose()
+	}
 	return script.log
 }
 

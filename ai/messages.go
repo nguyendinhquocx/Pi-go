@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
 // Message is the closed provider-facing transcript union.
 type Message interface {
 	messageRole() string
+	MessageRole() string
 	cloneMessage() Message
 }
 
@@ -94,6 +97,9 @@ type SystemMessage struct {
 }
 
 func (SystemMessage) messageRole() string { return "system" }
+
+// MessageRole is the role property of a message.
+func (SystemMessage) MessageRole() string { return "system" }
 func (message SystemMessage) cloneMessage() Message {
 	message.Content = cloneSystemContent(message.Content)
 	message.Sections = cloneSections(message.Sections)
@@ -109,6 +115,9 @@ type UserMessage struct {
 }
 
 func (UserMessage) messageRole() string { return "user" }
+
+// MessageRole is the role property of a message.
+func (UserMessage) MessageRole() string { return "user" }
 func (message UserMessage) cloneMessage() Message {
 	message.Content = cloneUserContent(message.Content)
 	return message
@@ -128,27 +137,52 @@ type AssistantMessage struct {
 	Usage                 Usage                        `json:"usage"`
 	StopReason            StopReason                   `json:"stopReason"`
 	Deferred              *DeferredHandle              `json:"deferred,omitempty"`
-	ErrorMessage          string                       `json:"errorMessage,omitempty"`
 	RawStopReason         string                       `json:"rawStopReason,omitempty"`
 	EndTurn               *bool                        `json:"endTurn,omitempty"`
 	Timestamp             int64                        `json:"timestamp"`
-	// ThinkingLevel is the thinking level the agent loop requested for this response. Absent outside the agent loop and for legacy responses. Mirrors upstream AssistantMessage.thinkingLevel (packages/ai/src/types.ts:557).
+	// ErrorMessage follows the timestamp: a provider's catch block sets it on the output it built with its timestamp. A message
+	// built with the error first (ErrorBeforeTimestamp) encodes it before the timestamp.
+	ErrorMessage string `json:"errorMessage,omitempty"`
+	// ErrorBeforeTimestamp records that the message was built with errorMessage before timestamp, as faux.ts builds its
+	// messages (fauxAssistantMessage and createErrorMessage spread errorMessage, then timestamp), and as a stored record
+	// that lists the keys in that order decodes. JavaScript keeps the order its source wrote, so the order is part of the
+	// message; both encoders write it.
+	ErrorBeforeTimestamp bool `json:"-"`
+	// DurationMs is the milliseconds from the start of the request to the final message, measured with a monotonic clock by the AssistantMessageEventStream. Nil for legacy messages and for deferred results fetched later.
+	// upstream: ai/src/types.ts:582 AssistantMessage.durationMs
+	DurationMs *int64 `json:"durationMs,omitempty"`
+	// ModelThinkingLevel is the thinking level the agent loop requested for this response. Absent outside the agent loop and for legacy responses. Mirrors upstream AssistantMessage.thinkingLevel (packages/ai/src/types.ts:557).
 	ThinkingLevel ModelThinkingLevel `json:"thinkingLevel,omitempty"`
 }
 
 func (AssistantMessage) messageRole() string { return "assistant" }
+
+// MessageRole is the role property of a message.
+func (AssistantMessage) MessageRole() string { return "assistant" }
 func (message AssistantMessage) cloneMessage() Message {
 	return *message.Observe()
 }
 
 func cloneAssistantMessage(message AssistantMessage) AssistantMessage {
+	return cloneAssistantMessageWith(message, cloneArgumentsValue)
+}
+
+// clonePublishedAssistantMessage is cloneAssistantMessage for a snapshot a message cell published. Publication already copied its tool arguments through cloneArgumentsValue, so their strings are valid and a copy need not read them again: without that, every observation of a streaming tool call would read all of its arguments so far.
+func clonePublishedAssistantMessage(message AssistantMessage) AssistantMessage {
+	return cloneAssistantMessageWith(message, clonePublishedJSONValue)
+}
+
+func cloneAssistantMessageWith(message AssistantMessage, cloneArguments func(any) any) AssistantMessage {
 	message.observation = nil
-	message.Content = cloneAssistantContent(message.Content)
+	message.Content = cloneAssistantContentWith(message.Content, cloneArguments)
 	message.Usage = cloneUsage(message.Usage)
 	message.Diagnostics = cloneDiagnostics(message.Diagnostics)
 	message.Deferred = cloneDeferredHandle(message.Deferred)
 	if message.EndTurn != nil {
 		message.EndTurn = new(*message.EndTurn)
+	}
+	if message.DurationMs != nil {
+		message.DurationMs = new(*message.DurationMs)
 	}
 	return message
 }
@@ -265,10 +299,16 @@ type ToolResultMessage struct {
 	// upstream: .upstream/v0.99.1/packages/ai/src/types.ts:604
 	NestedCalls *NestedToolCalls `json:"nestedCalls,omitempty"`
 	IsError     bool             `json:"isError"`
-	Timestamp   int64            `json:"timestamp"`
+	// DurationMs is the milliseconds execute() took, measured with a monotonic clock. Nil when the tool did not run, and for results stored before it was recorded.
+	// upstream: ai/src/types.ts ToolResultMessage.durationMs
+	DurationMs *int64 `json:"durationMs,omitempty"`
+	Timestamp  int64  `json:"timestamp"`
 }
 
 func (ToolResultMessage) messageRole() string { return "toolResult" }
+
+// MessageRole is the role property of a message.
+func (ToolResultMessage) MessageRole() string { return "toolResult" }
 func (message ToolResultMessage) cloneMessage() Message {
 	message.Content = cloneToolResultMessageContent(message.Content)
 	message.Details = cloneJSONValue(message.Details)
@@ -276,6 +316,9 @@ func (message ToolResultMessage) cloneMessage() Message {
 		message.Usage = new(cloneUsage(*message.Usage))
 	}
 	message.NestedCalls = cloneNestedToolCalls(message.NestedCalls)
+	if message.DurationMs != nil {
+		message.DurationMs = new(*message.DurationMs)
+	}
 	return message
 }
 
@@ -286,7 +329,7 @@ func cloneNestedToolCalls(calls *NestedToolCalls) *NestedToolCalls {
 	cloned := &NestedToolCalls{Calls: make([]NestedToolCallRecord, len(calls.Calls)), Complete: calls.Complete}
 	for i, call := range calls.Calls {
 		if call.Arguments != nil {
-			call.Arguments = cloneJSONValue(map[string]any(call.Arguments)).(map[string]any)
+			call.Arguments = cloneArgumentsValue(map[string]any(call.Arguments)).(map[string]any)
 		}
 		if call.ArgumentsBytes != nil {
 			call.ArgumentsBytes = new(*call.ArgumentsBytes)
@@ -300,7 +343,9 @@ func cloneNestedToolCalls(calls *NestedToolCalls) *NestedToolCalls {
 }
 
 func marshalMessage(role string, value any) ([]byte, error) {
-	body, err := json.Marshal(value)
+	// A lone surrogate in a string (Details, an id, a name) is written as its escape, as the content blocks write it. Marshal, not
+	// MarshalStringify: a value that is not JSON (NaN in Details) stays an error, as it was with encoding/json.
+	body, err := jsstring.MarshalKeepingSurrogates(value)
 	if err != nil {
 		return nil, err
 	}
@@ -312,9 +357,22 @@ func marshalMessage(role string, value any) ([]byte, error) {
 	return append(prefix, body[1:]...), nil
 }
 
+// MarshalJSON writes an empty but present sections object as {}, which Pi's durable store writes after a reset: an
+// absent member and an empty object are different records.
 func (message SystemMessage) MarshalJSON() ([]byte, error) {
-	type plain SystemMessage
-	return marshalMessage(message.messageRole(), plain(message))
+	// The members are listed in the order Pi writes them. An embedded struct plus an overriding field would put sections last.
+	type wire struct {
+		Content      SystemContent    `json:"content"`
+		Sections     *OrderedSections `json:"sections,omitempty"`
+		Timestamp    int64            `json:"timestamp"`
+		ToolsAdded   []ToolSchema     `json:"toolsAdded,omitempty"`
+		ToolsRemoved []ToolReference  `json:"toolsRemoved,omitempty"`
+	}
+	out := wire{Content: message.Content, Timestamp: message.Timestamp, ToolsAdded: message.ToolsAdded, ToolsRemoved: message.ToolsRemoved}
+	if message.Sections != nil {
+		out.Sections = &message.Sections
+	}
+	return marshalMessage(message.messageRole(), out)
 }
 
 func (message UserMessage) MarshalJSON() ([]byte, error) {
@@ -327,7 +385,40 @@ func (message AssistantMessage) MarshalJSON() ([]byte, error) {
 	if message.observation != nil {
 		message = *message.Observe()
 	}
+	if message.ErrorBeforeTimestamp && message.ErrorMessage != "" {
+		return marshalMessage(message.messageRole(), assistantErrorFirst(message))
+	}
 	return marshalMessage(message.messageRole(), plain(message))
+}
+
+// assistantErrorFirst is AssistantMessage's wire form with errorMessage before timestamp; responseId follows errorMessage as fauxAssistantMessage writes it (faux.ts:97-99).
+func assistantErrorFirst(message AssistantMessage) any {
+	type head struct {
+		Content               []AssistantContentBlock      `json:"content"`
+		API                   API                          `json:"api"`
+		Provider              string                       `json:"provider"`
+		Model                 string                       `json:"model"`
+		ResponseModel         string                       `json:"responseModel,omitempty"`
+		ProviderThinkingLevel string                       `json:"providerThinkingLevel,omitempty"`
+		Diagnostics           []AssistantMessageDiagnostic `json:"diagnostics,omitempty"` //portlint:allow emptydrop the errorMessage-first form emits the default form's members, whose diagnostics field the baseline lists
+		Usage                 Usage                        `json:"usage"`
+		StopReason            StopReason                   `json:"stopReason"`
+		Deferred              *DeferredHandle              `json:"deferred,omitempty"`
+		RawStopReason         string                       `json:"rawStopReason,omitempty"`
+		EndTurn               *bool                        `json:"endTurn,omitempty"`
+	}
+	return struct {
+		head
+		ErrorMessage  string             `json:"errorMessage"`
+		ResponseID    string             `json:"responseId,omitempty"`
+		Timestamp     int64              `json:"timestamp"`
+		DurationMs    *int64             `json:"durationMs,omitempty"`
+		ThinkingLevel ModelThinkingLevel `json:"thinkingLevel,omitempty"`
+	}{
+		head{message.Content, message.API, message.Provider, message.Model, message.ResponseModel, message.ProviderThinkingLevel,
+			message.Diagnostics, message.Usage, message.StopReason, message.Deferred, message.RawStopReason, message.EndTurn},
+		message.ErrorMessage, message.ResponseID, message.Timestamp, message.DurationMs, message.ThinkingLevel,
+	}
 }
 
 func (message ToolResultMessage) MarshalJSON() ([]byte, error) {
@@ -347,7 +438,7 @@ func (message *ToolResultMessage) UnmarshalJSON(data []byte) error {
 		Content []json.RawMessage `json:"content"`
 		Details json.RawMessage   `json:"details"`
 	}
-	if err := json.Unmarshal(data, &wire); err != nil {
+	if err := jsstring.UnmarshalKeepingSurrogates(data, &wire); err != nil {
 		return err
 	}
 	decoded := ToolResultMessage(wire.plain)
@@ -366,7 +457,7 @@ func (message *ToolResultMessage) UnmarshalJSON(data []byte) error {
 		}
 	}
 	if wire.Details != nil {
-		if err := json.Unmarshal(wire.Details, &decoded.Details); err != nil {
+		if err := jsstring.UnmarshalKeepingSurrogates(wire.Details, &decoded.Details); err != nil {
 			return fmt.Errorf("tool result details: %w", err)
 		}
 		decoded.DetailsNull = decoded.Details == nil
@@ -401,19 +492,22 @@ func cloneUserContentBlock(block UserContentBlock) UserContentBlock {
 }
 
 func cloneAssistantContent(blocks []AssistantContentBlock) []AssistantContentBlock {
+	return cloneAssistantContentWith(blocks, cloneArgumentsValue)
+}
+
+func cloneAssistantContentWith(blocks []AssistantContentBlock, cloneArguments func(any) any) []AssistantContentBlock {
 	if blocks == nil {
 		return nil
 	}
 	out := make([]AssistantContentBlock, len(blocks))
 	for i, block := range blocks {
 		switch value := block.(type) {
-		case TextContent:
-			out[i] = value
-		case ThinkingContent:
-			out[i] = value
+		case TextContent, ThinkingContent:
+			// A struct held in an interface is never changed in place (callers replace the whole block), so the clone shares the boxed value.
+			out[i] = block
 		case ToolCall:
 			if value.Arguments != nil {
-				value.Arguments = JsonObject(cloneJSONValue(value.Arguments).(map[string]any))
+				value.Arguments = JsonObject(cloneArguments(value.Arguments).(map[string]any))
 			}
 			out[i] = value
 		default:
@@ -473,4 +567,15 @@ func cloneDeferredHandle(handle *DeferredHandle) *DeferredHandle {
 	}
 	out.Data = cloneJSONValue(handle.Data)
 	return &out
+}
+
+// cloneUsage copies usage so the optional counters are not shared.
+func cloneUsage(usage Usage) Usage {
+	if usage.CacheWrite1h != nil {
+		usage.CacheWrite1h = new(*usage.CacheWrite1h)
+	}
+	if usage.Reasoning != nil {
+		usage.Reasoning = new(*usage.Reasoning)
+	}
+	return usage
 }

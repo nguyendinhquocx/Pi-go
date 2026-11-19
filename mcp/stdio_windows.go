@@ -10,6 +10,9 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/nodespawn"
 )
 
+// Ports packages/mcp/src/transports/stdio.ts (killProcessTree: taskkill /T /F; no process groups on win32)
+
+//portlint:allow ctxbackground the server runs until the transport's Close ends it (stdio.go Start sets cmd.Cancel = nil), so no caller context bounds it
 func bgContext() context.Context { return context.Background() }
 
 // setStdioProcAttr keeps the attributes crossspawn set: they hold the cmd.exe
@@ -37,8 +40,10 @@ func killProcessTree(cmd *exec.Cmd, exited <-chan struct{}, _ bool) {
 		return
 	default:
 	}
+	//nolint:gosec // G204 (class a): program is the literal taskkill; args are fixed /T /F plus the pid of the MCP server process PiG started.
 	kill := exec.Command("taskkill", "/pid", strconv.Itoa(cmd.Process.Pid), "/T", "/F")
 	nodespawn.HideWindow(kill, nodespawn.Ignore, nodespawn.Ignore, nodespawn.Ignore)
 	_ = kill.Start()
+	//portlint:allow golifetime reaps taskkill; it returns when taskkill exits
 	go func() { _ = kill.Wait() }()
 }

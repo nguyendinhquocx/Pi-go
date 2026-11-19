@@ -9,27 +9,29 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/MichaelKinsy/PiG/internal/jsonparse"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
+	"github.com/MichaelKinsy/PiG/internal/nodeurl"
+	_ "github.com/MichaelKinsy/PiG/internal/tlsdistrust" // hardens http.DefaultClient, the default fetch (pig additive (D191))
 )
 
 // Ports packages/mcp/src/transports/streamable-http.ts.
 
 const (
-	maxErrorBodyBytes           = 8 * 1024
-	errorMessageBodyChars       = 500
-	defaultReconnectInitialMs   = 1_000
-	defaultReconnectMaxDelayMs  = 30_000
-	defaultReconnectMaxRetries  = 5
-	sessionDeleteTimeout        = time.Second
-	responseBodyDrainLimitBytes = 64 * 1024
+	maxErrorBodyBytes          = 8 * 1024
+	errorMessageBodyChars      = 500
+	defaultReconnectInitialMs  = 1_000
+	defaultReconnectMaxDelayMs = 30_000
+	defaultReconnectMaxRetries = 5
+	sessionDeleteTimeout       = time.Second
 )
 
 // StreamableHTTPReconnectOptions control reconnection of dropped SSE streams
@@ -66,7 +68,19 @@ type McpHttpError struct {
 	Body    string
 }
 
+// NewMcpHttpError is `new McpHttpError(status, message, body)`.
+func NewMcpHttpError(status int, message string, body string) *McpHttpError {
+	e := &McpHttpError{Status: status, Message: message, Body: body}
+	return e
+}
+
 func (e *McpHttpError) Error() string { return e.Message }
+
+// Name is the `name` property, "McpHttpError".
+func (e *McpHttpError) Name() string { return "McpHttpError" }
+
+// Cause is the `cause` property. No upstream constructor sets one, so it is always nil.
+func (e *McpHttpError) Cause() error { return nil }
 
 // McpAuthRequiredError is a 401 response.
 type McpAuthRequiredError struct {
@@ -77,14 +91,17 @@ type McpAuthRequiredError struct {
 	HasWWWAuthenticate bool
 }
 
-// NewAuthRequiredError builds the error for a 401 response.
-func NewAuthRequiredError(response *http.Response, body string) *McpAuthRequiredError {
-	e := &McpAuthRequiredError{McpHttpError: McpHttpError{Status: 401, Message: "MCP server requires authentication", Body: body}}
+// NewMcpAuthRequiredError is `new McpAuthRequiredError(response, body)`.
+func NewMcpAuthRequiredError(response *http.Response, body string) *McpAuthRequiredError {
+	e := &McpAuthRequiredError{McpHttpError: *NewMcpHttpError(401, "MCP server requires authentication", body)}
 	if values := response.Header.Values("Www-Authenticate"); len(values) > 0 {
-		e.WWWAuthenticate, e.HasWWWAuthenticate = strings.Join(values, ", "), true
+		e.WWWAuthenticate, e.HasWWWAuthenticate = jsstring.FromLatin1(strings.Join(values, ", ")), true
 	}
 	return e
 }
+
+// Name is the `name` property, "McpAuthRequiredError".
+func (e *McpAuthRequiredError) Name() string { return "McpAuthRequiredError" }
 
 // Unwrap lets errors.As find the *McpHttpError.
 func (e *McpAuthRequiredError) Unwrap() error { return &e.McpHttpError }
@@ -92,21 +109,27 @@ func (e *McpAuthRequiredError) Unwrap() error { return &e.McpHttpError }
 // McpSessionExpiredError is a 404 response for an established session.
 type McpSessionExpiredError struct{ McpHttpError }
 
-// NewSessionExpiredError builds the error for an expired session.
-func NewSessionExpiredError(body string) *McpSessionExpiredError {
-	return &McpSessionExpiredError{McpHttpError{Status: 404, Message: "MCP session expired", Body: body}}
+// NewMcpSessionExpiredError is `new McpSessionExpiredError(body)`.
+func NewMcpSessionExpiredError(body string) *McpSessionExpiredError {
+	e := &McpSessionExpiredError{*NewMcpHttpError(404, "MCP session expired", body)}
+	return e
 }
+
+// Name is the `name` property, "McpSessionExpiredError".
+func (e *McpSessionExpiredError) Name() string { return "McpSessionExpiredError" }
 
 // Unwrap lets errors.As find the *McpHttpError.
 func (e *McpSessionExpiredError) Unwrap() error { return &e.McpHttpError }
 
 func responseContentType(response *http.Response) string {
-	value := response.Header.Get("Content-Type")
+	value := jsstring.FromLatin1(response.Header.Get("Content-Type"))
 	before, _, _ := strings.Cut(value, ";")
-	return strings.ToLower(strings.TrimSpace(before))
+	return strings.ToLower(jsstring.Trim(before))
 }
 
-var insufficientScope = lazyregexp.New(`(?i)(?:^|[\s,])error="?insufficient_scope"?`)
+// insufficientScope is /(?:^|[\s,])error="?insufficient_scope"?/i. A non-unicode JavaScript RegExp's i flag folds ASCII letters only, so the letters
+// are spelled as classes: RE2's (?i) would also fold U+017F into s.
+var insufficientScope = lazyregexp.New(`(?:^|[` + jsstring.SpaceClass + `,])[eE][rR][rR][oO][rR]="?[iI][nN][sS][uU][fF][fF][iI][cC][iI][eE][nN][tT]_[sS][cC][oO][pP][eE]"?`)
 
 // needsAuthorization is true for a 401, or a 403 with an `insufficient_scope`
 // bearer challenge (step-up authorization).
@@ -117,7 +140,7 @@ func needsAuthorization(response *http.Response) bool {
 	if response.StatusCode != http.StatusForbidden {
 		return false
 	}
-	return insufficientScope.MatchString(strings.Join(response.Header.Values("Www-Authenticate"), ", "))
+	return insufficientScope.MatchString(jsstring.FromLatin1(strings.Join(response.Header.Values("Www-Authenticate"), ", ")))
 }
 
 // isTransientStatus marks statuses worth retrying when a stream fails to (re)open.
@@ -131,12 +154,35 @@ func discardResponse(response *http.Response) {
 	}
 }
 
+// readBodyBytes is Pi's readBodyText (streamable-http.ts, 4a8b60bc3): it reads body to its end, or until it holds more than
+// maxBytes, and closes it. A body over maxBytes is cancelled unread and reported as truncated, with only its first maxBytes
+// bytes kept, less a trailing incomplete UTF-8 sequence (decoder.decode(subarray, {stream: true}) withholds it).
+func readBodyBytes(body io.ReadCloser, maxBytes int) (data []byte, truncated bool, err error) {
+	defer func() { _ = body.Close() }()
+	data, err = io.ReadAll(io.LimitReader(body, int64(maxBytes)+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if len(data) <= maxBytes {
+		return data, false, nil
+	}
+	data = data[:maxBytes]
+	for i := len(data) - 1; i >= 0 && i >= len(data)-3; i-- {
+		if utf8.RuneStart(data[i]) {
+			if !utf8.FullRune(data[i:]) {
+				data = data[:i]
+			}
+			break
+		}
+	}
+	return data, true, nil
+}
+
 func describeHTTPFailure(status int, body string) string {
-	text := strings.TrimSpace(body)
-	units := utf16.Encode([]rune(text))
+	text := jsstring.Trim(body)
 	snippet := text
-	if len(units) > errorMessageBodyChars {
-		snippet = string(utf16.Decode(units[:errorMessageBodyChars-3])) + "..."
+	if jsstring.Length(text) > errorMessageBodyChars {
+		snippet = jsstring.Slice(text, 0, errorMessageBodyChars-3) + "..."
 	}
 	if snippet != "" {
 		snippet = ": " + snippet
@@ -159,31 +205,58 @@ type streamCursor struct {
 // with Last-Event-ID.
 type StreamableHTTPTransport struct {
 	TransportEvents
-	URL     *url.URL
-	options StreamableHTTPTransportOptions
-	fetch   McpFetch
+	URL *url.URL
+	// requestURL is URL without its fragment; requests use it as fetch(url) does.
+	requestURL *url.URL
+	options    StreamableHTTPTransportOptions
+	fetch      McpFetch
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	// requests counts the fetch calls in flight (see do): Close waits for them before it sends the session DELETE.
+	requests sync.WaitGroup
 
 	mu              sync.Mutex
 	started         bool
 	closed          bool
 	sessionID       string
 	protocolVersion string
-	getStreamStart  bool
+	// lastToken is the access token of the latest request, which Close reuses instead of asking the auth provider.
+	lastToken      string
+	getStreamStart bool
+	// getStreamWritten reports that the GET stream's first request was written (issued, for a fetch that cannot report
+	// its writes) or failed; nil until the stream starts.
+	getStreamWritten func()
+}
+
+// signalGetStreamWritten calls getStreamWritten once the GET stream has started.
+func (t *StreamableHTTPTransport) signalGetStreamWritten() {
+	t.mu.Lock()
+	signal := t.getStreamWritten
+	t.mu.Unlock()
+	if signal != nil {
+		signal()
+	}
 }
 
 // NewStreamableHTTPTransport returns a transport for options.URL. It returns
 // an error when the URL does not parse.
 func NewStreamableHTTPTransport(options StreamableHTTPTransportOptions) (*StreamableHTTPTransport, error) {
-	u, err := url.Parse(options.URL)
-	if err != nil || u.Scheme == "" || u.Host == "" && u.Opaque == "" {
+	parsed, err := nodeurl.ParseURL(options.URL)
+	if err != nil {
+		return nil, fmt.Errorf("Invalid URL: %s", options.URL)
+	}
+	u, err := transportURL(parsed.Href())
+	if err != nil {
+		return nil, fmt.Errorf("Invalid URL: %s", options.URL)
+	}
+	requestURL, err := transportURL(parsed.WithoutHash().Href())
+	if err != nil {
 		return nil, fmt.Errorf("Invalid URL: %s", options.URL)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	t := &StreamableHTTPTransport{URL: u, options: options, fetch: options.Fetch, ctx: ctx, cancel: cancel}
+	t := &StreamableHTTPTransport{URL: u, requestURL: requestURL, options: options, fetch: options.Fetch, ctx: ctx, cancel: cancel}
 	if t.fetch == nil {
 		t.fetch = http.DefaultClient
 	}
@@ -208,7 +281,7 @@ func (t *StreamableHTTPTransport) Start() error {
 		return errors.New("MCP Streamable HTTP transport already started")
 	}
 	if t.closed {
-		return NewConnectionClosedError()
+		return NewMcpConnectionClosedError("")
 	}
 	t.started = true
 	return nil
@@ -235,10 +308,11 @@ func (t *StreamableHTTPTransport) isClosed() bool {
 
 // Send POSTs one message. A response to a request arrives as JSON, which is
 // delivered before Send returns, or as an SSE stream, which a goroutine
-// delivers.
-func (t *StreamableHTTPTransport) Send(message JSONRPCMessage) error {
+// delivers. Once ctx ends the message is not dispatched (Pi
+// streamable-http.ts:231-240, the send signal).
+func (t *StreamableHTTPTransport) Send(ctx context.Context, message JSONRPCMessage) error {
 	if !t.isOpen() {
-		return NewConnectionClosedError()
+		return NewMcpConnectionClosedError("")
 	}
 	body, err := json.Marshal(message)
 	if err != nil {
@@ -246,7 +320,7 @@ func (t *StreamableHTTPTransport) Send(message JSONRPCMessage) error {
 	}
 	response, err := t.authorizedFetch(http.MethodPost, map[string]string{
 		"accept": "application/json, text/event-stream", "content-type": "application/json",
-	}, body)
+	}, body, ctx)
 	if err != nil {
 		return err
 	}
@@ -266,14 +340,18 @@ func (t *StreamableHTTPTransport) Send(message JSONRPCMessage) error {
 	}
 	if response.StatusCode == http.StatusAccepted || response.StatusCode == http.StatusNoContent {
 		discardResponse(response)
-		return &McpHttpError{Status: response.StatusCode, Message: fmt.Sprintf("MCP server accepted request %s without a response", message.Method)}
+		return NewMcpHttpError(response.StatusCode, fmt.Sprintf("MCP server accepted request %s without a response", message.Method), "")
 	}
 	switch kind := responseContentType(response); kind {
 	case "application/json":
-		data, err := io.ReadAll(response.Body)
-		_ = response.Body.Close()
+		// pig divergence (D233): Pi 1.5.0 reads an application/json reply whole; Pi main caps it at maxMessageBytes like an SSE event (4a8b60bc3, #11335).
+		maxBytes := t.maxMessageBytes()
+		data, truncated, err := readBodyBytes(response.Body, maxBytes)
 		if err != nil {
 			return err
+		}
+		if truncated {
+			return fmt.Errorf("MCP JSON response exceeds %d bytes", maxBytes)
 		}
 		// Response.json() decodes the body as UTF-8 without its BOM, then
 		// rejects invalid JSON with JSON.parse's SyntaxError.
@@ -307,13 +385,18 @@ func (t *StreamableHTTPTransport) Send(message JSONRPCMessage) error {
 		if kind == "" {
 			kind = "missing"
 		}
-		return &McpHttpError{Status: response.StatusCode, Message: "Unsupported MCP response content type: " + kind}
+		return NewMcpHttpError(response.StatusCode, "Unsupported MCP response content type: "+kind, "")
 	}
 }
 
-// Close aborts every in-flight request and stream, ends the session with a
-// DELETE when the server assigned one, and waits for the transport's
-// goroutines.
+// Close aborts every in-flight request and stream, waits for the aborted requests to leave fetch, ends the session
+// with a DELETE when the server assigned one, and waits for the transport's goroutines.
+//
+// The DELETE waits for the aborted requests because net/http can fail a request with the context error of an
+// aborted one: a response without a body (a GET stream answered 405, a 202) is handed over after its connection went
+// back to the idle pool, and a round trip that sees its context end in between closes that connection, which the
+// DELETE may already have taken from the pool. Pi's close() (streamable-http.ts) sends the DELETE right after
+// aborting, which is safe there: Node's fetch has no such cross-request failure.
 func (t *StreamableHTTPTransport) Close() error {
 	t.mu.Lock()
 	if t.closed {
@@ -322,16 +405,21 @@ func (t *StreamableHTTPTransport) Close() error {
 	}
 	t.closed = true
 	started, sessionID := t.started, t.sessionID
-	t.mu.Unlock()
+	// Under the lock, so that a request that do finds the transport closed is one whose context has ended.
 	t.cancel()
+	t.mu.Unlock()
+	t.requests.Wait()
 	if started && sessionID != "" {
+		// Best effort: the session expires on the server anyway. The auth provider may refresh tokens over the
+		// network, so it is not asked here and closing never waits for a refresh (streamable-http.ts close, #10565).
 		ctx, cancel := context.WithTimeout(context.Background(), sessionDeleteTimeout)
-		if headers, _, err := t.headers(ctx, nil); err == nil {
-			if request, err := http.NewRequestWithContext(ctx, http.MethodDelete, t.URL.String(), nil); err == nil {
-				request.Header = headers
-				if response, err := t.fetch.Do(request); err == nil {
-					discardResponse(response)
-				}
+		t.mu.Lock()
+		token := t.lastToken
+		t.mu.Unlock()
+		if request, err := t.newRequest(ctx, http.MethodDelete, nil); err == nil {
+			request.Header = t.buildHeaders(nil, token)
+			if response, err := t.fetch.Do(request); err == nil {
+				discardResponse(response)
 			}
 		}
 		cancel()
@@ -341,10 +429,34 @@ func (t *StreamableHTTPTransport) Close() error {
 	return nil
 }
 
+// transportURL keeps the WHATWG serialization, including a "|" or a malformed percent escape that url.Parse rejects or re-escapes.
+func transportURL(href string) (*url.URL, error) {
+	if u, err := nodeurl.RequestURL(href); err == nil {
+		return u, nil
+	}
+	return url.Parse(href)
+}
+
+// newRequest targets requestURL directly, because http.NewRequest would re-parse and re-escape its spelling.
+func (t *StreamableHTTPTransport) newRequest(ctx context.Context, method string, body io.Reader) (*http.Request, error) {
+	request, err := http.NewRequestWithContext(ctx, method, "", body)
+	if err != nil {
+		return nil, err
+	}
+	target := *t.requestURL
+	request.URL, request.Host = &target, target.Host
+	return request, nil
+}
+
 // authorizedFetch sends a request with auth headers. A 401 (or a 403 asking
 // for more scope) is handed to the auth provider once, and the request is
 // retried with whatever credentials it left behind.
-func (t *StreamableHTTPTransport) authorizedFetch(method string, extra map[string]string, body []byte) (*http.Response, error) {
+//
+// signal only stops dispatch: getting a token or the authorization recovery
+// can take a while, and a request its sender gave up on in the meantime must
+// not reach the server. It does not abort the shared recovery, which other
+// requests may wait for (Pi streamable-http.ts:287-317).
+func (t *StreamableHTTPTransport) authorizedFetch(method string, extra map[string]string, body []byte, signal context.Context) (*http.Response, error) {
 	var handler UnauthorizedHandler
 	if t.options.AuthProvider != nil {
 		handler, _ = t.options.AuthProvider.(UnauthorizedHandler)
@@ -354,16 +466,29 @@ func (t *StreamableHTTPTransport) authorizedFetch(method string, extra map[strin
 		if err != nil {
 			return nil, err
 		}
+		if signal != nil && signal.Err() != nil {
+			return nil, NewMcpAbortError("")
+		}
 		var reader io.Reader
 		if body != nil {
 			reader = bytes.NewReader(body)
 		}
-		request, err := http.NewRequestWithContext(t.ctx, method, t.URL.String(), reader)
+		request, err := t.newRequest(t.ctx, method, reader)
 		if err != nil {
 			return nil, err
 		}
+		if method == http.MethodGet {
+			request = request.WithContext(httptrace.WithClientTrace(request.Context(), &httptrace.ClientTrace{
+				WroteRequest: func(httptrace.WroteRequestInfo) { t.signalGetStreamWritten() },
+			}))
+		}
 		request.Header = headers
-		response, err := t.fetch.Do(request)
+		if _, reportsWrites := t.fetch.(*http.Client); method == http.MethodGet && !reportsWrites {
+			// Another McpFetch may not report its writes: the stream's first request counts as sent once it is issued to
+			// the fetch, with its token read.
+			t.signalGetStreamWritten()
+		}
+		response, err := t.do(request)
 		if err != nil {
 			return nil, err
 		}
@@ -378,7 +503,36 @@ func (t *StreamableHTTPTransport) authorizedFetch(method string, extra map[strin
 	}
 }
 
+// do sends a request through the fetch. Close waits for the calls started before it, so that a request Close aborted
+// has left the fetch before the session DELETE enters it. A request that finds the transport closed carries an ended
+// context (see Close) and fails before it reaches a connection, so it needs no wait.
+func (t *StreamableHTTPTransport) do(request *http.Request) (*http.Response, error) {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return t.fetch.Do(request)
+	}
+	t.requests.Add(1)
+	t.mu.Unlock()
+	defer t.requests.Done()
+	return t.fetch.Do(request)
+}
+
 func (t *StreamableHTTPTransport) headers(ctx context.Context, extra map[string]string) (http.Header, string, error) {
+	var token string
+	if t.options.AuthProvider != nil {
+		var err error
+		if token, err = t.options.AuthProvider.Token(ctx); err != nil {
+			return nil, "", err
+		}
+	}
+	t.mu.Lock()
+	t.lastToken = token
+	t.mu.Unlock()
+	return t.buildHeaders(extra, token), token, nil
+}
+
+func (t *StreamableHTTPTransport) buildHeaders(extra map[string]string, token string) http.Header {
 	headers := http.Header{}
 	for name, value := range t.options.Headers {
 		headers.Set(name, value)
@@ -395,17 +549,10 @@ func (t *StreamableHTTPTransport) headers(ctx context.Context, extra map[string]
 	if version != "" {
 		headers.Set("MCP-Protocol-Version", version)
 	}
-	var token string
-	if t.options.AuthProvider != nil {
-		var err error
-		if token, err = t.options.AuthProvider.Token(ctx); err != nil {
-			return nil, "", err
-		}
-	}
 	if token != "" {
 		headers.Set("Authorization", "Bearer "+token)
 	}
-	return headers, token, nil
+	return headers
 }
 
 func (t *StreamableHTTPTransport) captureSession(response *http.Response) {
@@ -420,23 +567,20 @@ func (t *StreamableHTTPTransport) checkResponse(response *http.Response) error {
 	if response.StatusCode >= 200 && response.StatusCode < 300 {
 		return nil
 	}
-	// response.text() decodes the body as UTF-8 without its BOM, and slice
-	// keeps MAX_ERROR_BODY_BYTES UTF-16 units, which take at most three bytes
-	// each.
-	data, _ := io.ReadAll(io.LimitReader(response.Body, int64(3*maxErrorBodyBytes+len("\uFEFF"))))
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, responseBodyDrainLimitBytes))
-	_ = response.Body.Close()
-	body := jsstring.Slice(jsstring.FromUTF8(bytes.TrimPrefix(data, []byte("\uFEFF"))), 0, maxErrorBodyBytes)
+	// pig divergence (D233): Pi 1.5.0 keeps the first 8192 UTF-16 units of the whole body; Pi main reads only the first MAX_ERROR_BODY_BYTES bytes and cancels the rest (4a8b60bc3, #11335).
+	// TextDecoder decodes the kept bytes without a leading BOM; a failed read leaves an empty body.
+	data, _, _ := readBodyBytes(response.Body, maxErrorBodyBytes)
+	body := jsstring.FromUTF8(bytes.TrimPrefix(data, []byte("\uFEFF")))
 	if response.StatusCode == http.StatusUnauthorized {
-		return NewAuthRequiredError(response, body)
+		return NewMcpAuthRequiredError(response, body)
 	}
 	t.mu.Lock()
 	hasSession := t.sessionID != ""
 	t.mu.Unlock()
 	if response.StatusCode == http.StatusNotFound && hasSession {
-		return NewSessionExpiredError(body)
+		return NewMcpSessionExpiredError(body)
 	}
-	return &McpHttpError{Status: response.StatusCode, Message: describeHTTPFailure(response.StatusCode, body), Body: body}
+	return NewMcpHttpError(response.StatusCode, describeHTTPFailure(response.StatusCode, body), body)
 }
 
 func (t *StreamableHTTPTransport) maxMessageBytes() int {
@@ -458,7 +602,7 @@ func (t *StreamableHTTPTransport) consumeSSE(stream io.Reader, cursor *streamCur
 		OnEvent: func(event SSEEvent) {
 			cursor.received = true
 			// Events without data prime resumption; other event types are not JSON-RPC.
-			if strings.TrimSpace(event.Data) == "" || (event.Event != "" && event.Event != "message") {
+			if jsstring.Trim(event.Data) == "" || (event.Event != "" && event.Event != "message") {
 				return
 			}
 			message, err := parseWireMessage([]byte(event.Data))
@@ -529,7 +673,7 @@ func (t *StreamableHTTPTransport) consumeResponseStream(body io.ReadCloser, requ
 	if failure != nil {
 		reason = failure.Error()
 	}
-	t.EmitMessage(NewErrorResponse(requestID, JSONRPCInternalError, "MCP response stream failed: "+reason, nil))
+	t.EmitMessage(NewErrorResponse(requestID, JSONRPCErrorCodes.InternalError, "MCP response stream failed: "+reason, nil))
 }
 
 func (t *StreamableHTTPTransport) startGetStream() {
@@ -543,11 +687,23 @@ func (t *StreamableHTTPTransport) startGetStream() {
 	}
 	t.getStreamStart = true
 	t.wg.Add(1)
+	written := make(chan struct{})
+	var once sync.Once
+	t.getStreamWritten = func() { once.Do(func() { close(written) }) }
 	t.mu.Unlock()
 	go func() {
 		defer t.wg.Done()
+		defer t.signalGetStreamWritten()
 		t.runGetStream()
 	}()
+	// The upstream transport issues the GET request before send returns, so it reaches the server before the client's
+	// next request and has read its token by then. A goroutine can start late: wait until the first attempt has written
+	// its request, or failed. A fetch that cannot report its writes is waited for until the request is issued to it
+	// (see authorizedFetch).
+	select {
+	case <-written:
+	case <-t.ctx.Done():
+	}
 }
 
 // runGetStream keeps the server-to-client stream open, reconnecting with
@@ -556,6 +712,7 @@ func (t *StreamableHTTPTransport) runGetStream() {
 	cursor := &streamCursor{}
 	for attempt := 0; !t.isClosed(); {
 		stream, err := t.openSSEStream(cursor.lastEventID, cursor.hasEventID)
+		t.signalGetStreamWritten()
 		if err == nil {
 			// The server does not offer a GET stream.
 			if stream == nil {
@@ -598,7 +755,7 @@ func (t *StreamableHTTPTransport) openSSEStream(lastEventID string, hasLastEvent
 	if hasLastEventID {
 		extra["last-event-id"] = lastEventID
 	}
-	response, err := t.authorizedFetch(http.MethodGet, extra, nil)
+	response, err := t.authorizedFetch(http.MethodGet, extra, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -616,7 +773,7 @@ func (t *StreamableHTTPTransport) openSSEStream(lastEventID string, hasLastEvent
 		if kind == "" {
 			kind = "missing"
 		}
-		return nil, &McpHttpError{Status: response.StatusCode, Message: "Unsupported MCP GET response content type: " + kind}
+		return nil, NewMcpHttpError(response.StatusCode, "Unsupported MCP GET response content type: "+kind, "")
 	}
 	return response.Body, nil
 }

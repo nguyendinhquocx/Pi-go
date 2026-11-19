@@ -76,7 +76,7 @@ func TestRegisteredOAuthLoginReportsReturnedCredentialPath(t *testing.T) {
 			if providerID == "anthropic" {
 				m.opts.ModelRegistry.SetRuntimeAPIKey(providerID, "test-key")
 			}
-			if err := m.runLoginRegisteredOAuth(t.Context(), provider, ""); err != nil {
+			if err := m.runLoginRegisteredOAuth(t.Context(), provider, testOAuthLoginName(provider), ""); err != nil {
 				t.Fatal(err)
 			}
 			waitPostLoginStatus(t, m, "Credentials saved to")
@@ -109,7 +109,7 @@ func TestPostLoginSelectionLosesToOwnerLoopCommands(t *testing.T) {
 				started, release := make(chan struct{}), make(chan struct{})
 				build := m.opts.ModelBuilder
 				m.opts.ModelBuilder = func(spec string) (*ai.Model, error) {
-					if spec == "openai/gpt-5.5" {
+					if spec == "openai/gpt-6.1-sol" {
 						close(started)
 						<-release
 					}
@@ -127,7 +127,7 @@ func TestPostLoginSelectionLosesToOwnerLoopCommands(t *testing.T) {
 					if command == "same model" {
 						spec = "unknown/unknown"
 					}
-					if err := m.buildSlashContext(t.Context()).SwitchModel(spec); err != nil {
+					if err := settleSwitchModel(t, m, m.buildSlashContext(t.Context()), spec); err != nil {
 						t.Fatal(err)
 					}
 				} else if err := m.buildSlashContext(t.Context()).NewSession(); err != nil {
@@ -143,7 +143,7 @@ func TestPostLoginSelectionLosesToOwnerLoopCommands(t *testing.T) {
 				if m.opts.SettingsManager.GetDefaultModel() != "" {
 					t.Fatal("stale login persisted the default")
 				}
-				if strings.Contains(plainRender(m.chatContainer), "Selected gpt-5.5") {
+				if strings.Contains(plainRender(m.chatContainer), "Selected gpt-6.1-sol") {
 					t.Fatal("stale login announced selection")
 				}
 			})
@@ -161,11 +161,11 @@ type blockedPostLoginHandle struct {
 func (h *blockedPostLoginHandle) SetModel(model *ai.Model, options ...ModelMutationOptions) error {
 	return h.setModel(model, options, func(mutate func() error) error { return mutate() })
 }
-func (h *blockedPostLoginHandle) SetModelOnMain(model *ai.Model, options ModelMutationOptions, dispatch func(func() error) error) error {
+func (h *blockedPostLoginHandle) SetModelOnMain(_ context.Context, model *ai.Model, options ModelMutationOptions, dispatch func(func() error) error) error {
 	return h.setModel(model, []ModelMutationOptions{options}, dispatch)
 }
 func (h *blockedPostLoginHandle) setModel(model *ai.Model, options []ModelMutationOptions, dispatch func(func() error) error) error {
-	login := model.ID == "gpt-5.5"
+	login := model.ID == "gpt-6.1-sol"
 	if login && !h.afterMutation {
 		close(h.started)
 		<-h.release
@@ -209,7 +209,7 @@ func TestPostLoginSelectionRechecksSessionMutationAndCompletion(t *testing.T) {
 					}
 				}
 				sc := m.buildSlashContext(context.Background())
-				if err := sc.SwitchModel("fixture/chosen"); err != nil {
+				if err := settleSwitchModel(t, m, sc, "fixture/chosen"); err != nil {
 					t.Fatal(err)
 				}
 				if err := m.persistDefaultModel(m.opts.Model); err != nil {

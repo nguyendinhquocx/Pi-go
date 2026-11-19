@@ -62,7 +62,7 @@ func TestProviderResponseAndToolPromptsAcrossSDKs(t *testing.T) {
 			defer server.Close()
 			provider := ai.NewOpenAIProvider(ai.OpenAIConfig{ProviderID: "test", Model: "probe", APIKey: "key", BaseURL: server.URL})
 			t.Cleanup(func() { _ = provider.Close() })
-			services, err := coding.NewServices(coding.ServicesOptions{CWD: t.TempDir(), AgentDir: t.TempDir()})
+			services, err := coding.CreateAgentSessionServices(coding.CreateAgentSessionServicesOptions{CWD: t.TempDir(), AgentDir: t.TempDir()})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -97,7 +97,7 @@ func TestProviderResponseAndToolPromptsAcrossSDKs(t *testing.T) {
 				t.Fatalf("requests = %d", len(gotRequests))
 			}
 			for i, prompt := range gotRequests {
-				want := "<tools>\n- guided_tool: Guided tool summary\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n</tools>"
+				want := "<tools>\n- guided_tool: Guided tool summary\n\nAdditional tools may be available.\n</tools>"
 				if i == 1 {
 					want = strings.Replace(want, "- guided_tool: Guided tool summary", "(none)", 1)
 				}

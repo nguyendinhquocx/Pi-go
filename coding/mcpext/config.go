@@ -17,6 +17,7 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/jsonparse"
 	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
 	"github.com/MichaelKinsy/PiG/internal/orderedjson"
+	"github.com/MichaelKinsy/PiG/internal/text"
 )
 
 // Ports packages/coding-agent/src/extensions/mcp/config.ts.
@@ -111,6 +112,8 @@ func (s *configState) readFile(path, scope string) {
 		s.errors = append(s.errors, fmt.Sprintf("%s: %s", path, nodeReadError(path, err)))
 		return
 	}
+	// upstream: config.ts readConfigFile `JSON.parse(stripBom(readFileSync(path, "utf8")))` (#11191)
+	data = text.StripBomBytes(data)
 	if !json.Valid(data) {
 		message := "Unexpected end of JSON input"
 		if err := jsonparse.Validate(data); err != nil {
@@ -339,8 +342,11 @@ func AddMcpServerConfigJSON(path, name string, config json.RawMessage) (bool, er
 		if servers == nil {
 			servers = orderedjson.New()
 		}
-		replaced = servers.Has(name)
-		servers.Set(name, config)
+		replaced = plainObjectDefines(servers, name)
+		// Assigning "__proto__" on a plain object sets its prototype instead of adding a member, so the file gets no such server.
+		if name != "__proto__" || servers.Has(name) {
+			servers.Set(name, config)
+		}
 		serversRaw, _ := servers.MarshalJSON()
 		parsed.Set("mcpServers", serversRaw)
 		return true, nil
@@ -356,14 +362,26 @@ func RemoveMcpServerConfig(path, name string) (bool, error) {
 	}
 	removed := false
 	err := editMcpServers(path, func(servers, _ *orderedjson.Object) (bool, error) {
-		if servers == nil || !servers.Has(name) {
+		if servers == nil || !plainObjectDefines(servers, name) {
 			return false, nil
 		}
-		servers.Delete(name)
+		servers.Delete(name) // a name that is only inherited deletes nothing, but Pi counts it as removed and rewrites the file
 		removed = true
 		return true, nil
 	})
 	return removed, err
+}
+
+// objectPrototypeNames are the properties a plain JavaScript object inherits from Object.prototype.
+var objectPrototypeNames = map[string]bool{
+	"constructor": true, "__defineGetter__": true, "__defineSetter__": true, "hasOwnProperty": true, "__lookupGetter__": true, "__lookupSetter__": true,
+	"isPrototypeOf": true, "propertyIsEnumerable": true, "toString": true, "valueOf": true, "__proto__": true, "toLocaleString": true,
+}
+
+// plainObjectDefines is `servers[name] !== undefined` on the plain object Pi parses mcp.json into: an own member, or one inherited from
+// Object.prototype (a server named "constructor" or "__proto__" reads as already defined).
+func plainObjectDefines(servers *orderedjson.Object, name string) bool {
+	return servers.Has(name) || objectPrototypeNames[name]
 }
 
 var indentPattern = lazyregexp.New(`(?m)^([ \t]+)\S`)
@@ -373,10 +391,12 @@ var indentPattern = lazyregexp.New(`(?m)^([ \t]+)\S`)
 // returns true. Other content is kept. The servers object edit receives is
 // written back into the file's `mcpServers` member, in place.
 func editMcpServers(path string, edit func(servers, parsed *orderedjson.Object) (bool, error)) error {
-	var text []byte
+	var existing []byte
 	parsed := orderedjson.New()
 	if data, err := os.ReadFile(path); err == nil {
-		text = data
+		// upstream: config.ts editMcpServers `stripBom(readFileSync(path, "utf8"))` (#11191)
+		data = text.StripBomBytes(data)
+		existing = data
 		if !json.Valid(data) {
 			if err := jsonparse.Validate(data); err != nil {
 				return err
@@ -404,7 +424,7 @@ func editMcpServers(path string, edit func(servers, parsed *orderedjson.Object) 
 		parsed.Set("mcpServers", raw)
 	}
 	indent := "  "
-	if match := indentPattern.FindSubmatch(text); match != nil {
+	if match := indentPattern.FindSubmatch(existing); match != nil {
 		indent = string(match[1])
 	}
 	// JSON.stringify uses at most the first 10 characters of a string indent.

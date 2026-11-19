@@ -28,30 +28,143 @@ type EditorRemote interface {
 	StateChanged()
 }
 
+// EditorRemoteInvalidator is an [EditorRemote] that learns of a theme change, which Pi's TUI delivers as invalidate() to every
+// component it holds (container.ts invalidate forwards to its children; a custom editor clears its caches there).
+type EditorRemoteInvalidator interface {
+	Invalidate()
+}
+
 type editorRemoteState struct {
 	remote          EditorRemote
 	frame           []string
 	frameWidth      int
 	wantsKeyRelease bool
+	// capturesViewportInput is the remote component's capturesViewportInput as its latest frame reported it.
+	capturesViewportInput bool
 	// expanded is the component's getExpandedText for the mirrored text.
 	expanded        string
 	expandedFor     string
 	focusedReported bool
 	thinkingLevel   string
+	// delegated marks a component whose base editing is this editor: the
+	// component sees keys and renders through [Editor.AsBase], and the text
+	// stays the editor's own.
+	delegated bool
+	// theme is the active theme the remote last drew with; a change invalidates the component.
+	theme *Theme
 }
 
 // SetRemote installs remote in place of the editor's own editing, or with
 // nil restores it. The mirrored text becomes the editor's text.
 func (e *Editor) SetRemote(remote EditorRemote) {
+	text := e.Text()
+	leavingDelegated := e.stockInstance != nil
+	if leavingDelegated {
+		// The delegated component's editor instance ends; the default editor returns as it was at the install.
+		e.loadInstance(*e.stockInstance)
+		e.stockInstance = nil
+	}
 	if remote == nil {
 		e.remote = nil
+		if leavingDelegated {
+			// upstream: interactive-mode.ts setCustomEditorComponent defaultEditor.setText(currentText)
+			e.SetText(text)
+		}
 		e.Invalidate()
 		return
 	}
 	e.AutocompleteCancel()
-	e.remote = &editorRemoteState{remote: remote, focusedReported: e.Focused, thinkingLevel: e.ThinkingLevel}
+	e.remote = &editorRemoteState{remote: remote, focusedReported: e.Focused, thinkingLevel: e.ThinkingLevel, theme: ActiveTheme()}
 	e.Invalidate()
 }
+
+// SetDelegatedRemote installs remote like [Editor.SetRemote] for a component
+// that subclasses the editor: it receives every key and renders every frame,
+// and reaches this editor's own editing, rendering and app-action handling
+// through [Editor.AsBase], as a CustomEditor subclass reaches its super.
+//
+// Pi builds a new Editor for each factory and copies only the text into it, so the component's base starts as a fresh
+// instance: an empty prompt history and kill ring, no pastes, and an undo stack holding the empty document its
+// setText(currentText) replaced. The default editor's own instance state returns when the component is removed or
+// replaced.
+func (e *Editor) SetDelegatedRemote(remote EditorRemote) {
+	text := e.Text()
+	e.SetRemote(remote)
+	if e.remote == nil {
+		return
+	}
+	e.remote.delegated = true
+	stock := e.saveInstance()
+	e.stockInstance = &stock
+	e.loadInstance(editorInstance{lines: []string{""}, inputHistIdx: -1})
+	// upstream: interactive-mode.ts setCustomEditorComponent newEditor.setText(currentText) on the new instance
+	normalized := normalizeEditorText(text)
+	if normalized != "" {
+		e.saveHistory()
+	}
+	e.lines = strings.Split(normalized, "\n")
+	e.cursor[0] = len(e.lines) - 1
+	e.setCursorCol(jsstring.Length(e.lines[e.cursor[0]]))
+	e.Invalidate()
+}
+
+// editorInstance is the editing state each pi-tui Editor instance owns, as opposed to its configuration (padding,
+// autocomplete provider and size, theme, border colour) and the TUI's focus.
+type editorInstance struct {
+	lines                []string
+	cursor               [2]int
+	jumpMode             string
+	history              []editorState
+	killRing             KillRing
+	lastAction           string
+	preferredVisualCol   *int
+	snappedFromCursorCol *int
+	inputHistory         []string
+	inputHistIdx         int
+	inputHistSaved       *editorHistoryDraft
+	isInPaste            bool
+	pasteBuffer          string
+	pastes               map[int]string
+	pasteCounter         int
+	scrollOffset         int
+}
+
+func (e *Editor) saveInstance() editorInstance {
+	return editorInstance{
+		lines: e.lines, cursor: e.cursor, jumpMode: e.jumpMode, history: e.history, killRing: e.killRing, lastAction: e.lastAction,
+		preferredVisualCol: e.preferredVisualCol, snappedFromCursorCol: e.snappedFromCursorCol, inputHistory: e.inputHistory,
+		inputHistIdx: e.inputHistIdx, inputHistSaved: e.inputHistSaved, isInPaste: e.isInPaste, pasteBuffer: e.pasteBuffer,
+		pastes: e.pastes, pasteCounter: e.pasteCounter, scrollOffset: e.scrollOffset,
+	}
+}
+
+func (e *Editor) loadInstance(s editorInstance) {
+	e.lines, e.cursor, e.jumpMode, e.history, e.killRing, e.lastAction = s.lines, s.cursor, s.jumpMode, s.history, s.killRing, s.lastAction
+	e.preferredVisualCol, e.snappedFromCursorCol, e.inputHistory = s.preferredVisualCol, s.snappedFromCursorCol, s.inputHistory
+	e.inputHistIdx, e.inputHistSaved, e.isInPaste, e.pasteBuffer = s.inputHistIdx, s.inputHistSaved, s.isInPaste, s.pasteBuffer
+	e.pastes, e.pasteCounter, e.scrollOffset = s.pastes, s.pasteCounter, s.scrollOffset
+	e.Invalidate()
+}
+
+// IsDelegated reports whether the installed remote reaches this editor's
+// editing through [Editor.AsBase].
+func (e *Editor) IsDelegated() bool { return e != nil && e.remote != nil && e.remote.delegated }
+
+// AsBase runs fn with the editor's own editing, rendering and completion
+// state in place of the remote's, which is Pi's `super` call from a
+// CustomEditor subclass. It runs on the owner loop and does not nest.
+func (e *Editor) AsBase(fn func()) {
+	if e.inBase {
+		fn()
+		return
+	}
+	e.inBase = true
+	defer func() { e.inBase = false }()
+	fn()
+}
+
+// forwards reports whether the host's editor operations go to the remote.
+func (e *Editor) forwards() bool { return e.remote != nil && !e.inBase }
 
 // Remote returns the installed remote, or nil.
 func (e *Editor) Remote() EditorRemote {
@@ -77,6 +190,13 @@ func (e *Editor) SetRemoteFrame(lines []string, width int, wantsKeyRelease bool)
 	e.Invalidate()
 }
 
+// SetRemoteCapturesViewportInput records the remote component's capturesViewportInput (Component.capturesViewportInput) for the frame that follows.
+func (e *Editor) SetRemoteCapturesViewportInput(captures bool) {
+	if e.remote != nil {
+		e.remote.capturesViewportInput = captures
+	}
+}
+
 // ApplyRemoteChange mirrors the remote's text (its onChange) and the same
 // text with paste markers expanded.
 func (e *Editor) ApplyRemoteChange(text, expanded string) {
@@ -97,12 +217,12 @@ func (e *Editor) ApplyRemoteChange(text, expanded string) {
 // Editor handles (positioning the cursor or picking an autocomplete item),
 // and leaves press, drag, release and wheel to the renderer, as the Editor
 // leaves them unhandled outside its autocomplete list.
-func (e *Editor) remoteMouse(event TuiMouseEvent) *TuiMouseDispatchResult {
+func (e *Editor) remoteMouse(event TuiMouseEvent) *TuiMouseEventResult {
 	if event.Type != MouseClick || event.Button != MouseButtonLeft || event.Y < 0 {
 		return nil
 	}
 	e.remote.remote.Mouse(event)
-	return &TuiMouseDispatchResult{TuiMouseEventResult: TuiMouseEventResult{Handled: true, Focus: true}}
+	return &TuiMouseEventResult{Handled: true, Focus: true}
 }
 
 // WantsKeyRelease reports the remote component's wantsKeyRelease; the
@@ -130,12 +250,30 @@ func (e *Editor) remoteExpandedText() string {
 	return text
 }
 
+// EditorRemoteRenderer is an [EditorRemote] that renders its component on demand, for a component that runs in the host's process: the editor
+// shows what the component renders at the width it is asked for, so a component that changes on its own (an animation, a timer) shows the change on
+// the next render without a key. ok is false when the remote has only the frames it was sent.
+type EditorRemoteRenderer interface {
+	RenderRemote(width int) (lines []string, ok bool)
+}
+
 // renderRemote returns the component's frame unchanged at its render width. The layout owns the spacer above the editor. A stale-width frame is clipped until the component renders at the new width.
 func (e *Editor) renderRemote(width int) []string {
 	if e.Focused != e.remote.focusedReported || e.ThinkingLevel != e.remote.thinkingLevel {
 		e.remote.focusedReported = e.Focused
 		e.remote.thinkingLevel = e.ThinkingLevel
 		e.remote.remote.StateChanged()
+	}
+	if theme := ActiveTheme(); theme != e.remote.theme {
+		e.remote.theme = theme
+		if invalidator, ok := e.remote.remote.(EditorRemoteInvalidator); ok {
+			invalidator.Invalidate()
+		}
+	}
+	if renderer, ok := e.remote.remote.(EditorRemoteRenderer); ok {
+		if lines, ok := renderer.RenderRemote(width); ok {
+			return lines
+		}
 	}
 	out := make([]string, 0, len(e.remote.frame))
 	for _, line := range e.remote.frame {
@@ -146,6 +284,10 @@ func (e *Editor) renderRemote(width int) []string {
 	}
 	return out
 }
+
+// ApplyBorderColor is Pi's `this.borderColor(text)`: the editor's border color function applied to text, which without one
+// is the color of its thinking level, of bash mode, or the default border. A custom component calls it to color its own border rows.
+func (e *Editor) ApplyBorderColor(text string) string { return e.colorEditorBorder(text) }
 
 // RemoteSuggestionQuery captures a local provider's synchronous answer and its awaited work without reading the editor again.
 type RemoteSuggestionQuery struct {
@@ -178,16 +320,16 @@ func NewAutocompleteQuery(provider AutocompleteProvider, lines []string, cursorL
 			query.fileTask, query.filePrefix = run, prefix
 		}
 	}
-	if fp, ok := provider.(ForcefulAutocompleteProvider); ok && force {
-		query.base = fp.GetSuggestionsForce(lines, cursorLine, cursorCol)
-	} else {
-		query.base = provider.GetSuggestions(lines, cursorLine, cursorCol)
-	}
+	query.base = provider.GetSuggestions(context.Background(), lines, cursorLine, cursorCol, AutocompleteSuggestionOptions{Force: force})
 	if query.base != nil && len(query.base.Items) == 0 {
 		query.base = nil
 	}
 	return query
 }
+
+// AwaitsIO reports whether RunResult waits for work Pi awaits off the loop (a command's Promise-returning argument completer, the fd search):
+// the answer cannot settle in the microtask checkpoint after the read that asked.
+func (q *RemoteSuggestionQuery) AwaitsIO() bool { return q.argumentTask != nil || q.fileTask != nil }
 
 // RunResult awaits the query and preserves callback errors for its caller.
 func (q *RemoteSuggestionQuery) RunResult(ctx context.Context) (*AutocompleteSuggestions, error) {

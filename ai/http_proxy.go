@@ -17,11 +17,14 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/tlsdistrust"
 )
 
 // ApplyHTTPProxySettings sets absent HTTP_PROXY and HTTPS_PROXY variables. An explicitly empty environment value remains authoritative.
 func ApplyHTTPProxySettings(httpProxy string) error {
-	proxy := strings.TrimSpace(httpProxy)
+	proxy := jsstring.Trim(httpProxy)
 	if proxy == "" {
 		return nil
 	}
@@ -40,6 +43,34 @@ func proxyEnv(lower, upper string) string {
 		return value
 	}
 	return os.Getenv(upper)
+}
+
+// proxyFromEnvironment is the proxy a request uses under undici's EnvHttpProxyAgent: https_proxy then HTTPS_PROXY for https (falling back to the
+// http proxy), http_proxy then HTTP_PROXY for http, and none for a host NO_PROXY names. net/http.ProxyFromEnvironment reads the uppercase variable
+// first, so a WebSocket dial that needs undici's choice uses this.
+func proxyFromEnvironment(request *http.Request) (*url.URL, error) {
+	raw := proxyEnv("http_proxy", "HTTP_PROXY")
+	if request.URL.Scheme == "https" {
+		if secure := proxyEnv("https_proxy", "HTTPS_PROXY"); secure != "" {
+			raw = secure
+		}
+	}
+	if raw == "" || proxyBypassed(request.URL) {
+		return nil, nil
+	}
+	return parseProxyURL(raw)
+}
+
+// parseProxyURL accepts an http or https proxy URL with a host, as EnvHttpProxyAgent's ProxyAgent does.
+func parseProxyURL(raw string) (*url.URL, error) {
+	proxy, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	if proxy.Hostname() == "" || (proxy.Scheme != "http" && proxy.Scheme != "https") {
+		return nil, fmt.Errorf("invalid HTTP proxy URL %q", raw)
+	}
+	return proxy, nil
 }
 
 type proxyRequestContextKey struct{}
@@ -136,12 +167,9 @@ func proxyOriginTransport(direct *http.Transport, raw string) (*http.Transport, 
 	if raw == "" {
 		return nil, nil
 	}
-	proxy, err := url.Parse(raw)
+	proxy, err := parseProxyURL(raw)
 	if err != nil {
 		return nil, err
-	}
-	if proxy.Hostname() == "" || (proxy.Scheme != "http" && proxy.Scheme != "https") {
-		return nil, fmt.Errorf("invalid HTTP proxy URL %q", raw)
 	}
 	transport := direct.Clone()
 	dial := direct.DialContext
@@ -181,7 +209,8 @@ func proxyOriginTransport(direct *http.Transport, raw string) (*http.Transport, 
 		stop := context.AfterFunc(ctx, func() { _ = rawConn.Close() })
 		defer stop()
 		if proxy.Scheme == "https" && direct.DialTLSContext == nil {
-			tlsConn := tls.Client(conn, &tls.Config{ServerName: proxy.Hostname()})
+			// pig additive (D191): the proxy's own chain is checked like every other TLS peer's.
+			tlsConn := tls.Client(conn, tlsdistrust.Harden(&tls.Config{ServerName: proxy.Hostname(), MinVersion: tls.VersionTLS12}))
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				return nil, err
 			}

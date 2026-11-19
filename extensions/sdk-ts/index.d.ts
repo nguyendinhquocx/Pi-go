@@ -1,4 +1,5 @@
 import "@earendil-works/pi-coding-agent";
+import "@earendil-works/pi-tui";
 
 export type * from "@earendil-works/pi-coding-agent";
 
@@ -30,8 +31,104 @@ export interface PiGSpriteDefinition {
   palette: Record<string, string>;
 }
 
+/** A Pi theme token a surface may override (PiG component kit, D107 §6). */
+export type PiGViewThemeToken =
+  | "accent"
+  | "muted"
+  | "dim"
+  | "text"
+  | "border"
+  | "borderAccent"
+  | "borderMuted"
+  | "success"
+  | "warning"
+  | "error"
+  | "selectedBg"
+  | "customMessageBg";
+
+/**
+ * Token overrides for one surface, each a `#rrggbb` color. PiG renders the
+ * surface with them in every mode, escaped in the theme's color mode; a faint
+ * token stays faint. An unknown token or a malformed color is applied
+ * nowhere, and a frontend rejects the surface's view.
+ */
+export type PiGViewTheme = Partial<Record<PiGViewThemeToken, `#${string}`>>;
+
+/** One row of a {@link PiGViewList}: its primary text, a secondary text, and further table cells. */
+export interface PiGViewListItem {
+  label: string;
+  detail?: string;
+  columns?: string[];
+}
+
+/** Says a component's rows are a list: `items[i]` is row `i`. `selectedIndex` is the highlighted item, or -1. */
+export interface PiGViewList {
+  items: PiGViewListItem[];
+  selectedIndex: number;
+}
+
+/**
+ * What a component's rows show, for a frontend drawing them natively. PiG
+ * sends it only while a frontend draws, and only for a component it cannot
+ * read structure from (a custom `render`). The terminal always draws the rows.
+ */
+export interface PiGViewLines {
+  /** The rows depict this image (base64 data). */
+  image?: { data: string; mimeType: string };
+  /** The rows show a position in a range. */
+  progress?: { value: number; max: number };
+  /** The rows are a list, one item per row; a list whose item count differs from the rows is rejected. */
+  list?: PiGViewList;
+}
+
+/** The provenance the loader stamped on an extension (Pi's `SourceInfo`). */
+export interface PiGExtensionSourceInfo {
+  path: string;
+  source: string;
+  scope: string;
+  origin: string;
+  baseDir?: string;
+}
+
 declare module "@earendil-works/pi-coding-agent" {
+  interface ExtensionAPI {
+    /**
+     * Run `handler(ctx)` once the runtime registered and has its state, before
+     * it serves a request (`session_start` included) and after the emits its
+     * factory made were delivered. Pi has no such hook.
+     */
+    onLoaded(handler: (ctx: ExtensionContext) => void | Promise<void>): void;
+  }
+  interface ExtensionContext {
+    /** The provenance the loader stamped on this extension; undefined when the host holds none. */
+    extensionSourceInfo(): PiGExtensionSourceInfo | undefined;
+    /**
+     * In a tool's `execute`: the call's position among the tool calls of the
+     * assistant message that issued it; undefined for a nested `executeTool` call.
+     */
+    readonly toolCallIndex?: number;
+    /** In a tool's `execute`: `JSON.stringify` of the call's arguments, members in the model's order. */
+    readonly toolInput?: string;
+  }
+  // Pi c466a359 (#11360) adds ExecOptions.maxBuffer and ExecResult.truncated. PiG's host implements them and this augmentation declares them.
+  interface ExecOptions {
+    /**
+     * Combined stdout/stderr byte limit; exceeding it terminates the command with `truncated: true`.
+     * Nonnegative integer up to the runtime string limit. Default: 256 MiB, capped by that limit.
+     */
+    maxBuffer?: number;
+  }
+  interface ExecResult {
+    /** Output exceeded `maxBuffer`; stdout and stderr are incomplete and `code` is nonzero. */
+    truncated: boolean;
+  }
   interface ExtensionUIContext {
+    /** Subscribe to changes of the host's theme; the handler receives `ui.theme` after it took the new palette. Returns the unsubscribe function. */
+    onThemeChange(handler: (theme: Theme) => void): () => void;
+    /** Subscribe to the host toggling tool-output expansion; the handler receives the new state. Returns the unsubscribe function. */
+    onToolsExpandedChange(handler: (expanded: boolean) => void): () => void;
+    /** Ring the terminal bell of the interactive terminal; nothing without a terminal UI. */
+    bell(): void;
     /** Set PiG's native login template, or reject an invalid definition. */
     setLogin(definition: PiGLoginDefinition): Promise<void>;
     /**
@@ -40,5 +137,25 @@ declare module "@earendil-works/pi-coding-agent" {
      * leaves /sprite when the extension unloads.
      */
     registerSprite(definition: PiGSpriteDefinition): Promise<void>;
+  }
+  interface ExtensionAPI {
+    /**
+     * Declare that this extension owns the thinking runs of assistant messages,
+     * so a thinking run that is hidden or draws zero rows leaves no blank
+     * spacer rows around it. Called while the extension loads, it sets the
+     * initial value; called later, it changes it. The host ORs the flag across
+     * extensions, and it drops when the extension unloads or reloads. The last
+     * call wins. `enabled` defaults to true.
+     */
+    ownThinkingRuns(enabled?: boolean): void;
+  }
+}
+
+declare module "@earendil-works/pi-tui" {
+  interface Component {
+    /** On a surface's root component: token overrides for that surface (PiG only). */
+    viewTheme?: PiGViewTheme;
+    /** Frontend-only annotations of this component's rows (PiG only). */
+    viewLines?: PiGViewLines;
   }
 }

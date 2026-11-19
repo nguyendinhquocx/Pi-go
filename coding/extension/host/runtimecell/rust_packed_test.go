@@ -10,12 +10,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/MichaelKinsy/PiG/coding/extension/host/runtimecell"
 	"github.com/MichaelKinsy/PiG/coding/extension/host/subprocess"
+	"github.com/MichaelKinsy/PiG/internal/testbudget"
 	"github.com/MichaelKinsy/PiG/internal/testenv"
 )
 
@@ -26,8 +28,7 @@ func TestBuildRustPackedCellBuildsCachedRunner(t *testing.T) {
 	rootA := writeRustFactoryCrate(t, "packed_a", "a-ext", "a")
 	rootB := writeRustFactoryCrate(t, "packed_b", "b-ext", "b")
 	cache := t.TempDir()
-	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
-	defer cancel()
+	ctx := testbudget.DeadlineContext(t)
 
 	cell, err := runtimecell.BuildRustPackedCell(ctx, cache, "cell:rust-test", []runtimecell.RustExtension{
 		{Name: "b-ext", Root: rootB, Package: "packed_b", Factory: "new_extension", Hash: "hb"},
@@ -174,4 +175,31 @@ func acceptRegisterRust(t *testing.T, ln net.Listener) *subprocess.RegisterPaylo
 	_, _ = conn.Write(hdr[:])
 	_, _ = conn.Write(readyData)
 	return env.Register
+}
+
+// A rustc killed from outside (the host's memory limit under load) leaves cargo's "could not compile" with a signal and no diagnostic. The cell build must report that cause,
+// the status and how long cargo ran, because its log is removed with the test that owned it.
+func TestBuildRustPackedCellReportsHowAKilledCargoEnded(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake cargo is a shell script")
+	}
+	bin := t.TempDir()
+	script := "#!/bin/sh\nif [ \"$1\" = \"--version\" ] || [ \"$1\" = \"-V\" ] || [ \"$1\" = \"-vV\" ]; then echo \"$0 1.0.0\"; exit 0; fi\n" +
+		"printf 'error: could not compile `serde_json` (lib)\\n\\nCaused by:\\n  process didn'\"'\"'t exit successfully: `rustc --crate-name serde_json src/lib.rs` (signal: 9, SIGKILL: kill)\\n'\nexit 101\n"
+	for _, name := range []string{"cargo", "rustc"} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	root := writeRustFactoryCrate(t, "killed_a", "killed-ext", "k")
+	_, err := runtimecell.BuildRustPackedCell(context.Background(), t.TempDir(), "cell:rust-killed", []runtimecell.RustExtension{{Name: "killed-ext", Root: root, Package: "killed_a", Factory: "new_extension", Hash: "hk"}})
+	if err == nil {
+		t.Fatal("a cargo that exits 101 built a cell")
+	}
+	for _, want := range []string{"cargo build failed:", "rustc for `serde_json` (signal: 9, SIGKILL: kill)", "exit status 101", " after ", "details: "} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q lacks %q", err, want)
+		}
+	}
 }

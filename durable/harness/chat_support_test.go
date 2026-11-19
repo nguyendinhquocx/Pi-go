@@ -4,7 +4,9 @@ package harness
 
 import (
 	"context"
+	"os"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/durable"
 	"github.com/MichaelKinsy/PiG/durable/env"
+	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
 // fauxHandle is the faux provider surface the harness tests drive (pi-ai FauxProviderHandle).
@@ -25,10 +28,12 @@ type fauxHandle interface {
 
 // chatState holds the models and registry that survive a close/reopen, like a host process's own objects.
 type chatState struct {
-	Faux     fauxHandle
-	Models   *ai.Models
-	Registry Registry
-	Reports  *reportLog
+	Faux   fauxHandle
+	Models *ai.Models
+	// HarnessModels, when set, is HarnessOptions.Models in place of Models, for a test that wraps the models.
+	HarnessModels durable.Models
+	Registry      Registry
+	Reports       *reportLog
 	// mu guards Settings and Now, which tests change between decisions.
 	mu       sync.Mutex
 	settings HarnessSettings
@@ -50,7 +55,7 @@ func (setup *chatState) SetNow(now func() float64) {
 }
 
 // chatSetup registers a faux provider (pi-ai fauxProvider(options)) on fresh models.
-func chatSetup(t *testing.T, config ...ai.FauxConfig) *chatState {
+func chatSetup(t testing.TB, config ...ai.FauxConfig) *chatState {
 	t.Helper()
 	var options ai.FauxConfig
 	if len(config) > 0 {
@@ -59,30 +64,50 @@ func chatSetup(t *testing.T, config ...ai.FauxConfig) *chatState {
 	faux := ai.NewFauxProvider(options)
 	models := ai.CreateModels()
 	models.SetProvider(faux.Provider())
-	return &chatState{
+	state := &chatState{
 		Faux:     faux,
 		Models:   models,
 		Registry: CreateRegistry(),
 		Reports:  &reportLog{},
 		now:      func() float64 { return float64(time.Now().UnixMilli()) },
 	}
+	// PI_DURABLE_DOCUMENT_RETENTION_MS runs the suite with the document retention of every chat set, as upstream's
+	// setup-document-retention.ts does for `npm run test:evicting` (0 evicts each unattached document right after use).
+	if forced := os.Getenv("PI_DURABLE_DOCUMENT_RETENTION_MS"); forced != "" {
+		retention, err := strconv.ParseFloat(forced, 64)
+		if err != nil {
+			t.Fatalf("PI_DURABLE_DOCUMENT_RETENTION_MS = %q: %v", forced, err)
+		}
+		state.settings.DocumentRetentionMs = &retention
+	}
+	return state
 }
 
 type openChatOptions struct {
 	// env is one environment for every conversation; envFunc an Env function.
 	env     env.ExecutionEnv
 	envFunc func(ctx context.Context, target EnvTarget) (env.ExecutionEnv, error)
+	// telemetry is HarnessOptions.telemetry.
+	telemetry telemetry.TelemetryContext
+	// setTimer is HarnessOptions.SetTimer.
+	setTimer durable.SetTimer
+	// identity is HarnessOptions.Identity.
+	identity *ai.ClientIdentity
 }
 
 // openChat opens a Harness over storage and returns its root, configured with the faux model on first creation.
-func openChat(t *testing.T, storage durable.Storage, setup *chatState, options ...openChatOptions) (Harness, Conversation) {
+func openChat(t testing.TB, storage durable.Storage, setup *chatState, options ...openChatOptions) (Harness, Conversation) {
 	t.Helper()
 	var option openChatOptions
 	if len(options) > 0 {
 		option = options[0]
 	}
+	var models durable.Models = setup.Models
+	if setup.HarnessModels != nil {
+		models = setup.HarnessModels
+	}
 	harnessOptions := HarnessOptions{
-		Models:   setup.Models,
+		Models:   models,
 		Registry: setup.Registry,
 		Settings: func() *HarnessSettings {
 			setup.mu.Lock()
@@ -96,7 +121,10 @@ func openChat(t *testing.T, storage durable.Storage, setup *chatState, options .
 			setup.mu.Unlock()
 			return now()
 		},
-		OnReport: setup.Reports.add,
+		OnReport:  setup.Reports.add,
+		Telemetry: option.telemetry,
+		SetTimer:  option.setTimer,
+		Identity:  option.identity,
 	}
 	switch {
 	case option.envFunc != nil:
@@ -187,10 +215,10 @@ func unanswered() unansweredStep {
 	var once sync.Once
 	return unansweredStep{
 		reached: reached,
-		step: ai.FauxFactoryStep(func(_ ai.TranscriptContext, options ai.StreamOptions, _ *ai.FauxProviderState, _ *ai.Model) (ai.FauxResponse, error) {
+		step: ai.FauxFactoryStep(func(_ ai.TranscriptContext, options ai.StreamOptions, _ *ai.FauxProviderState, _ *ai.Model) (ai.AssistantMessage, error) {
 			once.Do(func() { close(reached) })
 			<-options.Signal.Done()
-			return ai.FauxResponse{}, context.Cause(options.Signal)
+			return ai.FauxResponse{}.AssistantMessage(), context.Cause(options.Signal)
 		}),
 	}
 }

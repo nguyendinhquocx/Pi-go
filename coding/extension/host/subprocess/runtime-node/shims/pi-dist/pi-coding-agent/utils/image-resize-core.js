@@ -1,5 +1,10 @@
 import { applyExifOrientation } from "./exif-orientation.js";
 import { loadPhoton } from "./photon.js";
+/**
+ * Tag on image resize worker replies. Node can post its own messages on the worker channel
+ * (for example `{ "watch:require": [...] }` under `node --watch`), so replies must be identifiable.
+ */
+export const IMAGE_RESIZE_WORKER_RESPONSE_TYPE = "pi:image-resize-response";
 // 4.5MB of base64 payload. Provides headroom below Anthropic's 5MB limit.
 const DEFAULT_MAX_BYTES = 4.5 * 1024 * 1024;
 const DEFAULT_OPTIONS = {
@@ -85,9 +90,11 @@ export async function resizeImageInProcess(inputBytes, mimeType, options) {
         let currentWidth = targetWidth;
         let currentHeight = targetHeight;
         while (true) {
-            const candidates = tryEncodings(currentWidth, currentHeight, qualitySteps);
-            for (const candidate of candidates) {
-                if (candidate.encodedSize < opts.maxBytes) {
+            const [png, jpeg, ...lowerQualityJpegs] = tryEncodings(currentWidth, currentHeight, qualitySteps);
+            // Prefer the smaller of PNG and JPEG at the configured quality; lower JPEG quality only if neither fits.
+            const preferred = jpeg && jpeg.encodedSize < png.encodedSize ? [jpeg, png] : [png, jpeg];
+            for (const candidate of [...preferred, ...lowerQualityJpegs]) {
+                if (candidate && candidate.encodedSize < opts.maxBytes) {
                     return {
                         data: candidate.data,
                         mimeType: candidate.mimeType,

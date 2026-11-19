@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
 // ModelAuth is request auth for a single model request. Mirrors upstream
@@ -59,6 +61,12 @@ type AuthCheck struct {
 	Source string
 	Type   CredentialType
 }
+
+// AuthCheckType is the credential type the check found, "oauth" or "api_key" (the provider selector compares it with the option's auth type).
+func (c *AuthCheck) AuthCheckType() string { return string(c.Type) }
+
+// AuthCheckSource is where the configured auth comes from, as the provider selector prints it.
+func (c *AuthCheck) AuthCheckSource() string { return c.Source }
 
 // AuthContext is environment access for auth resolution. Env reports a
 // value only when it is set and not blank.
@@ -109,12 +117,17 @@ type APIKeyAuth struct {
 	Resolve func(ctx context.Context, input APIKeyAuthInput) (*AuthResult, error)
 }
 
+// AuthMethodName is the method's display name, which the provider selector searches (oauth-selector.ts:136 `provider.method?.name`).
+func (a *APIKeyAuth) AuthMethodName() string { return a.Name }
+
 // LoginOptions is app-supplied context for Models.Login.
 type LoginOptions struct {
 	// GetDeviceID returns the stable ID of this app installation, for example sent to OpenAI as its agent host ID.
 	// Login flows call it only when they need it, so apps can create the ID on first use; it must return the same ID on
 	// every later call. Nil means the app supplies none.
 	GetDeviceID func() string
+	// AgentName is the name this app introduces itself with during login, for example OpenAI's agent name hint and the Codex originator. Nil means the flow's own default; an empty name is kept as given (auth/types.ts:206-213).
+	AgentName *string
 }
 
 // OAuthAuth refreshes stored OAuth credentials and derives request auth
@@ -129,6 +142,9 @@ type OAuthAuth struct {
 	// store is the D40 extension-owned credential store of the OAuth provider whose flow Login runs; a login through it saves there instead of the core credential store.
 	store OAuthCredentialStore
 }
+
+// AuthMethodName is the method's display name, which the provider selector searches (oauth-selector.ts:136 `provider.method?.name`).
+func (a *OAuthAuth) AuthMethodName() string { return a.Name }
 
 // ProviderAuth lists the auth methods a provider supports.
 type ProviderAuth struct {
@@ -165,14 +181,18 @@ type ModelsError struct {
 	Cause   error
 }
 
+// Name is the upstream `name` property.
+func (*ModelsError) Name() string { return "ModelsError" }
+
 // NewModelsError mirrors the upstream ModelsError constructor, including ECMAScript trimming of the cause detail.
 func NewModelsError(code ModelsErrorCode, message string, cause error) *ModelsError {
 	if cause != nil {
-		if detail := trimJSWhitespace(cause.Error()); detail != "" && !strings.Contains(message, detail) {
+		if detail := trimJSWhitespace(FormatThrownValue(cause)); detail != "" && !strings.Contains(message, detail) {
 			message = message + ": " + detail
 		}
 	}
-	return &ModelsError{Code: code, Message: message, Cause: cause}
+	e := &ModelsError{Code: code, Message: message, Cause: cause}
+	return e
 }
 
 func (e *ModelsError) Error() string { return e.Message }
@@ -190,8 +210,14 @@ const (
 // credential type without a matching handler. Mirrors upstream
 // resolveProviderAuth.
 func ResolveProviderAuth(ctx context.Context, providerID string, auth ProviderAuth, credentials CredentialStore, authContext AuthContext, overrides AuthResolutionOverrides) (*AuthResult, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	return resolveProviderAuth(ctx, providerID, auth, credentials, authContext, overrides, startOAuthRefreshWork)
+}
+
+// resolveProviderAuth is ResolveProviderAuth with the starter of the stored-credential refresh its caller owns.
+func resolveProviderAuth(ctx context.Context, providerID string, auth ProviderAuth, credentials CredentialStore, authContext AuthContext, overrides AuthResolutionOverrides, start oauthRefreshStarter) (*AuthResult, error) {
+	if ctx.Err() != nil {
+		// resolve.ts:53 signal.throwIfAborted() throws the signal's reason: "This operation was aborted" for a plain abort().
+		return nil, AbortReason(ctx)
 	}
 	requestContext := authContext
 	if overrides.Env != nil {
@@ -206,7 +232,7 @@ func ResolveProviderAuth(ctx context.Context, providerID string, auth ProviderAu
 	}
 	if stored != nil {
 		if stored.Type == CredentialOAuth && auth.OAuth != nil {
-			return resolveStoredOAuth(ctx, credentials, providerID, auth.OAuth, *stored, overrides.MinOAuthValidityMs)
+			return resolveStoredOAuth(ctx, credentials, providerID, auth.OAuth, *stored, overrides.MinOAuthValidityMs, start)
 		}
 		if stored.Type == CredentialAPIKey && auth.APIKey != nil {
 			credential := stored
@@ -232,8 +258,8 @@ func ResolveProviderAuth(ctx context.Context, providerID string, auth ProviderAu
 // refreshing OAuth or running request-time work where a check exists.
 // Mirrors upstream Models.checkAuth for a known provider.
 func CheckProviderAuth(ctx context.Context, providerID string, auth ProviderAuth, credentials CredentialStore, authContext AuthContext) (*AuthCheck, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	if ctx.Err() != nil {
+		return nil, AbortReason(ctx)
 	}
 	credential, err := readProviderCredential(ctx, credentials, providerID)
 	if err != nil {
@@ -281,8 +307,8 @@ func overlayEnvAuthContext(base AuthContext, env map[string]string) AuthContext 
 // resolveStoredOAuth refreshes with double-checked locking: a token with less
 // than the minimum validity remaining locks, re-checks expiry under the lock,
 // refreshes once, and persists the rotated credential before release.
-func resolveStoredOAuth(ctx context.Context, credentials CredentialStore, providerID string, oauth *OAuthAuth, stored Credential, minOAuthValidityMs *float64) (*AuthResult, error) {
-	credential, err := refreshStoredOAuth(ctx, credentials, providerID, oauth, stored, minOAuthValidityMs)
+func resolveStoredOAuth(ctx context.Context, credentials CredentialStore, providerID string, oauth *OAuthAuth, stored Credential, minOAuthValidityMs *float64, start oauthRefreshStarter) (*AuthResult, error) {
+	credential, err := refreshStoredOAuth(ctx, credentials, providerID, oauth, stored, minOAuthValidityMs, start)
 	if err != nil || credential == nil {
 		return nil, err
 	}
@@ -294,7 +320,7 @@ func resolveStoredOAuth(ctx context.Context, credentials CredentialStore, provid
 }
 
 // refreshStoredOAuth is resolveStoredOAuth's refresh step: it returns the credential to derive auth from, refreshed under the store's lock when it expires within the minimum validity, or nil when the credential was removed or replaced by a non-OAuth one meanwhile.
-func refreshStoredOAuth(ctx context.Context, credentials CredentialStore, providerID string, oauth *OAuthAuth, stored Credential, minOAuthValidityMs *float64) (*Credential, error) {
+func refreshStoredOAuth(ctx context.Context, credentials CredentialStore, providerID string, oauth *OAuthAuth, stored Credential, minOAuthValidityMs *float64, start oauthRefreshStarter) (*Credential, error) {
 	minimumValidityMs := defaultOAuthMinimumValidityMs
 	if minOAuthValidityMs != nil {
 		minimumValidityMs = math.Max(minimumValidityMs, *minOAuthValidityMs)
@@ -305,7 +331,7 @@ func refreshStoredOAuth(ctx context.Context, credentials CredentialStore, provid
 	credential := stored
 	if expiresSoon(credential) {
 		// Optimistic check said expired; the authoritative check runs under the lock.
-		post, err := refreshStoredOAuthCredential(ctx, credentials, providerID, oauth, expiresSoon)
+		post, err := refreshStoredOAuthCredential(ctx, credentials, providerID, oauth, expiresSoon, start)
 		if err != nil {
 			return nil, err
 		}
@@ -323,30 +349,41 @@ func refreshStoredOAuth(ctx context.Context, credentials CredentialStore, provid
 	return &credential, nil
 }
 
-// oauthRefreshWork owns the stored-credential refreshes that outlive a cancelled caller. Each is bounded by the store's lock and the fifteen-second refresh timeout.
+// oauthRefreshWork owns the stored-credential refreshes that outlive a cancelled caller and belong to no Models collection. Each is bounded by the store's lock and the fifteen-second refresh timeout.
 var oauthRefreshWork sync.WaitGroup
 
+// oauthRefreshStarter starts a stored-credential refresh that outlives a cancelled caller, and reports false when its owner admits no more work. A Models
+// collection supplies its own owned work, so draining it joins the credential write a cancelled caller leaves behind; the rest start it on oauthRefreshWork.
+type oauthRefreshStarter func(run func()) bool
+
+func startOAuthRefreshWork(run func()) bool {
+	oauthRefreshWork.Go(run)
+	return true
+}
+
 // refreshStoredOAuthCredential refreshes a stored OAuth credential under the credential store's lock and persists the result before the lock is released. needsRefresh is re-checked under the lock, so concurrent callers and processes refresh once.
-// ctx cancels only the wait for the lock. Once a refresh starts, the provider may already have rotated the refresh token, so the refresh and its persistence ignore ctx and are bounded only by the fifteen-second timeout; otherwise a cancelled caller could discard the only valid refresh token. Upstream's callers race the promise with their signal; this call does that itself, so a cancelled caller returns the cancellation cause while the refresh finishes and persists in the background. It returns nil when the credential was removed or replaced by a non-OAuth one meanwhile.
+// ctx cancels only the wait for the lock. Once a refresh starts, the provider may already have rotated the refresh token, so the refresh and its persistence ignore ctx and are bounded only by the fifteen-second timeout; otherwise a cancelled caller could discard the only valid refresh token. Upstream's callers race the promise with their signal; this call does that itself, so a cancelled caller returns the signal reason ([AbortReason]) while the refresh finishes and persists in the background. It returns nil when the credential was removed or replaced by a non-OAuth one meanwhile.
 // upstream: packages/ai/src/auth/resolve.ts:refreshStoredOAuthCredential
-func refreshStoredOAuthCredential(ctx context.Context, credentials CredentialStore, providerID string, oauth *OAuthAuth, needsRefresh func(Credential) bool) (*Credential, error) {
+func refreshStoredOAuthCredential(ctx context.Context, credentials CredentialStore, providerID string, oauth *OAuthAuth, needsRefresh func(Credential) bool, start oauthRefreshStarter) (*Credential, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, context.Cause(ctx)
+		return nil, AbortReason(ctx)
 	}
 	type outcome struct {
 		credential *Credential
 		err        error
 	}
 	done := make(chan outcome, 1)
-	oauthRefreshWork.Go(func() {
+	if !start(func() {
 		credential, err := refreshStoredOAuthLocked(ctx, credentials, providerID, oauth, needsRefresh)
 		done <- outcome{credential, err}
-	})
+	}) {
+		return nil, errModelsDraining
+	}
 	select {
 	case result := <-done:
 		return result.credential, result.err
 	case <-ctx.Done():
-		return nil, context.Cause(ctx)
+		return nil, AbortReason(ctx)
 	}
 }
 
@@ -358,7 +395,7 @@ func refreshStoredOAuthLocked(ctx context.Context, credentials CredentialStore, 
 	post, err := credentials.Modify(lockWait, providerID, func(current *Credential) (*Credential, error) {
 		stopLockWait()
 		if err := ctx.Err(); err != nil {
-			return nil, context.Cause(ctx)
+			return nil, AbortReason(ctx)
 		}
 		if current == nil || current.Type != CredentialOAuth || !needsRefresh(*current) {
 			return nil, nil // logged out meanwhile, or another process or request refreshed
@@ -374,7 +411,7 @@ func refreshStoredOAuthLocked(ctx context.Context, credentials CredentialStore, 
 			return nil, err
 		}
 		if ctx.Err() != nil {
-			return nil, context.Cause(ctx)
+			return nil, AbortReason(ctx)
 		}
 		return nil, NewModelsError(ModelsErrorAuth, fmt.Sprintf("Credential store modify failed for %s", providerID), err)
 	}
@@ -431,8 +468,9 @@ func MergeProviderHeaders(base, override ProviderHeaders) ProviderHeaders {
 	merged := make(ProviderHeaders, len(base)+len(override))
 	maps.Copy(merged, base)
 	for name, value := range override {
+		lowerName := jsstring.ToLower(name)
 		for existing := range merged {
-			if strings.EqualFold(existing, name) {
+			if jsstring.ToLower(existing) == lowerName {
 				delete(merged, existing)
 			}
 		}

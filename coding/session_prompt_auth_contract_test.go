@@ -13,7 +13,7 @@ func TestPromptHonorsRegisteredProviderAuthContract(t *testing.T) {
 	for _, id := range []string{"amazon-bedrock", "ollama", "custom-auth-required"} {
 		t.Run(id, func(t *testing.T) {
 			dir := t.TempDir()
-			services, err := NewServices(ServicesOptions{CWD: dir, AgentDir: dir})
+			services, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: dir, AgentDir: dir})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -40,9 +40,10 @@ func TestPromptHonorsRegisteredProviderAuthContract(t *testing.T) {
 				t.Fatal(err)
 			}
 			done := make(chan struct{})
+			eventsCh := session.Events()
 			go func() {
 				defer close(done)
-				for event := range session.Events() {
+				for event := range eventsCh {
 					AcknowledgeEvent(event)
 				}
 			}()
@@ -52,7 +53,7 @@ func TestPromptHonorsRegisteredProviderAuthContract(t *testing.T) {
 				}
 				<-done
 			})
-			_, err = session.Prompt(t.Context(), "hi")
+			err = session.Prompt(t.Context(), "hi")
 			if err == nil || !strings.Contains(err.Error(), "No API key found for "+id+".") || provider.callCount() != 0 {
 				t.Fatalf("missing configured auth: error=%v provider calls=%d", err, provider.callCount())
 			}

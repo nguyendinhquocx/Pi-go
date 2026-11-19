@@ -23,7 +23,7 @@ func newExtensionDialogProbe(t *testing.T) (*InteractiveMode, *bytes.Buffer) {
 
 func newExtensionDialogProbeSized(t *testing.T, width, height int) (*InteractiveMode, *bytes.Buffer) {
 	t.Helper()
-	m := NewInteractiveMode(InteractiveOptions{CWD: t.TempDir()})
+	m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: t.TempDir()})
 	m.editor = tui.NewEditor()
 	m.editorContainer = tui.NewContainer()
 	m.editorContainer.Add(m.editor)
@@ -60,7 +60,7 @@ func runExtensionDialogProbe(
 	case <-time.After(time.Second):
 		t.Fatal("dialog did not post its mutation to the UI loop")
 	}
-	if m.extensionDialog == nil {
+	if m.shownExtensionDialog() == nil {
 		t.Fatal("dialog was not installed on the UI loop")
 	}
 	for _, key := range input {
@@ -83,7 +83,7 @@ func TestAC48SubprocessDialogsRunOnUILoop(t *testing.T) {
 	ui := &ExtUIContext{m: m}
 
 	selected, err := runExtensionDialogProbe(t, m, func() (string, error) {
-		return ui.Select(context.Background(), "Pick one", []string{"first", "second"}, nil)
+		return ui.Select(context.Background(), "Pick one", []string{"first", "second"}, extension.ExtensionUIDialogOptions{})
 	}, []string{"\x1b[B", "\r"})
 	if err != nil || selected != "second" {
 		t.Fatalf("select = %q, %v; want second", selected, err)
@@ -93,7 +93,7 @@ func TestAC48SubprocessDialogsRunOnUILoop(t *testing.T) {
 	}
 
 	input, err := runExtensionDialogProbe(t, m, func() (string, error) {
-		return ui.Input(context.Background(), "Your name", "name", nil)
+		return ui.Input(context.Background(), "Your name", "name", extension.ExtensionUIDialogOptions{})
 	}, []string{"Ada", "\r"})
 	if err != nil || input != "Ada" {
 		t.Fatalf("input = %q, %v; want Ada", input, err)
@@ -113,10 +113,10 @@ func TestExtUIContextDialogCancellationIsExplicit(t *testing.T) {
 		call func(*ExtUIContext) (string, error)
 	}{
 		{"select", func(ui *ExtUIContext) (string, error) {
-			return ui.Select(context.Background(), "Cancel me", []string{"first"}, nil)
+			return ui.Select(context.Background(), "Cancel me", []string{"first"}, extension.ExtensionUIDialogOptions{})
 		}},
 		{"input", func(ui *ExtUIContext) (string, error) {
-			return ui.Input(context.Background(), "Cancel me", "", nil)
+			return ui.Input(context.Background(), "Cancel me", "", extension.ExtensionUIDialogOptions{})
 		}},
 		{"editor", func(ui *ExtUIContext) (string, error) {
 			return ui.Editor(context.Background(), "Cancel me", "")
@@ -139,7 +139,7 @@ func TestExtUIContextDialogContextCancellationRestoresEditorOnUILoop(t *testing.
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		_, err := (&ExtUIContext{m: m}).Input(ctx, "Cancel by context", "", nil)
+		_, err := (&ExtUIContext{m: m}).Input(ctx, "Cancel by context", "", extension.ExtensionUIDialogOptions{})
 		result <- err
 	}()
 
@@ -159,7 +159,7 @@ func TestExtUIContextDialogContextCancellationRestoresEditorOnUILoop(t *testing.
 	case <-time.After(time.Second):
 		t.Fatal("dialog cleanup was not posted to the UI loop")
 	}
-	if m.extensionDialog != nil {
+	if m.shownExtensionDialog() != nil {
 		t.Fatal("cancelled dialog remains installed")
 	}
 }
@@ -218,10 +218,10 @@ func TestExtensionDialogKeepsTranscriptVisible(t *testing.T) {
 		keys []string
 	}{
 		{"select", func(ui *ExtUIContext) (string, error) {
-			return ui.Select(context.Background(), "Pick one", []string{"first", "second"}, nil)
+			return ui.Select(context.Background(), "Pick one", []string{"first", "second"}, extension.ExtensionUIDialogOptions{})
 		}, []string{"\r"}},
 		{"input", func(ui *ExtUIContext) (string, error) {
-			return ui.Input(context.Background(), "Your name", "name", nil)
+			return ui.Input(context.Background(), "Your name", "name", extension.ExtensionUIDialogOptions{})
 		}, []string{"\r"}},
 		{"editor", func(ui *ExtUIContext) (string, error) {
 			return ui.Editor(context.Background(), "Edit note", "start")
@@ -274,7 +274,7 @@ func TestTreeSelectorKeepsTheTranscript(t *testing.T) {
 	for i := range 60 {
 		m.chatContainer.Add(tui.NewText(fmt.Sprintf("transcript line %d", i)))
 	}
-	ts := tui.NewTreeSelect("Session tree", nil)
+	ts := tui.NewTreeSelectorComponent("Session tree", nil)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -308,7 +308,9 @@ func TestExtensionDialogCapScalesWithTerminalHeight(t *testing.T) {
 			m.chatContainer.Add(tui.NewText(fmt.Sprintf("transcript line %d", i)))
 		}
 		ui := &ExtUIContext{m: m}
-		go func() { _, _ = ui.Select(context.Background(), "Pick", []string{"a", "b"}, nil) }()
+		go func() {
+			_, _ = ui.Select(t.Context(), "Pick", []string{"a", "b"}, extension.ExtensionUIDialogOptions{})
+		}()
 		select {
 		case task := <-m.uiTaskCh:
 			task()
@@ -330,7 +332,9 @@ func TestExtensionDialogKeepsAFloorOnAShortTerminal(t *testing.T) {
 		m.chatContainer.Add(tui.NewText(fmt.Sprintf("line %d", i)))
 	}
 	ui := &ExtUIContext{m: m}
-	go func() { _, _ = ui.Select(context.Background(), "Pick", []string{"a", "b", "c"}, nil) }()
+	go func() {
+		_, _ = ui.Select(t.Context(), "Pick", []string{"a", "b", "c"}, extension.ExtensionUIDialogOptions{})
+	}()
 	select {
 	case task := <-m.uiTaskCh:
 		task()
@@ -357,7 +361,9 @@ func TestExtensionDialogCapIsRecomputedOnHeightChange(t *testing.T) {
 		m.chatContainer.Add(tui.NewText(fmt.Sprintf("line %d", i)))
 	}
 	ui := &ExtUIContext{m: m}
-	go func() { _, _ = ui.Select(context.Background(), "Pick", []string{"a", "b"}, nil) }()
+	go func() {
+		_, _ = ui.Select(t.Context(), "Pick", []string{"a", "b"}, extension.ExtensionUIDialogOptions{})
+	}()
 	select {
 	case task := <-m.uiTaskCh:
 		task()
@@ -384,7 +390,7 @@ func TestHeightChangesReachTheDialogCapWithoutSubprocessExtensions(t *testing.T)
 		t.Fatal("probe unexpectedly has a subprocess host")
 	}
 	m.chatContainer.SetMaxLines(staleChatCap)
-	m.extensionDialog = &extensionDialog{component: tui.NewText("dialog")}
+	m.extensionDialogs = []*extensionDialog{{component: tui.NewText("dialog"), handle: func(string) {}}}
 	m.onTerminalHeightChange(m.tuiInst.Height())
 	if got := len(m.chatContainer.Render(100)); got == staleChatCap {
 		t.Fatal("height change did not recompute the cap without a subprocess host")
@@ -406,7 +412,7 @@ func TestCancelledDialogRestoresTheTranscript(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := ui.Select(ctx, "Pick", []string{"a", "b"}, nil)
+		_, err := ui.Select(ctx, "Pick", []string{"a", "b"}, extension.ExtensionUIDialogOptions{})
 		done <- err
 	}()
 

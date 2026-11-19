@@ -1,5 +1,10 @@
 package extension
 
+import (
+	"context"
+	"encoding/json"
+)
+
 // RemoteEditor is an editor an extension installed with
 // ctx.ui.setEditorComponent, running in the extension's process. Pi puts the
 // factory's editor (typically a CustomEditor subclass) in place of its own:
@@ -22,7 +27,7 @@ type RemoteEditor interface {
 	AddToHistory(text string)
 	// Mouse delivers a left click on the editor rows to the editor's
 	// handleMouse, as Pi's fullscreen renderer does.
-	Mouse(event RemoteEditorMouseEvent)
+	Mouse(event RemoteMouseEvent)
 	// Configure applies host editor state to the editor: Pi copies the
 	// default editor's text, padding and autocomplete size when it installs
 	// the editor, and the TUI sets its focus.
@@ -34,23 +39,6 @@ type RemoteEditor interface {
 	Bind(host RemoteEditorHost)
 	// Close detaches the editor from the host.
 	Close()
-}
-
-// RemoteEditorMouseEvent is pi-tui's TuiMouseEvent, with the row relative to
-// the editor's first row.
-type RemoteEditorMouseEvent struct {
-	Type       string `json:"type"`
-	Button     string `json:"button"`
-	X          int    `json:"x"`
-	Y          int    `json:"y"`
-	ScreenX    int    `json:"screenX"`
-	ScreenY    int    `json:"screenY"`
-	Width      int    `json:"width"`
-	Height     int    `json:"height"`
-	Shift      bool   `json:"shift"`
-	Alt        bool   `json:"alt"`
-	Ctrl       bool   `json:"ctrl"`
-	ClickCount int    `json:"clickCount,omitempty"`
 }
 
 // RemoteEditorConfig is the host editor state an [RemoteEditor] mirrors.
@@ -123,4 +111,47 @@ type RemoteEditorHost interface {
 	// EditorClosed reports that the extension's editor is gone (its process
 	// ended); the host restores its own editor.
 	EditorClosed()
+}
+
+// RemoteEditorViewportHost is an optional [RemoteEditorHost] that takes the component's capturesViewportInput with each frame
+// (Component.capturesViewportInput in packages/tui/src/tui.ts). It is called before the frame's EditorFrame.
+type RemoteEditorViewportHost interface {
+	EditorCapturesViewportInput(captures bool)
+}
+
+// LiveRemoteEditor is a [RemoteEditor] that runs in the host's process and renders on demand: the host shows what RenderFrame returns at the width
+// of each render instead of the last frame the editor pushed.
+type LiveRemoteEditor interface {
+	RenderFrame(width int) []string
+}
+
+// DelegatedRemoteEditor is a RemoteEditor whose component subclasses the host's
+// stock editor, as a Pi extension's CustomEditor subclass extends the default
+// editor. The host keeps its own editor's text, history, completion and app-action handling and
+// the component reaches them through [RemoteEditorBaseHost].
+type DelegatedRemoteEditor interface {
+	Delegated() bool
+}
+
+// RemoteEditorInvalidator is a [RemoteEditor] whose component hears the TUI's invalidate(), which Pi sends every component it holds
+// when the theme changes, so a component that caches styled rows drops them.
+type RemoteEditorInvalidator interface {
+	Invalidate()
+}
+
+// RemoteEditorBaseHost is implemented by the [RemoteEditorHost] bound to a
+// [DelegatedRemoteEditor]. EditorBase runs one of the base editor's operations
+// on the host's owner loop and returns its JSON result: handleInput, handleMouse,
+// render, getText, getExpandedText, getLines, getCursor, setText,
+// insertTextAtCursor, addToHistory, setPaddingX, getPaddingX,
+// setAutocompleteMaxVisible, getAutocompleteMaxVisible, isShowingAutocomplete,
+// borderColor, getDisableSubmit, setDisableSubmit, getFocused, setFocused,
+// setAutocompleteProvider, onSubmit and onChange. An unknown operation is an error.
+//
+// handleInput takes the app actions the component handles itself (its onEscape, onCtrlD,
+// onPasteImage and actionHandlers) as "hooks": when the key is one of them the host
+// answers {"hook": <action>} without running the action, and the component runs its handler,
+// in the order Pi's CustomEditor.handleInput gives them.
+type RemoteEditorBaseHost interface {
+	EditorBase(ctx context.Context, op string, args json.RawMessage) (json.RawMessage, error)
 }

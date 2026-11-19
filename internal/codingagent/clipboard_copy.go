@@ -3,9 +3,7 @@ package codingagent
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"io"
 	"os"
@@ -15,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/nodespawn"
@@ -41,12 +41,18 @@ type clipboardCommandOptions struct {
 func runClipboardCommand(name string, args []string, options clipboardCommandOptions) (output []byte, ok bool) {
 	timeout := options.timeout
 	if timeout <= 0 {
-		timeout = 3 * time.Second
+		timeout = clipboardCommandTimeout
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := clipboardCommandDeadline(timeout)
 	defer cancel()
 	output, err := runClipboardCommandContext(ctx, name, args, options)
 	return output, err == nil
+}
+
+// clipboardCommandDeadline starts runClipboardCommand's timer: the context ends timeout after the call, as upstream's setTimeout(abort, timeoutMs). Tests replace it to fire the deadline themselves instead of racing process startup on a loaded host.
+var clipboardCommandDeadline = func(timeout time.Duration) (context.Context, context.CancelFunc) {
+	//portlint:allow ctxbackground clipboard-command.ts:30 setTimeout(abort, options?.timeoutMs ?? 3000) is the command's only abort; runClipboardCommand takes no signal from its callers
+	return context.WithTimeout(context.Background(), timeout)
 }
 
 // runClipboardCommandContext shares the bounded subprocess lifetime for clipboard readers and writers under the caller's deadline. A reader waits for the child to exit and every holder of its stdout to close it, even after a nonzero exit. A writer receives no output pipe to retain after daemonizing and succeeds when the child exits successfully. The deadline, parent cancellation, or output overflow kills the child and closes the parent's pipe end without joining any descendant that inherited stdin or stdout. Input strings use Node's UTF-8 encoding, replacing lone UTF-16 units.
@@ -58,8 +64,11 @@ func runClipboardCommandContext(parent context.Context, name string, args []stri
 	}
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
+	//nolint:gosec // G204 (class a): program and args are a clipboard helper from PiG's fixed table (pbcopy, clip, wl-copy, xclip, xsel, termux-clipboard-set and the readers); the text goes to stdin, never to argv.
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = "/"
 	hideClipboardWindow(cmd)
+	detachClipboardChild(cmd)
 	// The parent owns its pipe end as an *os.File and closes it itself, so Wait joins only the child and never a copy that a descendant holds open.
 	parentEnd, childEnd, err := clipboardPipe(options.input == nil)
 	if err != nil {
@@ -169,8 +178,9 @@ func copyToClipboard(text string) error {
 // screen.
 func CopyToClipboard(text string) error { return copyToClipboard(text) }
 
+// isRemoteSession is clipboard.ts isRemoteSession: an SSH or Mosh session, or PI_CLIPBOARD_OSC52=1 for a remote client that leaves no SSH variables (a multiplexer attached from another machine, a remote IDE daemon). Such a session emits OSC 52 after the local write.
 func (c clipboardCopier) isRemoteSession() bool {
-	return c.getenv("SSH_CONNECTION") != "" || c.getenv("SSH_CLIENT") != "" || c.getenv("MOSH_CONNECTION") != ""
+	return c.getenv("SSH_CONNECTION") != "" || c.getenv("SSH_CLIENT") != "" || c.getenv("MOSH_CONNECTION") != "" || c.getenv("PI_CLIPBOARD_OSC52") == "1"
 }
 
 // emitOSC52 uses Buffer.from(text) semantics: lone UTF-16 units become U+FFFD before base64 encoding and the size check.
@@ -179,7 +189,7 @@ func (c clipboardCopier) emitOSC52(text string) bool {
 	if len(encoded) > maxOSC52EncodedLength {
 		return false
 	}
-	_, _ = io.WriteString(c.stdout, "\x1b]52;c;"+encoded+"\x07")
+	tui.WriteToTerminal(c.stdout, "\x1b]52;c;"+encoded+"\x07")
 	return true
 }
 
@@ -208,9 +218,7 @@ func (c clipboardCopier) writerCommands() [][]string {
 // PowerShell reads the text from a file because clip.exe and PowerShell stdin
 // decode piped bytes with the console code page, which mangles UTF-8. The file uses Node's UTF-8 encoding, replacing lone UTF-16 units.
 func (c clipboardCopier) copyViaWindowsClipboard(text string) bool {
-	suffix := make([]byte, 16)
-	_, _ = rand.Read(suffix)
-	tmpFile := filepath.Join(c.tempDir(), "pi-wsl-clip-"+hex.EncodeToString(suffix)+".txt")
+	tmpFile := filepath.Join(c.tempDir(), "pi-wsl-clip-"+uuid.NewString()+".txt")
 	if err := os.WriteFile(tmpFile, jsstring.ToUTF8(text), 0o600); err != nil {
 		return false
 	}
@@ -272,9 +280,9 @@ func (c clipboardCopier) unavailableError(oversized bool) error {
 	switch {
 	case oversized:
 		return errors.New("Clipboard unavailable: text exceeds the OSC 52 size limit")
-	case c.platform != "linux":
 	case c.getenv("TERMUX_VERSION") != "":
 		return errors.New("Clipboard unavailable: install the Termux:API app and `termux-api` package")
+	case c.platform != "linux":
 	case c.getenv("WAYLAND_DISPLAY") != "":
 		return errors.New("Clipboard unavailable: install `wl-clipboard` (`wl-copy`) or check Wayland access")
 	case c.getenv("DISPLAY") != "":

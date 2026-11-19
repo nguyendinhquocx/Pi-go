@@ -171,7 +171,12 @@ func keepContextMessage(message map[string]any) bool {
 	return true
 }
 
-func (p *planMode) onBeforeAgentStart(_ sdk.Context, _ map[string]any) (any, error) {
+// onBeforeAgentStart injects the plan or execution context before a user prompt. Runs that a custom message starts, such as background
+// task notifications, skip it: the context from the last prompt is still in the conversation, and adding it on every notification would only repeat it.
+func (p *planMode) onBeforeAgentStart(_ sdk.Context, event map[string]any) (any, error) {
+	if event["messageType"] != "user" {
+		return nil, nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -281,7 +286,7 @@ func (p *planMode) onAgentEnd(ctx sdk.Context, data map[string]any) (any, error)
 	}
 
 	planMessage := p.planTodoListMessage()
-	choice, ok, err := ctx.Select("Plan mode - what next?", []string{
+	picked, ok, err := ctx.Select("Plan mode - what next?", []string{
 		"Execute the plan (track progress)",
 		"Stay in plan mode",
 		"Refine the plan",
@@ -289,6 +294,7 @@ func (p *planMode) onAgentEnd(ctx sdk.Context, data map[string]any) (any, error)
 	if err != nil || !ok {
 		return nil, err
 	}
+	choice, _ := picked.(string) // a client that answers a non-string matches no option
 	if strings.HasPrefix(choice, "Execute") {
 		first := p.todos[0]
 		p.enabled = false
@@ -323,7 +329,8 @@ After completing a step, include a [DONE:n] tag in your response.`, strings.Join
 		})
 	}
 	if choice == "Refine the plan" {
-		refinement, accepted, err := ctx.Editor("Refine the plan:", "")
+		edited, accepted, err := ctx.Editor("Refine the plan:", "")
+		refinement, _ := edited.(string)
 		refinement = jsTrim(refinement)
 		if err != nil || !accepted || refinement == "" {
 			return nil, err
@@ -430,7 +437,7 @@ func (p *planMode) updateStatus(ctx sdk.Context) error {
 	case p.enabled:
 		ctx.SetStatus("plan-mode", "⏸ plan")
 	default:
-		ctx.SetStatus("plan-mode", "")
+		ctx.ClearStatus("plan-mode")
 	}
 
 	if p.executing && len(p.todos) > 0 {

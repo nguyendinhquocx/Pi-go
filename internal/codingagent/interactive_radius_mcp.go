@@ -1,3 +1,5 @@
+//go:build !pig_strip_mcp
+
 package codingagent
 
 // Ports packages/coding-agent/src/modes/interactive/interactive-mode.ts (offerRadiusMcpServer).
@@ -13,6 +15,8 @@ import (
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/mcpext"
 	"github.com/MichaelKinsy/PiG/internal/orderedjson"
+	"github.com/MichaelKinsy/PiG/internal/pigstrip"
+	"github.com/MichaelKinsy/PiG/internal/text"
 	"github.com/MichaelKinsy/PiG/tui"
 )
 
@@ -23,6 +27,10 @@ var RadiusMcpURL = ai.NormalizeRadiusGatewayURL(ai.DefaultRadiusGateway) + "/mcp
 // server when missing. Nothing is asked when a global server already uses this login. Mirrors Pi's
 // offerRadiusMcpServer (interactive-mode.ts:6292-6343).
 func (m *InteractiveMode) offerRadiusMcpServer(providerID, providerName string) {
+	// pig additive (D92): a runtime stripped mcp offers nothing, like a build without it (interactive_radius_mcp_stripped.go).
+	if pigstrip.Has(pigstrip.ListExtensions, "mcp") {
+		return
+	}
 	mcpPath := filepath.Join(m.opts.AgentDir, "mcp.json")
 	normalizeURL := func(url string) string { return strings.TrimRight(url, "/") }
 	servers := mcpext.LoadMcpConfig(mcpext.LoadOptions{AgentDir: m.opts.AgentDir, Cwd: m.opts.CWD, ProjectTrusted: false}).Servers
@@ -40,26 +48,37 @@ func (m *InteractiveMode) offerRadiusMcpServer(providerID, providerName string) 
 		name = "radius-mcp"
 	}
 	config, err := radiusMcpServerConfig(mcpPath, name, index >= 0, providerID)
+	// This runs on the login's goroutine, which is not the owner loop when the login was started off it; the chat container and the status line are the
+	// loop's alone (Pi's TUI is single-threaded), so every use of them goes through the loop. On the loop itself the work runs in place.
+	ctx := m.loginContext()
+	onMain := func(work func()) {
+		_ = m.runOnMainAndWait(ctx, func() error {
+			work()
+			return nil
+		})
+	}
 	if err != nil {
-		m.showError(fmt.Sprintf("Could not update %s: %v", mcpPath, err))
+		onMain(func() { m.showError(fmt.Sprintf("Could not update %s: %v", mcpPath, err)) })
 		return
 	}
 
-	selector := tui.NewExtensionSelector(fmt.Sprintf("Configure %s MCP in %s?", providerName, mcpPath), []string{"Yes", "No"})
+	selector := tui.NewExtensionSelectorComponent(fmt.Sprintf("Configure %s MCP in %s?", providerName, mcpPath), []string{"Yes", "No"}, nil, nil)
 	index, ok := m.runEditorSlotExtensionSelector(selector)
 	if !ok || index != 0 {
 		return
 	}
 	if _, err := mcpext.AddMcpServerConfigJSON(mcpPath, name, config); err != nil {
-		m.showError(fmt.Sprintf("Could not update %s: %v", mcpPath, err))
+		onMain(func() { m.showError(fmt.Sprintf("Could not update %s: %v", mcpPath, err)) })
 		return
 	}
 	// The MCP extension reads mcp.json when the session starts. Pi runs its /reload handler directly
 	// (interactive-mode.ts:6334 handleReloadCommand), not the slash command an extension may override.
-	if err := reloadHandler(m.buildSlashContext(m.loginContext())); err != nil {
-		m.showError(err.Error())
-	}
-	m.tuiInst.Render()
+	onMain(func() {
+		if err := reloadHandler(m.buildSlashContext(ctx)); err != nil {
+			m.showError(err.Error())
+		}
+		m.tuiInst.Render()
+	})
 }
 
 // radiusMcpServerConfig is the server entry that uses the Radius login: an existing entry keeps its members in order
@@ -94,7 +113,8 @@ func globalMcpServerJSON(mcpPath, name string) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	parsed, err := orderedjson.Parse(data)
+	// Pi reads this file through loadMcpConfig, which strips a UTF-8 BOM (config.ts readConfigFile, #11191).
+	parsed, err := orderedjson.Parse(text.StripBomBytes(data))
 	if err != nil {
 		return nil, err
 	}

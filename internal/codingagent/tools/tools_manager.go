@@ -29,7 +29,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -38,8 +37,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/managementhttp"
 	"github.com/MichaelKinsy/PiG/internal/nodespawn"
+	"github.com/MichaelKinsy/PiG/internal/nodeurl"
+	_ "github.com/MichaelKinsy/PiG/internal/tlsdistrust" // hardens http.DefaultTransport, which the tool downloads use (pig additive (D191))
 )
 
 const (
@@ -54,14 +57,13 @@ type toolConfig struct {
 	BinaryName        string   // Name of the binary inside the archive
 	SystemBinaryNames []string // Alternative system command names to try
 	TagPrefix         string   // Prefix for tags ("v" or "")
-	// GetAssetName returns the release asset filename, or "" if the
-	// platform/arch combo is unsupported. Matches upstream
-	// (version, plat, architecture) → string|null.
-	GetAssetName func(version, plat, arch string) string
+	// GetAssetName returns the release asset filename for a release target
+	// (releaseTarget's suffix). Matches upstream (version, target) → string.
+	GetAssetName func(version, target string) string
 }
 
 // toolsTable selects fd and rg release archives for each platform.
-// Linux fd and arm64 rg currently select GNU archives; Linux x64 rg selects musl.
+// Linux selects the musl archive for both tools on every architecture.
 var toolsTable = map[string]toolConfig{
 	"fd": {
 		Name:              "fd",
@@ -69,51 +71,39 @@ var toolsTable = map[string]toolConfig{
 		BinaryName:        "fd",
 		SystemBinaryNames: []string{"fd", "fdfind"},
 		TagPrefix:         "v",
-		GetAssetName: func(version, plat, architecture string) string {
-			switch plat {
-			case "darwin":
-				return fmt.Sprintf("fd-v%s-%s-apple-darwin.tar.gz", version, archStr(architecture))
-			case "linux":
-				return fmt.Sprintf("fd-v%s-%s-unknown-linux-gnu.tar.gz", version, archStr(architecture))
-			case "windows", "win32":
-				return fmt.Sprintf("fd-v%s-%s-pc-windows-msvc.zip", version, archStr(architecture))
-			}
-			return ""
-		},
+		GetAssetName:      func(version, target string) string { return "fd-v" + version + "-" + target },
 	},
 	"rg": {
-		Name:       "ripgrep",
-		Repo:       "BurntSushi/ripgrep",
-		BinaryName: "rg",
-		TagPrefix:  "",
-		GetAssetName: func(version, plat, architecture string) string {
-			switch plat {
-			case "darwin":
-				return fmt.Sprintf("ripgrep-%s-%s-apple-darwin.tar.gz", version, archStr(architecture))
-			case "linux":
-				if architecture == "arm64" {
-					return fmt.Sprintf("ripgrep-%s-aarch64-unknown-linux-gnu.tar.gz", version)
-				}
-				return fmt.Sprintf("ripgrep-%s-x86_64-unknown-linux-musl.tar.gz", version)
-			case "windows", "win32":
-				return fmt.Sprintf("ripgrep-%s-%s-pc-windows-msvc.zip", version, archStr(architecture))
-			}
-			return ""
-		},
+		Name:         "ripgrep",
+		Repo:         "BurntSushi/ripgrep",
+		BinaryName:   "rg",
+		TagPrefix:    "",
+		GetAssetName: func(version, target string) string { return "ripgrep-" + version + "-" + target },
 	},
 }
 
-// archStr maps Go GOARCH (or Node's arch) values to upstream's tuple form.
-// upstream Node arch: "arm64" → "aarch64", "x64" → "x86_64".
-// Go GOARCH: "arm64" → "aarch64", "amd64" → "x86_64".
-func archStr(architecture string) string {
+// releaseTarget mirrors upstream getReleaseTarget: the release target suffix shared by fd and ripgrep, or ""
+// when the platform or architecture has no prebuilt archive. Only x64 and arm64 are mapped; any other
+// architecture (ARM32, ia32, riscv64) must not fall back to an x86-64 binary (Pi #11209).
+func releaseTarget(plat, architecture string) string {
+	var archStr string
 	switch architecture {
 	case "arm64", "aarch64":
-		return "aarch64"
-	case "amd64", "x64", "x86_64":
-		return "x86_64"
+		archStr = "aarch64"
+	case "x64", "amd64", "x86_64":
+		archStr = "x86_64"
+	default:
+		return ""
 	}
-	return architecture
+	switch plat {
+	case "darwin":
+		return archStr + "-apple-darwin.tar.gz"
+	case "linux":
+		return archStr + "-unknown-linux-musl.tar.gz"
+	case "windows", "win32":
+		return archStr + "-pc-windows-msvc.zip"
+	}
+	return ""
 }
 
 // termuxPackages mirrors upstream TERMUX_PACKAGES (tools-manager.ts:339).
@@ -146,7 +136,7 @@ type ToolsManager struct {
 	platformOverride string
 	archOverride     string
 
-	// beforeInflightLock, when set by a test, runs after EnsureTool's first
+	// beforeInflightLock, when set by a test, runs after BeginEnsureTool's first
 	// installed-tool lookup misses and before it takes the in-flight lock.
 	beforeInflightLock func(tool string)
 }
@@ -233,30 +223,40 @@ type ToolStatus struct {
 
 // EnsureTool mirrors upstream ensureTool: it returns the tool's path, or "" when unavailable. It reports progress and failures through onStatus (nil discards them), never writes to the console, and includes up to five distinct cause messages in download warnings.
 func (m *ToolsManager) EnsureTool(ctx context.Context, tool string, onStatus func(ToolStatus)) string {
-	report := func(kind, message string) {
-		if onStatus != nil {
-			onStatus(ToolStatus{Type: kind, Message: message})
-		}
+	path, download := m.BeginEnsureTool(tool, onStatus)
+	if download == nil {
+		return path
 	}
+	return download(ctx, onStatus)
+}
+
+// BeginEnsureTool runs upstream ensureTool up to its first await on the caller: it resolves a present tool, reports why a missing one is not downloaded, or reports that its download starts. download is nil when ensureTool settles without awaiting; otherwise the caller must call it, and it finishes the download (or waits for this manager's download of the same tool) and reports the result through its onStatus.
+func (m *ToolsManager) BeginEnsureTool(tool string, onStatus func(ToolStatus)) (path string, download func(ctx context.Context, onStatus func(ToolStatus)) string) {
 	if existing := m.GetToolPath(tool); existing != "" {
-		return existing
+		return existing, nil
 	}
 	config, ok := toolsTable[tool]
 	if !ok {
-		return ""
+		return "", nil
 	}
 
 	if IsOfflineModeEnabled() {
-		report("warning", config.Name+" not found. Offline mode enabled, skipping download.")
-		return ""
+		reportToolStatus(onStatus, "warning", config.Name+" not found. Offline mode enabled, skipping download.")
+		return "", nil
 	}
 	if m.platform() == "android" {
 		pkg := termuxPackages[tool]
 		if pkg == "" {
 			pkg = tool
 		}
-		report("warning", config.Name+" not found. Install with: pkg install "+pkg)
-		return ""
+		reportToolStatus(onStatus, "warning", config.Name+" not found. Install with: pkg install "+pkg)
+		return "", nil
+	}
+
+	// Prebuilt downloads only exist for the targets mapped in releaseTarget.
+	if releaseTarget(m.platform(), m.arch()) == "" {
+		reportToolStatus(onStatus, "warning", fmt.Sprintf("%s not found. Automatic download is not supported on %s/%s. Install %s with your system package manager.", config.Name, m.platform(), m.arch(), config.Name))
+		return "", nil
 	}
 
 	// pig additive (D81): coalesce same-tool downloads within this manager.
@@ -266,38 +266,48 @@ func (m *ToolsManager) EnsureTool(ctx context.Context, tool string, onStatus fun
 	m.mu.Lock()
 	if ch, busy := m.inflight[tool]; busy {
 		m.mu.Unlock()
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			return ""
+		return "", func(ctx context.Context, _ func(ToolStatus)) string {
+			select {
+			case <-ch:
+			case <-ctx.Done():
+				return ""
+			}
+			return m.GetToolPath(tool)
 		}
-		return m.GetToolPath(tool)
 	}
 	// A download that finished after the check above has already installed
 	// the tool and cleared its in-flight entry; look again under the lock so
 	// a late caller uses that install instead of downloading it a second time.
 	if existing := m.GetToolPath(tool); existing != "" {
 		m.mu.Unlock()
-		return existing
+		return existing, nil
 	}
 	ch := make(chan struct{})
 	m.inflight[tool] = ch
 	m.mu.Unlock()
-	defer func() {
-		m.mu.Lock()
-		delete(m.inflight, tool)
-		close(ch)
-		m.mu.Unlock()
-	}()
 
-	report("info", config.Name+" not found. Downloading...")
-	path, err := m.downloadTool(ctx, tool)
-	if err != nil {
-		report("warning", "Failed to download "+config.Name+": "+toolFailureMessage(err))
-		return ""
+	reportToolStatus(onStatus, "info", config.Name+" not found. Downloading...")
+	return "", func(ctx context.Context, onStatus func(ToolStatus)) string {
+		defer func() {
+			m.mu.Lock()
+			delete(m.inflight, tool)
+			close(ch)
+			m.mu.Unlock()
+		}()
+		path, err := m.downloadTool(ctx, tool)
+		if err != nil {
+			reportToolStatus(onStatus, "warning", "Failed to download "+config.Name+": "+toolFailureMessage(err))
+			return ""
+		}
+		reportToolStatus(onStatus, "info", config.Name+" installed to "+path)
+		return path
 	}
-	report("info", config.Name+" installed to "+path)
-	return path
+}
+
+func reportToolStatus(onStatus func(ToolStatus), kind, message string) {
+	if onStatus != nil {
+		onStatus(ToolStatus{Type: kind, Message: message})
+	}
 }
 
 // toolFailureMessage joins distinct cause messages in order. Go wrappers often already append their cause text; remove that suffix before joining so the same cause is not printed twice.
@@ -322,13 +332,15 @@ func toolFailureMessage(err error) string {
 // Duplicated here (instead of imported from cmd/pig) because tools is a
 // lower-level package that cannot depend on the CLI.
 func IsOfflineModeEnabled() bool {
-	for _, key := range []string{"PIG_OFFLINE", "PI_OFFLINE"} {
-		v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
-		if v == "1" || v == "true" || v == "yes" {
+	// tools-manager.ts compares PI_OFFLINE exactly; PIG_OFFLINE is PiG's alias.
+	if v := os.Getenv("PI_OFFLINE"); v != "" {
+		l := jsstring.ToLower(v)
+		if v == "1" || l == "true" || l == "yes" {
 			return true
 		}
 	}
-	return false
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("PIG_OFFLINE")))
+	return v == "1" || v == "true" || v == "yes"
 }
 
 // getLatestVersion mirrors upstream getLatestVersion (tools-manager.ts). It
@@ -340,7 +352,8 @@ func (m *ToolsManager) getLatestVersion(ctx context.Context, repo string) (strin
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", "pig-coding-agent")
+	// tools-manager.ts getLatestVersion sends getPiUserAgent(VERSION), the detailed identity User-Agent (D65).
+	req.Header.Set("User-Agent", ai.FormatUserAgent(nil))
 	// redirect: "manual": only the status and Location matter.
 	client := *m.httpClient
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
@@ -366,18 +379,19 @@ func (m *ToolsManager) getLatestVersion(ctx context.Context, repo string) (strin
 // Location against https://github.com, take the last path segment, and require
 // a /releases/tag/ target.
 func latestReleaseTagVersion(repo, location string) (string, error) {
-	ref, err := url.Parse(location)
+	resolved, err := nodeurl.ResolveURL(location, "https://github.com")
 	if err != nil {
 		return "", err
 	}
-	resolved := (&url.URL{Scheme: "https", Host: "github.com", Path: "/"}).ResolveReference(ref)
-	segments := strings.Split(resolved.EscapedPath(), "/")
-	tag, err := url.PathUnescape(segments[len(segments)-1])
-	if err != nil {
-		return "", err
-	}
-	if tag == "" || !strings.Contains(location, "/releases/tag/") {
+	pathname := resolved.Pathname
+	segments := strings.Split(pathname, "/")
+	last := segments[len(segments)-1]
+	if last == "" || !strings.Contains(location, "/releases/tag/") {
 		return "", fmt.Errorf("Failed to resolve latest %s release: unexpected redirect to %s", repo, location)
+	}
+	tag, err := nodeurl.DecodeURIComponent(last)
+	if err != nil {
+		return "", err
 	}
 	return strings.TrimPrefix(tag, "v"), nil
 }
@@ -530,20 +544,22 @@ func (m *ToolsManager) downloadTool(ctx context.Context, tool string) (string, e
 	}
 	plat := m.platform()
 	architecture := m.arch()
-
-	version, err := m.getLatestVersion(ctx, config.Repo)
-	if err != nil {
-		return "", err
-	}
-	// fd uses upstream's pinned darwin/x64 release.
-	if tool == "fd" && plat == "darwin" && architecture == "x64" {
-		version = "10.3.0"
-	}
-
-	assetName := config.GetAssetName(version, plat, architecture)
-	if assetName == "" {
+	target := releaseTarget(plat, architecture)
+	if target == "" {
 		return "", fmt.Errorf("Unsupported platform: %s/%s", plat, architecture)
 	}
+
+	// fd is pinned on darwin/x64, so skip the version lookup there.
+	version := "10.3.0"
+	if tool != "fd" || plat != "darwin" || architecture != "x64" {
+		var err error
+		version, err = m.getLatestVersion(ctx, config.Repo)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	assetName := config.GetAssetName(version, target)
 
 	if err := os.MkdirAll(m.BinDir(), 0o755); err != nil {
 		return "", err

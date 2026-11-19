@@ -3,7 +3,6 @@ package session_test
 import (
 	"testing"
 
-	"github.com/MichaelKinsy/PiG/chord"
 	"github.com/MichaelKinsy/PiG/chord/delta"
 	"github.com/MichaelKinsy/PiG/durable"
 	"github.com/MichaelKinsy/PiG/durable/session"
@@ -25,39 +24,41 @@ type definitionState struct {
 
 var (
 	definitionSessionDoc = durable.DefineDoc(durable.DocDefinition[definitionState]{
-		CommonDocDefinition: durable.CommonDocDefinition[definitionState]{Kind: "t.session", Version: 1},
+		CommonDocDefinition: durable.CommonDocDefinition[definitionState]{Kind: "t.session", Version: 1, Initial: func() definitionState { return definitionState{} }, CheckpointWhen: func(definitionState, []durable.Op, durable.CheckpointInfo) bool { return false }},
 		DocumentSemantics:   sessionScope,
-		Initial:             func() definitionState { return definitionState{} },
 	})
 	definitionLatestDoc = durable.DefineDoc(durable.DocDefinition[definitionState]{
-		CommonDocDefinition: durable.CommonDocDefinition[definitionState]{Kind: "t.latest", Version: 1},
+		CommonDocDefinition: durable.CommonDocDefinition[definitionState]{Kind: "t.latest", Version: 1, Initial: func() definitionState { return definitionState{} }, CheckpointWhen: func(definitionState, []durable.Op, durable.CheckpointInfo) bool { return false }},
 		DocumentSemantics:   latestScope(durable.ForkCurrent),
-		Initial:             func() definitionState { return definitionState{} },
 	})
 	definitionRewindableDoc = durable.DefineDoc(durable.DocDefinition[definitionState]{
-		CommonDocDefinition: durable.CommonDocDefinition[definitionState]{Kind: "t.rewindable", Version: 1},
+		CommonDocDefinition: durable.CommonDocDefinition[definitionState]{Kind: "t.rewindable", Version: 1, Initial: func() definitionState { return definitionState{} }, CheckpointWhen: func(definitionState, []durable.Op, durable.CheckpointInfo) bool { return false }},
 		DocumentSemantics:   rewindableScope(durable.ForkAsOf),
-		Initial:             func() definitionState { return definitionState{} },
 	})
 	definitionTaskDoc = durable.DefineDoc(durable.DocDefinition[definitionState]{
-		CommonDocDefinition: durable.CommonDocDefinition[definitionState]{Kind: "t.task", Version: 1},
+		CommonDocDefinition: durable.CommonDocDefinition[definitionState]{Kind: "t.task", Version: 1, Initial: func() definitionState { return definitionState{} }, CheckpointWhen: func(definitionState, []durable.Op, durable.CheckpointInfo) bool { return false }},
 		DocumentSemantics:   taskScope,
-		Initial:             func() definitionState { return definitionState{} },
 	})
 	definitionSessionFamily = durable.DefineDocFamily(durable.DocFamilyDefinition[definitionState, float64]{
-		CommonDocDefinition: durable.CommonDocDefinition[definitionState]{Kind: "t.session-family", Version: 1},
-		DocumentSemantics:   sessionScope,
-		Initial:             func(seed float64) definitionState { return definitionState{Value: seed} },
+		Family: true,
+		Kind:   "t.session-family", Version: 1,
+		DocumentSemantics: sessionScope,
+		Initial:           func(seed float64) definitionState { return definitionState{Value: seed} },
+		CheckpointWhen:    func(definitionState, []durable.Op, durable.CheckpointInfo) bool { return false },
 	})
 	definitionConversationFamily = durable.DefineDocFamily(durable.DocFamilyDefinition[definitionState, float64]{
-		CommonDocDefinition: durable.CommonDocDefinition[definitionState]{Kind: "t.conversation-family", Version: 1},
-		DocumentSemantics:   rewindableScope(durable.ForkInitial),
-		Initial:             func(seed float64) definitionState { return definitionState{Value: seed} },
+		Family: true,
+		Kind:   "t.conversation-family", Version: 1,
+		DocumentSemantics: rewindableScope(durable.ForkInitial),
+		Initial:           func(seed float64) definitionState { return definitionState{Value: seed} },
+		CheckpointWhen:    func(definitionState, []durable.Op, durable.CheckpointInfo) bool { return false },
 	})
 	definitionTaskFamily = durable.DefineDocFamily(durable.DocFamilyDefinition[definitionState, float64]{
-		CommonDocDefinition: durable.CommonDocDefinition[definitionState]{Kind: "t.task-family", Version: 1},
-		DocumentSemantics:   taskScope,
-		Initial:             func(seed float64) definitionState { return definitionState{Value: seed} },
+		Family: true,
+		Kind:   "t.task-family", Version: 1,
+		DocumentSemantics: taskScope,
+		Initial:           func(seed float64) definitionState { return definitionState{Value: seed} },
+		CheckpointWhen:    func(definitionState, []durable.Op, durable.CheckpointInfo) bool { return false },
 	})
 )
 
@@ -79,9 +80,6 @@ var (
 	_ = func(kernel *session.SessionImpl, tx durable.Tx, conversationId durable.ConversationId, at durable.EntryId) {
 		_ = keep[*definitionState](durable.Snapshot(ctx, kernel, definitionLatestDoc, conversationId))
 		_ = keep[*definitionState](durable.SnapshotAsOf(ctx, kernel, definitionRewindableDoc, at, conversationId))
-		var state *chord.AttachedReplicatedState[obj]
-		state, _ = kernel.DocumentStateErased(ctx, definitionSessionDoc)
-		_ = state
 		var watch durable.WatchHandle[obj]
 		watch, _ = kernel.WatchDocErased(ctx, definitionSessionDoc)
 		_ = watch
@@ -102,13 +100,30 @@ var (
 func TestDocumentDefinitions(t *testing.T) {
 	t.Run("validates persisted version semantics", func(t *testing.T) {
 		expectPanic(t, "positive integer", func() {
-			durable.DefineDoc(durable.DocDefinition[obj]{CommonDocDefinition: durable.CommonDocDefinition[obj]{Kind: "k", Version: 0}, DocumentSemantics: sessionScope})
+			durable.DefineDoc(durable.DocDefinition[obj]{CommonDocDefinition: durable.CommonDocDefinition[obj]{Kind: "k", Version: 0, CheckpointWhen: func(obj, []durable.Op, durable.CheckpointInfo) bool { return false }}, DocumentSemantics: sessionScope})
 		})
 		// Upstream also rejects version 1.5 at run time; a Go int version cannot hold a fraction, so the compiler does.
-		testenv.ExpectTypeError(t, "a fractional version", definitionImports, `_ = d.CommonDocDefinition[struct{}]{Kind: "k", Version: 1.5}`)
-		empty := durable.DefineDoc(durable.DocDefinition[obj]{CommonDocDefinition: durable.CommonDocDefinition[obj]{Kind: "", Version: 1}, DocumentSemantics: sessionScope})
+		testenv.ExpectTypeError(t, "a fractional version", definitionImports, `_ = d.CommonDocDefinition[struct{}]{Kind: "k", Version: 1.5, CheckpointWhen: func(struct{}, []durable.Op, durable.CheckpointInfo) bool { return false }}`)
+		empty := durable.DefineDoc(durable.DocDefinition[obj]{CommonDocDefinition: durable.CommonDocDefinition[obj]{Kind: "", Version: 1, CheckpointWhen: func(obj, []durable.Op, durable.CheckpointInfo) bool { return false }}, DocumentSemantics: sessionScope})
 		if empty.AnyDefinition().Kind != "" || definitionSessionDoc.AnyDefinition().Kind != "t.session" {
 			t.Fatal("kinds are kept as defined")
+		}
+	})
+
+	// documents.ts:31-34 FamilyInput requires `family: true`, and resolveAddress (documents.ts) reads the erased flag to take a family key after the owner.
+	t.Run("defines a family only with the family literal and keeps it on every scope's token", func(t *testing.T) {
+		expectPanic(t, "family must be true", func() {
+			durable.DefineDocFamily(durable.DocFamilyDefinition[definitionState, float64]{
+				Kind: "t.nofamily", Version: 1,
+				DocumentSemantics: sessionScope,
+				Initial:           func(float64) definitionState { return definitionState{} },
+				CheckpointWhen:    func(definitionState, []durable.Op, durable.CheckpointInfo) bool { return false },
+			})
+		})
+		for name, token := range map[string]durable.AnyDocToken{"session": definitionSessionFamily, "conversation": definitionConversationFamily, "task": definitionTaskFamily} {
+			if !token.AnyDefinition().Family {
+				t.Errorf("%s family token's erased definition is not a family", name)
+			}
 		}
 	})
 
@@ -118,7 +133,7 @@ func TestDocumentDefinitions(t *testing.T) {
 		var taskId durable.TaskId
 		commit(t, harness.Session, func(tx durable.Tx) error {
 			var err error
-			taskId, err = durable.CreateTask(tx, workTask, obj{"path": "a"}, conversationOwned(conversationId))
+			taskId, err = durable.CreateTask(tx, workTask, delta.JsonObjectOf("path", "a"), conversationOwned(conversationId))
 			must(t, err)
 			for _, access := range []struct {
 				token durable.AnyDocToken
@@ -244,7 +259,7 @@ _, _ = d.TxAppendEntry(tx, marker, 1, d.TypedEntryDraft[int]{Data: 1})`)
 		taskId := durable.TaskId(0)
 		commit(t, harness.Session, func(tx durable.Tx) error {
 			var err error
-			taskId, err = durable.CreateTask(tx, workTask, obj{"path": "a"}, conversationOwned(conversationId))
+			taskId, err = durable.CreateTask(tx, workTask, delta.JsonObjectOf("path", "a"), conversationOwned(conversationId))
 			return err
 		})
 
@@ -265,19 +280,13 @@ _, _ = d.TxAppendEntry(tx, marker, 1, d.TypedEntryDraft[int]{Data: 1})`)
 			t.Fatalf("session document = %+v, want value 7", value)
 		}
 
-		// session.watchDoc(SessionDoc, conversationId, context) and documentState: the owner is not read.
+		// session.watchDoc(SessionDoc, conversationId, context): the owner is not read.
 		watch, err := harness.Session.WatchDocErased(ctx, definitionSessionDoc, conversationId)
 		must(t, err)
-		if watch == nil || watch.Value()["value"] != float64(7) {
+		if watch == nil || watch.Value().Value("value") != float64(7) {
 			t.Fatalf("watch of a Session document with an owner argument = %v", watch)
 		}
 		_, _ = watch.Stop()
-		state, err := harness.Session.DocumentStateErased(ctx, definitionSessionDoc, conversationId)
-		must(t, err)
-		if state == nil || state.Value()["value"] != float64(7) {
-			t.Fatalf("state of a Session document with an owner argument = %v", state)
-		}
-		state.Dispose()
 
 		// tx.doc(SessionFamily, "k"): no seed is `undefined` upstream, which copyJson rejects; nothing is created.
 		err = tryCommit(harness.Session, func(tx durable.Tx) error {

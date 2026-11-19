@@ -13,6 +13,7 @@ impl Drop for Lease {
                 method: "provider.release".into(),
                 args: Some(json!({"handle":self.handle,"token":self.token})),
                 parent_request_id: None,
+                timer: false,
             }),
             ..Default::default()
         });
@@ -65,6 +66,7 @@ impl Proxy {
                 method: "cancelModelStream".into(),
                 args: Some(json!({"streamId":id})),
                 parent_request_id: None,
+                timer: false,
             }),
             ..Default::default()
         });
@@ -141,11 +143,15 @@ impl Proxy {
                 }),
             );
         }
-        if let Some(callback) = options.transform_headers {
-            names.push("transformHeaders");
+        if let Some(callback) = options.on_provider_stream_event {
+            names.push("onProviderStreamEvent");
+            let model = model.clone();
             callbacks.insert(
-                "transformHeaders".into(),
-                Arc::new(move |args| callback(args["value"].clone())),
+                "onProviderStreamEvent".into(),
+                Arc::new(move |args| {
+                    callback(args["value"].clone(), model.clone())?;
+                    Ok(Value::Null)
+                }),
             );
         }
         let mut params = json!({"model":model.as_ref(),"options":options.values,"callbacks":names,"aborted":options.signal.is_cancelled()});
@@ -245,12 +251,11 @@ impl ProviderObjects {
             .to_owned();
         let id = decl["id"].as_str().ok_or("missing Provider id")?.to_owned();
         let mut proxies = self.proxies.lock().unwrap();
-        if let Some((current, weak)) = proxies.get(&id) {
-            if current == &handle {
-                if let Some(provider) = weak.upgrade() {
-                    return Ok(provider);
-                }
-            }
+        if let Some((current, weak)) = proxies.get(&id)
+            && current == &handle
+            && let Some(provider) = weak.upgrade()
+        {
+            return Ok(provider);
         }
         let lease = Arc::new(Lease {
             conn: conn.clone(),
@@ -348,11 +353,23 @@ impl ProviderObjects {
                     .map(str::to_owned),
                 login: {
                     let proxy = proxy.clone();
-                    Arc::new(move |input| {
+                    Arc::new(move |input, options: crate::provider::LoginOptions| {
+                        let mut wire = serde_json::Map::new();
+                        let mut callbacks = interaction_callbacks(&input);
+                        if let Some(get_device_id) = options.get_device_id {
+                            wire.insert("getDeviceId".into(), json!(true));
+                            callbacks.insert(
+                                "getDeviceId".into(),
+                                Arc::new(move |_| Ok(json!(get_device_id()?))),
+                            );
+                        }
+                        if let Some(agent_name) = options.agent_name {
+                            wire.insert("agentName".into(), json!(agent_name));
+                        }
                         proxy.invoke(
                             "auth.oauth.login",
-                            json!({}),
-                            interaction_callbacks(&input),
+                            json!({"options": wire}),
+                            callbacks,
                             input.signal,
                         )
                     })
@@ -424,6 +441,48 @@ impl ProviderObjects {
             } else {
                 None
             },
+            filter_all_models: if has("filterAllModels") {
+                let proxy = proxy.clone();
+                Some(Arc::new(move |models: &[ProviderModel], credential| {
+                    let result=proxy.plain("filterAllModels",json!({"models":models.iter().map(|m|m.as_ref()).collect::<Vec<_>>(),"credential":credential}))?;
+                    let mut filtered = Vec::new();
+                    for (i, model) in result["models"]
+                        .as_array()
+                        .ok_or("filterAllModels result must be an array")?
+                        .iter()
+                        .enumerate()
+                    {
+                        if let Some(index) = result["indices"][i].as_u64() {
+                            filtered.push(
+                                models
+                                    .get(index as usize)
+                                    .ok_or("filterAllModels index out of range")?
+                                    .clone(),
+                            )
+                        } else {
+                            filtered.push(Arc::new(model.clone()))
+                        }
+                    }
+                    Ok(filtered)
+                }))
+            } else {
+                None
+            },
+            get_all_models: if has("getAllModels") {
+                let proxy = proxy.clone();
+                Some(Arc::new(move || {
+                    Ok(proxy
+                        .plain("getAllModels", json!({}))?
+                        .as_array()
+                        .ok_or("getAllModels must return an array")?
+                        .iter()
+                        .cloned()
+                        .map(Arc::new)
+                        .collect())
+                }))
+            } else {
+                None
+            },
             refresh_models: if has("refreshModels") {
                 let proxy = proxy.clone();
                 Some(Arc::new(move |input: RefreshModelsContext| {
@@ -448,7 +507,11 @@ impl ProviderObjects {
                             })?))
                         }),
                     );
-                    proxy.invoke("refreshModels",json!({"credential":input.credential,"stored":input.stored,"allowNetwork":input.allow_network,"force":input.force}),callbacks,input.signal)?;
+                    let mut params = json!({"credential":input.credential,"stored":input.stored,"allowNetwork":input.allow_network,"force":input.force});
+                    if let Some(base_url) = &input.base_url {
+                        params["baseUrl"] = json!(base_url);
+                    }
+                    proxy.invoke("refreshModels", params, callbacks, input.signal)?;
                     Ok(())
                 }))
             } else {

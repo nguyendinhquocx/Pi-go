@@ -14,7 +14,7 @@ import (
 func TestContextSessionIdentityAcrossSDKs(t *testing.T) {
 	t.Parallel()
 	cases := allHarnessCases()
-	for _, language := range []string{"go", "rust", "python"} {
+	for _, language := range []string{"go", "rust", "python", "lisp"} {
 		cases = append(cases, harnessCase{name: "packed-" + language, make: func(t *testing.T) *harness { return makePackedUIHarness(t, language) }})
 	}
 	for _, tc := range cases {
@@ -58,7 +58,7 @@ func TestContextSessionIdentityAcrossSDKs(t *testing.T) {
 				}
 				// Pi's getSessionFile is `string | undefined` and getLeafId is `string | null`: an in-memory or empty session is absent (JSON null), not an empty string.
 				leaf := ""
-				if value := reference.LeafID(); value != nil {
+				if value := reference.GetLeafID(); value != nil {
 					leaf = *value
 				}
 				id := reference.GetSessionId()

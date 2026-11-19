@@ -38,18 +38,80 @@ type nestedCall struct {
 	cancel context.CancelFunc
 }
 
-// reserveNestedCall reserves call when it is an executeTool call and returns the function that ends the reservation after the call ran or was dropped. Other calls get a no-op.
+// reserveNestedCall reserves call when it is a dialog that carries a dialogId, an executeTool, builtinTool.execute or builtinTool.localExec call, or an exec call whose signal the extension owns, and returns the function that ends the reservation after the call ran or was dropped. Other calls get a no-op. An exec call is named in its own key space, so an exec id never meets an executeTool id.
 func (h *Host) reserveNestedCall(conn *Conn, call *CallPayload) (release func()) {
-	if call.Method != CallExecuteTool {
-		return func() {}
+	if id := dialogIDOf(call); id != "" {
+		return h.nested.reserve(conn, dialogSignalKey(id))
+	}
+	switch call.Method {
+	case CallExecuteTool, CallBuiltinToolExecute, CallBuiltinToolLocalExec:
+		var named struct {
+			ExecuteID string `json:"executeId"`
+		}
+		if json.Unmarshal(call.Args, &named) != nil {
+			return func() {}
+		}
+		return h.nested.reserve(conn, named.ExecuteID)
+	case "exec", CallLoadingExec:
+		var named ExecArgs
+		if json.Unmarshal(call.Args, &named) != nil || !named.OwnSignal {
+			return func() {}
+		}
+		return h.nested.reserve(conn, execCallKey(named.ExecID))
+	}
+	return func() {}
+}
+
+// execCallKey names an exec call among the reserved calls of its connection.
+func execCallKey(execID string) string { return "exec:" + execID }
+
+// execSignal derives the context an exec call runs under from its own context: when the extension passed options.signal, the command also ends when the extension reports the abort (CallExecCancel). The call's own context is untouched otherwise.
+func (h *Host) execSignal(ctx context.Context, conn *Conn, call *CallPayload) (context.Context, func()) {
+	if call.Method != "exec" && call.Method != CallLoadingExec {
+		return ctx, func() {}
+	}
+	var named ExecArgs
+	if json.Unmarshal(call.Args, &named) != nil || !named.OwnSignal {
+		return ctx, func() {}
+	}
+	signal := h.nested.signal(conn, execCallKey(named.ExecID))
+	if signal == nil {
+		return ctx, func() {}
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(signal, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
+// handleExecCancel serves CallExecCancel: the abort of the signal an extension passed to pi.exec. The call ends the command; it does not wait for it.
+//
+// upstream: core/exec.ts (the signal's abort listener)
+func (h *Host) handleExecCancel(conn *Conn, call *CallPayload) (*CallResultPayload, error) {
+	var cancel ExecCancel
+	if err := json.Unmarshal(call.Args, &cancel); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", call.Method, err)
+	}
+	h.nested.cancel(conn, execCallKey(cancel.ExecID))
+	return &CallResultPayload{}, nil
+}
+
+// dialogIDOf returns the dialogId of a ui.select, ui.confirm or ui.input call whose extension passed an options.signal, or "".
+func dialogIDOf(call *CallPayload) string {
+	switch call.Method {
+	case "ui.select", "ui.confirm", "ui.input":
+	default:
+		return ""
 	}
 	var named struct {
-		ExecuteID string `json:"executeId"`
+		DialogID string `json:"dialogId"`
 	}
 	if json.Unmarshal(call.Args, &named) != nil {
-		return func() {}
+		return ""
 	}
-	return h.nested.reserve(conn, named.ExecuteID)
+	return named.DialogID
 }
 
 func (n *nestedCalls) reserve(conn *Conn, id string) (release func()) {
@@ -229,23 +291,21 @@ func (h *Host) handleMcpServerCall(_ context.Context, me *managedExt, call *Call
 		h.providerRuntime.UnregisterMcpServer(path, ref.Name)
 		h.untrackMcpServer(me, ref.Name)
 	}
-	result, err := json.Marshal(McpServersResult{Servers: h.providerRuntime.McpServers()})
+	result, err := json.Marshal(McpServersResult{Servers: h.providerRuntime.McpServers().List()})
+	// The SDKs replace their replicated server list with this reply outside a state_update, so the next push to this extension is a full snapshot.
+	me.runtimeStateGen.Add(1)
 	return &CallResultPayload{Result: result}, err
 }
 
 // handleMcpServersRead serves CallGetMcpServers: the live registry, which a Node factory reads before its register frame (loader.ts:475-478).
 func (h *Host) handleMcpServersRead() (*CallResultPayload, error) {
-	result, err := json.Marshal(McpServersResult{Servers: h.providerRuntime.McpServers()})
+	result, err := json.Marshal(McpServersResult{Servers: h.providerRuntime.McpServers().List()})
 	return &CallResultPayload{Result: result}, err
 }
 
 // handleLoadingExec serves CallLoadingExec: upstream's execCommand in the working directory the loader was given, which a factory's pi.exec uses before any session binds (loader.ts:411-414).
 func (h *Host) handleLoadingExec(ctx context.Context, call *CallPayload) (*CallResultPayload, error) {
-	var request struct {
-		Command string                 `json:"command"`
-		Args    []string               `json:"args"`
-		Options *extension.ExecOptions `json:"options,omitempty"`
-	}
+	var request ExecArgs
 	if err := json.Unmarshal(call.Args, &request); err != nil {
 		return nil, fmt.Errorf("parse exec args: %w", err)
 	}
@@ -272,6 +332,13 @@ func (h *Host) handleMcpServerCheck(me *managedExt, call *CallPayload) (*CallRes
 	return &CallResultPayload{}, nil
 }
 
+// publishVirtualModelChange sends every extension that replicates the model registry the catalog with the virtual model a call registered or removed. The registry's change listener does not see it (the model runtime keeps virtual models apart from the registry), and its availability refresh is queued, so without this a Node extension's ctx.modelRegistry would list the model only after an unrelated publication. The frame precedes the call's result on the connection's ordered stream, as a provider registration's does.
+func (h *Host) publishVirtualModelChange() {
+	if h.uiBridge != nil {
+		h.uiBridge.PublishModelCatalog()
+	}
+}
+
 // handleVirtualModelCall serves CallRegisterVirtualModel and CallUnregisterVirtualModel.
 //
 // upstream: loader.ts:480-497
@@ -288,6 +355,7 @@ func (h *Host) handleVirtualModelCall(_ context.Context, me *managedExt, call *C
 			return nil, err
 		}
 		h.trackVirtualModel(me, VirtualModelRef{Provider: decl.Provider, ID: decl.ID})
+		h.publishVirtualModelChange()
 		return &CallResultPayload{}, nil
 	}
 	var ref VirtualModelRef
@@ -296,6 +364,7 @@ func (h *Host) handleVirtualModelCall(_ context.Context, me *managedExt, call *C
 	}
 	h.providerRuntime.UnregisterVirtualModel(ref.Provider, ref.ID)
 	h.untrackVirtualModel(me, ref)
+	h.publishVirtualModelChange()
 	return &CallResultPayload{}, nil
 }
 
@@ -381,7 +450,7 @@ func (h *Host) handleExecuteToolCall(ctx context.Context, conn *Conn, call *Call
 			return nil, executeErr
 		}
 	}
-	result, err := json.Marshal(ExecuteToolOutcome{ToolCall: outcome.ToolCall, Result: agentToolResultWire(outcome.Result), IsError: outcome.IsError})
+	result, err := json.Marshal(ExecuteToolOutcome{ToolCall: outcome.ToolCall, Result: agentToolResultWire(outcome.Result), IsError: outcome.IsError, DurationMs: outcome.DurationMs})
 	return &CallResultPayload{Result: result}, err
 }
 
@@ -496,19 +565,31 @@ func (h *Host) makeVirtualModelRoute(me *managedExt, ref VirtualModelRef) extens
 }
 
 func virtualModelRouteRequest(request extension.ModelRouteRequest) (VirtualModelRouteRequest, error) {
+	model, err := extension.ModelObject(request.Model)
+	if err != nil {
+		return VirtualModelRouteRequest{}, err
+	}
 	wire := VirtualModelRouteRequest{
-		Model: extension.ModelInfo(request.Model), ThinkingLevel: string(request.ThinkingLevel), Reason: string(request.Reason),
+		Model: model, ThinkingLevel: string(request.ThinkingLevel), Reason: string(request.Reason),
 		State: request.State, Messages: make([]json.RawMessage, len(request.Messages)),
 	}
 	if request.Previous != nil {
-		wire.Previous = &VirtualModelRoutePrevious{Model: extension.ModelInfo(request.Previous.Model), ThinkingLevel: string(request.Previous.ThinkingLevel)}
+		previous, err := extension.ModelObject(request.Previous.Model)
+		if err != nil {
+			return wire, err
+		}
+		wire.Previous = &VirtualModelRoutePrevious{Model: previous, ThinkingLevel: string(request.Previous.ThinkingLevel)}
 	}
 	if request.Failed != nil {
 		message, err := json.Marshal(request.Failed.Message)
 		if err != nil {
 			return wire, err
 		}
-		wire.Failed = &VirtualModelRouteFailed{Model: extension.ModelInfo(request.Failed.Model), ThinkingLevel: string(request.Failed.ThinkingLevel), Message: message}
+		failed, err := extension.ModelObject(request.Failed.Model)
+		if err != nil {
+			return wire, err
+		}
+		wire.Failed = &VirtualModelRouteFailed{Model: failed, ThinkingLevel: string(request.Failed.ThinkingLevel), Message: message}
 	}
 	for i, message := range request.Messages {
 		encoded, err := json.Marshal(message)
@@ -540,6 +621,14 @@ func (h *Host) makeToolPrepareLoadout(me *managedExt, toolName string) extension
 				exposure = loadout.GetExposure(tool.Name)
 			}
 			payload.Exposures[tool.Name] = exposure
+			if loadout.GetPromptGuidelines != nil {
+				if guidelines := loadout.GetPromptGuidelines(tool.Name); len(guidelines) > 0 {
+					if payload.PromptGuidelines == nil {
+						payload.PromptGuidelines = make(map[string][]string)
+					}
+					payload.PromptGuidelines[tool.Name] = guidelines
+				}
+			}
 			if loadout.GetNamespace != nil {
 				if namespace := loadout.GetNamespace(tool.Name); namespace != nil {
 					if payload.Namespaces == nil {

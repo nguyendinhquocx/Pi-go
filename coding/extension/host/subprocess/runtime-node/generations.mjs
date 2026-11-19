@@ -1,5 +1,6 @@
 import net from "node:net";
-import { resolve } from "node:path";
+import { flushCompileCache } from "node:module";
+import { posix, resolve, win32 } from "node:path";
 import { createInterface } from "node:readline";
 import { importExtension } from "./jiti-loader.mjs";
 import { reevaluateEdited } from "./loader.mjs";
@@ -13,6 +14,16 @@ import { runWithRuntime } from "./state.mjs";
 const pathEscapes = { "%25": "%", "%09": "\t", "%0A": "\n", "%0D": "\r" };
 function decodePath(value) {
   return value?.replace(/%(?:25|09|0A|0D)/g, (escape) => pathEscapes[escape]);
+}
+
+// Ports packages/coding-agent/src/utils/paths.ts getPathComparisonKey and pathsEqual (Pi 1be312b4, #11588): the platform's resolved path, lower-cased on Windows only because Windows paths are case-insensitive; the platform is read at call time so a test can simulate Windows. Comparison only, never for display or filesystem access.
+function getPathComparisonKey(path) {
+  const pathApi = process.platform === "win32" ? win32 : posix;
+  const resolvedPath = pathApi.resolve(path);
+  return pathApi === win32 ? resolvedPath.toLowerCase() : resolvedPath;
+}
+function pathsEqual(left, right) {
+  return getPathComparisonKey(left) === getPathComparisonKey(right);
 }
 
 export class Generations {
@@ -44,7 +55,7 @@ export class Generations {
   prepareCache({ reload = "0", cwd }) {
     const resolved = cwd ? resolve(cwd) : this.cacheCwd;
     const reloadStarts = reload !== "0" && reload !== this.reloadPass;
-    if (reloadStarts || (this.cacheCwd !== undefined && resolved !== undefined && resolved !== this.cacheCwd)) this.factories.clear();
+    if (reloadStarts || (this.cacheCwd !== undefined && resolved !== undefined && !pathsEqual(this.cacheCwd, resolved))) this.factories.clear();
     if (reloadStarts) {
       this.reloadPass = reload;
       reevaluateEdited(reload);
@@ -79,17 +90,21 @@ export class Generations {
     process.env.PIG_EXT_NAME = name;
     this.prepareCache({ reload, cwd });
     const runtime = new Runtime(entry, this.nativeProviderObjects, this.providerConfigObjects, { name, socket });
+    let phase = "import";
     try {
       await runWithRuntime(runtime, async () => {
         const install = await this.factoryFor(entry);
+        phase = "factory";
         await install(runtime.api);
       });
     } catch (error) {
       runtime.discardLoad();
-      if (runtime.earlyConn) await runtime.reportLoadFailureOnConnection(loadFailure(error));
-      else await reportLoadFailure(socket, loadFailure(error));
+      if (runtime.earlyConn) await runtime.reportLoadFailureOnConnection(loadFailure(error, phase));
+      else await reportLoadFailure(socket, loadFailure(error, phase));
       return false;
     }
+    // pig additive (D20): the host owns process teardown, so the bytecode this load compiled is flushed here rather than relying on normal Node exit. The flush serializes every module compiled so far on this thread, which takes seconds on a starved machine, so it ends before the member registers: once registered the host sends requests under the renderer inactivity lease (D56), and a flush after the host's ready message held the first request past it. Loading already holds this thread; a registered member never waits on it.
+    flushCompileCache();
     runtime.commitLoad();
     process.env.PIG_EXT_SOCKET = socket;
     this.live++;

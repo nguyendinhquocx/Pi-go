@@ -18,6 +18,9 @@ export class Text {
         this.customBgFn = customBgFn;
     }
     setText(text) {
+        // Renderers often set the same text on every update; keep the wrapped lines then.
+        if (text === this.text)
+            return;
         this.text = text;
         this.cachedText = undefined;
         this.cachedWidth = undefined;
@@ -28,6 +31,10 @@ export class Text {
         this.cachedText = undefined;
         this.cachedWidth = undefined;
         this.cachedLines = undefined;
+    }
+    setPaddingX(paddingX) {
+        this.paddingX = paddingX;
+        this.invalidate();
     }
     invalidate() {
         this.cachedText = undefined;

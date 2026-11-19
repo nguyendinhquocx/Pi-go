@@ -2,6 +2,8 @@ package inproc
 
 import (
 	"context"
+	"encoding/json"
+	"strconv"
 	"sync"
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
@@ -29,6 +31,15 @@ type uiPromptTracker struct {
 	draining bool
 	ctx      context.Context
 	cancel   context.CancelFunc
+	// enqueued counts the events queued and admitted the events whose handlers were invoked; waiters wait for admitted to reach a count.
+	enqueued int
+	admitted int
+	waiters  []uiPromptWaiter
+}
+
+type uiPromptWaiter struct {
+	target int
+	done   chan struct{}
 }
 
 type uiPrompt struct {
@@ -90,6 +101,7 @@ func (r *Runner) enqueueUIPromptLocked(event any) {
 		t.ctx, t.cancel = context.WithCancel(context.Background())
 	}
 	t.pending = append(t.pending, event)
+	t.enqueued++
 	if t.draining {
 		return
 	}
@@ -131,6 +143,7 @@ func (r *Runner) drainUIPromptEvents() {
 		if len(t.pending) == 0 || r.IsStale() {
 			t.pending = nil
 			t.draining = false
+			t.admitLocked(t.enqueued)
 			t.mu.Unlock()
 			return
 		}
@@ -144,6 +157,43 @@ func (r *Runner) drainUIPromptEvents() {
 		dispatchCtx := invocation.WithAcknowledgment(t.ctx, func() { close(invoked) })
 		go r.emitUIPromptEvent(dispatchCtx, event)
 		<-invoked
+		t.mu.Lock()
+		t.admitLocked(t.admitted + 1)
+		t.mu.Unlock()
+	}
+}
+
+// admitLocked records admitted events up to count and releases the waiters it satisfies. Caller holds t.mu.
+func (t *uiPromptTracker) admitLocked(count int) {
+	t.admitted = count
+	waiting := t.waiters[:0]
+	for _, waiter := range t.waiters {
+		if waiter.target <= t.admitted {
+			//portlint:allow doubleclose the caller holds t.mu, and a released waiter leaves t.waiters in this pass, so its done channel is closed once
+			close(waiter.done)
+			continue
+		}
+		waiting = append(waiting, waiter)
+	}
+	t.waiters = waiting
+}
+
+// AwaitUIPromptEvents returns once the handlers of every ui_prompt event queued before the call have been invoked, or when ctx ends.
+//
+// upstream: runner.ts emitUIPromptEvent queues the emission in a microtask before withUIPrompt's promise settles, so each handler's synchronous part runs before the prompting extension continues. The subprocess bridge waits here before it answers a dialog call.
+func (r *Runner) AwaitUIPromptEvents(ctx context.Context) {
+	t := &r.uiPrompts
+	t.mu.Lock()
+	if t.admitted >= t.enqueued {
+		t.mu.Unlock()
+		return
+	}
+	waiter := uiPromptWaiter{target: t.enqueued, done: make(chan struct{})}
+	t.waiters = append(t.waiters, waiter)
+	t.mu.Unlock()
+	select {
+	case <-waiter.done:
+	case <-ctx.Done():
 	}
 }
 
@@ -177,7 +227,120 @@ func (c *uiPromptContext) Editor(ctx context.Context, title, prefill string) (st
 	return c.UIContext.Editor(ctx, title, prefill)
 }
 
-func (c *uiPromptContext) Custom(ctx context.Context, factory any, opts any) (any, error) {
+// SelectValue, ConfirmValue, InputValue and EditorValue are [extension.DialogValueUIContext]: they report the prompt as the string-typed dialogs do and
+// pass the bound UI's JSON result through. A bound UI without them resolves through its string-typed method, and the result is that string as JSON (confirm: the bool).
+func (c *uiPromptContext) SelectValue(ctx context.Context, title string, options []string, opts extension.ExtensionUIDialogOptions) (json.RawMessage, error) {
+	defer c.runner.BeginUIPrompt(extension.UIPromptKindSelect, title)()
+	if ui, ok := c.UIContext.(extension.DialogValueUIContext); ok {
+		return ui.SelectValue(ctx, title, options, opts)
+	}
+	return stringResult(c.UIContext.Select(ctx, title, options, opts))
+}
+
+func (c *uiPromptContext) ConfirmValue(ctx context.Context, title, message string, opts extension.ExtensionUIDialogOptions) (json.RawMessage, error) {
+	defer c.runner.BeginUIPrompt(extension.UIPromptKindConfirm, title)()
+	if ui, ok := c.UIContext.(extension.DialogValueUIContext); ok {
+		return ui.ConfirmValue(ctx, title, message, opts)
+	}
+	confirmed, err := c.UIContext.Confirm(ctx, title, message, opts)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(strconv.FormatBool(confirmed)), nil
+}
+
+// A nil placeholder or prefill is Pi's undefined: a bound UI without a value-typed dialog opens it through its omitter, or with an empty member.
+func (c *uiPromptContext) InputValue(ctx context.Context, title string, placeholder *string, opts extension.ExtensionUIDialogOptions) (json.RawMessage, error) {
+	defer c.runner.BeginUIPrompt(extension.UIPromptKindInput, title)()
+	if ui, ok := c.UIContext.(extension.DialogValueUIContext); ok {
+		return ui.InputValue(ctx, title, placeholder, opts)
+	}
+	if omitter, ok := c.UIContext.(extension.PlaceholderOmitter); ok && placeholder == nil {
+		return stringResult(omitter.InputWithoutPlaceholder(ctx, title, opts))
+	}
+	text := ""
+	if placeholder != nil {
+		text = *placeholder
+	}
+	return stringResult(c.UIContext.Input(ctx, title, text, opts))
+}
+
+func (c *uiPromptContext) EditorValue(ctx context.Context, title string, prefill *string) (json.RawMessage, error) {
+	defer c.runner.BeginUIPrompt(extension.UIPromptKindEditor, title)()
+	if ui, ok := c.UIContext.(extension.DialogValueUIContext); ok {
+		return ui.EditorValue(ctx, title, prefill)
+	}
+	if omitter, ok := c.UIContext.(extension.PrefillOmitter); ok && prefill == nil {
+		return stringResult(omitter.EditorWithoutPrefill(ctx, title))
+	}
+	text := ""
+	if prefill != nil {
+		text = *prefill
+	}
+	return stringResult(c.UIContext.Editor(ctx, title, text))
+}
+
+func stringResult(text string, err error) (json.RawMessage, error) {
+	if err != nil {
+		return nil, err
+	}
+	encoded, _ := json.Marshal(text)
+	return encoded, nil
+}
+
+func (c *uiPromptContext) Custom(ctx context.Context, factory extension.CustomFactory, opts *extension.CustomOptions) (any, error) {
 	defer c.runner.BeginUIPrompt(extension.UIPromptKindCustom, "")()
 	return c.UIContext.Custom(ctx, factory, opts)
+}
+
+// ClearWorkingMessage restores the default working label (Pi's setWorkingMessage() with no argument) through the bound UI's own
+// [extension.WorkingMessageClearer]; for a bound UI without one it sends the empty message, as the subprocess bridge does. Embedding the bound UI
+// would otherwise hide its clearer from in-process extensions.
+func (c *uiPromptContext) ClearWorkingMessage() {
+	if clearer, ok := c.UIContext.(extension.WorkingMessageClearer); ok {
+		clearer.ClearWorkingMessage()
+		return
+	}
+	c.SetWorkingMessage("")
+}
+
+// ClearHiddenThinkingLabel restores the default hidden-thinking label (Pi's setHiddenThinkingLabel() with no argument) through the bound UI's own
+// [extension.HiddenThinkingLabelClearer], or sends the empty label for a bound UI without one.
+func (c *uiPromptContext) ClearHiddenThinkingLabel() {
+	if clearer, ok := c.UIContext.(extension.HiddenThinkingLabelClearer); ok {
+		clearer.ClearHiddenThinkingLabel()
+		return
+	}
+	c.SetHiddenThinkingLabel("")
+}
+
+// ClearStatus is Pi's setStatus(key, undefined) through the bound UI's own [extension.StatusClearer], or the empty text for a bound UI without one.
+func (c *uiPromptContext) ClearStatus(key string) {
+	if clearer, ok := c.UIContext.(extension.StatusClearer); ok {
+		clearer.ClearStatus(key)
+		return
+	}
+	c.SetStatus(key, "")
+}
+
+// InputWithoutPlaceholder opens the input dialog without a placeholder through the bound UI's own [extension.PlaceholderOmitter], or with an empty
+// placeholder for a bound UI without one. Like Input it is a ui_prompt scope.
+func (c *uiPromptContext) InputWithoutPlaceholder(ctx context.Context, title string, opts extension.ExtensionUIDialogOptions) (string, error) {
+	omitter, ok := c.UIContext.(extension.PlaceholderOmitter)
+	if !ok {
+		return c.Input(ctx, title, "", opts)
+	}
+	defer c.runner.BeginUIPrompt(extension.UIPromptKindInput, title)()
+	return omitter.InputWithoutPlaceholder(ctx, title, opts)
+}
+
+// EditorWithoutPrefill opens the editor dialog without a prefill through the bound UI's own [extension.PrefillOmitter], or with an empty prefill for a
+// bound UI without one. Like Editor it is a ui_prompt scope.
+func (c *uiPromptContext) EditorWithoutPrefill(ctx context.Context, title string) (string, error) {
+	omitter, ok := c.UIContext.(extension.PrefillOmitter)
+	if !ok {
+		return c.Editor(ctx, title, "")
+	}
+	defer c.runner.BeginUIPrompt(extension.UIPromptKindEditor, title)()
+	return omitter.EditorWithoutPrefill(ctx, title)
 }

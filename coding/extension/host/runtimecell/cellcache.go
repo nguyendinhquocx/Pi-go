@@ -16,7 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gofrs/flock"
+	"github.com/MichaelKinsy/PiG/internal/execfile"
+	"github.com/MichaelKinsy/PiG/internal/filelock"
 )
 
 // cellReadyFile is the readiness marker written last into a published cache
@@ -49,7 +50,9 @@ type cellFailureMeta struct {
 	Message     string `json:"message"`
 	Cause       string `json:"cause"`
 	Log         string `json:"log,omitempty"`
-	Created     int64  `json:"created"`
+	// Drift is the SDK drift of the failure: a recorded failure keeps the changes the build named.
+	Drift   []Drift `json:"drift,omitempty"` //portlint:allow emptydrop PiG-only cache record of a build failure; Pi has no such record and no reader tells absent from empty
+	Created int64   `json:"created"`
 }
 
 type cacheableBuildFailure struct {
@@ -131,7 +134,7 @@ func cachedBuildFailure(finalDir, inputDigest, language string) (error, bool) {
 		return nil, false
 	}
 	_ = TouchUsage(finalDir, time.Now())
-	return &BuildFailure{Summary: meta.Message, Cause: meta.Cause, Log: meta.Log, Cached: true}, true
+	return &BuildFailure{Summary: meta.Message, Cause: meta.Cause, Log: meta.Log, Cached: true, Drift: meta.Drift}, true
 }
 
 func publishCellFailure(ctx context.Context, finalDir, inputDigest, language string, failure *BuildFailure) error {
@@ -147,6 +150,7 @@ func publishCellFailure(ctx context.Context, finalDir, inputDigest, language str
 		Message:     failure.Summary,
 		Cause:       failure.Cause,
 		Log:         failure.Log,
+		Drift:       failure.Drift,
 		Created:     time.Now().Unix(),
 	})
 	if err != nil {
@@ -201,7 +205,19 @@ func isSHA256Hex(value string) bool {
 
 // ReusePublishedArtifact returns the complete entry at finalDir published for
 // want, if one exists, and records its use. It never builds or waits for a lock.
+// The check and the record happen under the entry's shared usage lock, which a
+// collection holds exclusively while it renames an entry away: the entry is
+// either reused and recorded before a collection can take the lock, or the
+// collector has it and the entry is not reused.
 func ReusePublishedArtifact(finalDir string, want EntryIdentity) (PublishedEntry, bool) {
+	if _, ok := validCellEntry(finalDir, want); !ok {
+		return PublishedEntry{}, false
+	}
+	lock, ok := tryLockUsageShared(finalDir)
+	if !ok {
+		return PublishedEntry{}, false
+	}
+	defer func() { _ = lock.Unlock() }()
 	art, ok := validCellEntry(finalDir, want)
 	if !ok {
 		return PublishedEntry{}, false
@@ -256,13 +272,17 @@ func publishArtifact(ctx context.Context, finalDir, canonicalName, inputDigest, 
 		return PublishedEntry{}, fmt.Errorf("create cell lock dir: %w", err)
 	}
 
-	lock := flock.New(filepath.Join(lockDir, inputDigest+".lock"))
+	lock := filelock.New(filepath.Join(lockDir, inputDigest+".lock"))
 	lockCtx := ctx
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
 		lockCtx, cancel = context.WithTimeout(ctx, cellBuildTimeout())
 		defer cancel()
 	}
+	// TryLockContext never tries a lock once its context is done, so a build whose context ended before it began fails here with the
+	// lock free. No holder was waited for, and the error must not say so: a package run that used up its deadline starves every
+	// build that starts after it, and a message about a lock sends the reader after a holder that does not exist.
+	startedLate := ctx.Err() != nil
 	// pig additive (D20): packed cells poll a process-shared build lock.
 	locked, err := lock.TryLockContext(lockCtx, 50*time.Millisecond)
 	if err != nil || !locked {
@@ -276,8 +296,11 @@ func publishArtifact(ctx context.Context, finalDir, canonicalName, inputDigest, 
 				return PublishedEntry{}, cachedErr
 			}
 		}
+		if startedLate {
+			return PublishedEntry{}, fmt.Errorf("build cell %s: its context had ended before the build began: %w", filepath.Base(finalDir), err)
+		}
 		if err != nil {
-			return PublishedEntry{}, fmt.Errorf("wait for cell build lock: %w", err)
+			return PublishedEntry{}, fmt.Errorf("wait for cell build lock: %w", filelock.Explain(parent, err))
 		}
 		return PublishedEntry{}, fmt.Errorf("timed out waiting for another process to build cell %s", filepath.Base(finalDir))
 	}
@@ -421,20 +444,14 @@ func stageArtifact(scratch, source, destination string) error {
 	return copyArtifact(source, destination)
 }
 
+// copyArtifact copies a compiler's output, which sits outside the scratch directory when CARGO_TARGET_DIR names one. The copy is the runner the host executes once the entry is published, so execfile writes it: a concurrent fork must not leave a child that holds the copy's write descriptor.
 func copyArtifact(source, destination string) (err error) {
 	input, err := os.Open(source)
 	if err != nil {
 		return err
 	}
 	defer func() { err = errors.Join(err, input.Close()) }()
-
-	output, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	defer func() { err = errors.Join(err, output.Close()) }()
-	_, err = io.Copy(output, input)
-	return err
+	return execfile.Write(destination, os.O_CREATE|os.O_EXCL, 0o600, input)
 }
 
 // pruneExcept removes every top-level entry of dir except keep and any name in

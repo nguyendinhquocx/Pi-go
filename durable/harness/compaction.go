@@ -10,11 +10,12 @@ import (
 	"math"
 	"slices"
 	"strings"
-	"unicode/utf16"
 
 	"github.com/MichaelKinsy/PiG/ai"
+	chordctx "github.com/MichaelKinsy/PiG/chord/context"
 	"github.com/MichaelKinsy/PiG/chord/delta"
 	"github.com/MichaelKinsy/PiG/durable"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
 // CompactionInput is the input of the built-in compaction task.
@@ -142,6 +143,9 @@ func init() {
 }
 
 func compactionSelectHandler(ctx context.Context, task compactionTask, runtime compactionRuntime) error {
+	if CutOffTooOften(task.Restarts, runtime) {
+		return failCompactionCutOff(ctx, runtime, task)
+	}
 	conversationId := runtime.ConversationId()
 	agent, err := runtime.Agent(ctx)
 	if err != nil {
@@ -156,7 +160,7 @@ func compactionSelectHandler(ctx context.Context, task compactionTask, runtime c
 	if ref == nil || model == nil {
 		return failCompactionNoModel(ctx, runtime, ref)
 	}
-	policy := settings.Compaction
+	policy := settings.Compaction.PolicyFor(*ref)
 	view, err := runtime.Context(ctx, conversationId, nil)
 	if err != nil {
 		return err
@@ -218,6 +222,9 @@ func compactionSelectHandler(ctx context.Context, task compactionTask, runtime c
 }
 
 func compactionSummarizeHandler(ctx context.Context, task compactionTask, runtime compactionRuntime) error {
+	if CutOffTooOften(task.Restarts, runtime) {
+		return failCompactionCutOff(ctx, runtime, task)
+	}
 	request := *task.State.Checkpoint.SummaryRequest
 	ref := request.Model
 	model := runtime.Models().GetModel(ref.Provider, ref.ModelId)
@@ -226,7 +233,7 @@ func compactionSummarizeHandler(ctx context.Context, task compactionTask, runtim
 	}
 	// The context at tail is immutable, so this is the range select chose.
 	tail := request.Tail
-	view, err := runtime.Context(ctx, runtime.ConversationId(), &tail)
+	view, err := runtime.Context(ctx, runtime.ConversationId(), &durable.ContextOptions{At: &tail})
 	if err != nil {
 		return err
 	}
@@ -247,6 +254,7 @@ func compactionSummarizeHandler(ctx context.Context, task compactionTask, runtim
 	options := streamOptionsOf(forwarded, runtime.Signal(), request.ThinkingLevel)
 	options.CacheRetention = ai.CacheRetention("none")
 	options.MaxTokens = request.MaxTokens
+	options.Telemetry = chordctx.Telemetry(ctx)
 	if options.SessionID, err = ensureProviderSessionId(ctx, runtime); err != nil {
 		return err
 	}
@@ -264,7 +272,7 @@ func compactionSummarizeHandler(ctx context.Context, task compactionTask, runtim
 	retry := message.StopReason == ai.StopReasonError && ai.IsRetryableAssistantError(message) && policy.Enabled && request.Attempt <= policy.MaxRetries
 	until := 0.0
 	if retry {
-		until = runtime.Now() + float64(ai.RetryDelayMs(policy.BaseDelayMs, policy.MaxAgentDelayMs, request.Attempt))
+		until = runtime.Now() + float64(ai.RetryDelayMs(ai.RetryPolicy{BaseDelayMs: policy.BaseDelayMs, MaxAgentDelayMs: policy.MaxAgentDelayMs}, request.Attempt))
 	}
 	return runtime.Commit(ctx, func(tx durable.Tx, current compactionTask) (*compactionNext, error) {
 		if err := RecordUsage(tx, runtime.ConversationId(), UsageModels, message.Provider+"/"+message.Model, message.Usage); err != nil {
@@ -279,24 +287,29 @@ func compactionSummarizeHandler(ctx context.Context, task compactionTask, runtim
 		}
 		if retry {
 			if status := FindCompactionStatus(live, runtime.TaskId()); status != nil {
-				if err := status.Set("retry", map[string]any{"at": until, "error": message.ErrorMessage}); err != nil {
+				if err := status.Set("retry", delta.JsonObjectOf("at", until, "error", message.ErrorMessage)); err != nil {
 					return nil, err
 				}
 			}
 			next := CompactionCheckpoint{Phase: compactionRetry, SummaryRequest: &request, Until: &until}
-			return runningState[CompactionCheckpoint, CompactionResult](next), nil
+			return sleepingState[CompactionCheckpoint, CompactionResult](next, until), nil
 		}
-		if err := RemoveCompactionStatus(live, runtime.TaskId()); err != nil {
+		text := summaryFailure(message)
+		if err := FailCompactionStatus(live, runtime.TaskId(), text); err != nil {
 			return nil, err
 		}
-		return failedState[CompactionCheckpoint, CompactionResult](summaryFailure(message), modelErrorReason), nil
+		return failedState[CompactionCheckpoint, CompactionResult](text, modelErrorReason), nil
 	})
 }
 
 func compactionRetryHandler(ctx context.Context, task compactionTask, runtime compactionRuntime) error {
 	checkpoint := *task.State.Checkpoint
-	if err := runtime.Sleep(ctx, *checkpoint.Until); err != nil {
-		return err
+	if CutOffTooOften(task.Restarts, runtime) {
+		return failCompactionCutOff(ctx, runtime, task)
+	}
+	// After the backoff's sleep; a run before Until (an early wake, or a record of an earlier version) sleeps again.
+	if *checkpoint.Until > runtime.Now() {
+		return runtime.SleepUntil(ctx, *checkpoint.Until, checkpoint)
 	}
 	request := *checkpoint.SummaryRequest
 	request.Attempt++
@@ -333,7 +346,7 @@ func CreateCompaction(tx durable.Tx, conversationId durable.ConversationId, inpu
 	if err != nil {
 		return 0, err
 	}
-	status := CompactionStatus{TaskId: taskId, Reason: input.Reason, Blocking: owner != nil, Attempt: 1}
+	status := CompactionStatus{TaskId: taskId, Trigger: input.Reason, Blocking: owner != nil, Attempt: 1}
 	return taskId, AddCompactionStatus(live, status)
 }
 
@@ -510,7 +523,7 @@ func summaryText(message ai.AssistantMessage) (string, bool) {
 			texts = append(texts, text.Text)
 		}
 	}
-	text := strings.TrimSpace(strings.Join(texts, "\n"))
+	text := jsstring.Trim(strings.Join(texts, "\n"))
 	return text, text != ""
 }
 
@@ -541,7 +554,9 @@ func summaryPrompt(messages []ai.Message, instructions *string) string {
 }
 
 // SerializeConversation writes messages as plain text, so the summarizer reads a transcript instead of continuing it.
-// System messages are omitted (compaction.ts:369-397).
+// System messages are omitted, and so is thinking: providers return summaries of the real reasoning, and replayed
+// thinking is often not part of the live context, so including it can make the request larger than the context it
+// summarizes (compaction.ts serializeConversation).
 func SerializeConversation(messages []ai.Message) string {
 	var parts []string
 	for _, message := range messages {
@@ -551,19 +566,14 @@ func SerializeConversation(messages []ai.Message) string {
 				parts = append(parts, "[User]: "+text)
 			}
 		case ai.AssistantMessage:
-			var thinking, texts, calls []string
+			var texts, calls []string
 			for _, content := range typed.Content {
 				switch block := content.(type) {
-				case ai.ThinkingContent:
-					thinking = append(thinking, block.Thinking)
 				case ai.TextContent:
 					texts = append(texts, block.Text)
 				case ai.ToolCall:
 					calls = append(calls, block.Name+"("+callArguments(block)+")")
 				}
-			}
-			if len(thinking) > 0 {
-				parts = append(parts, "[Assistant thinking]: "+strings.Join(thinking, "\n"))
 			}
 			if len(texts) > 0 {
 				parts = append(parts, "[Assistant]: "+strings.Join(texts, "\n"))
@@ -667,11 +677,11 @@ func jsStringEscapes(encoded []byte) string {
 
 // truncateUTF16 keeps the first maxChars UTF-16 units of text, as JavaScript's slice does.
 func truncateUTF16(text string, maxChars int) string {
-	units := utf16.Encode([]rune(text))
-	if len(units) <= maxChars {
+	length := jsstring.Length(text)
+	if length <= maxChars {
 		return text
 	}
-	return string(utf16.Decode(units[:maxChars])) + fmt.Sprintf("\n\n[... %d more characters truncated]", len(units)-maxChars)
+	return jsstring.Slice(text, 0, maxChars) + fmt.Sprintf("\n\n[... %d more characters truncated]", length-maxChars)
 }
 
 // placeHookSummary places a summary supplied by a hook in its own commit.
@@ -693,6 +703,7 @@ func placeSummary(tx durable.Tx, runtime compactionRuntime, current compactionTa
 	if err := RemoveCompactionStatus(live, runtime.TaskId()); err != nil {
 		return nil, err
 	}
+	live.Delete("compactionFailure")
 	head := firstKept
 	text := summaryPrefix + summary + summarySuffix
 	data, err := durable.ToJsonValue(durable.CompactionEntryData{Reason: current.Input.Reason})
@@ -709,11 +720,11 @@ func placeSummary(tx durable.Tx, runtime compactionRuntime, current compactionTa
 	if current.Owner == nil {
 		requestId := fmt.Sprintf("compaction:%d", runtime.TaskId())
 		draft := durable.SubmissionDraft{Type: durable.SubmissionTypeWrite, RequestId: &requestId, Entry: &entry}
-		id, err := AdmitSubmission(tx, runtime.ConversationId(), draft, runtime.Now(), QueueModesOf(runtime.Settings()))
+		admission, err := AdmitSubmission(tx, runtime.ConversationId(), draft, runtime.Now(), QueueModesOf(runtime.Settings()), nil)
 		if err != nil {
 			return nil, err
 		}
-		result.SubmissionId = &id
+		result.SubmissionId = &admission.Id
 	} else {
 		appended, err := tx.AppendEntry(runtime.ConversationId(), entry)
 		if err != nil {
@@ -739,6 +750,22 @@ func completeCompaction(ctx context.Context, runtime compactionRuntime) error {
 	})
 }
 
+// failCompactionCutOff fails a compaction cut off settings.restartLimit times in a row (spec section 5.4) instead of
+// running it again.
+func failCompactionCutOff(ctx context.Context, runtime compactionRuntime, task compactionTask) error {
+	message := fmt.Sprintf("Compaction was interrupted %s", CutOffCount(task.Restarts))
+	return runtime.Commit(ctx, func(tx durable.Tx, _ compactionTask) (*compactionNext, error) {
+		live, err := docDraft(tx, LiveDoc, runtime.ConversationId())
+		if err != nil {
+			return nil, err
+		}
+		if err := FailCompactionStatus(live, runtime.TaskId(), message); err != nil {
+			return nil, err
+		}
+		return failedState[CompactionCheckpoint, CompactionResult](message, durable.ReasonRestartLimit), nil
+	})
+}
+
 func failCompactionNoModel(ctx context.Context, runtime compactionRuntime, ref *durable.ModelRef) error {
 	message := noModelMessage(ref)
 	return runtime.Commit(ctx, func(tx durable.Tx, _ compactionTask) (*compactionNext, error) {
@@ -746,7 +773,7 @@ func failCompactionNoModel(ctx context.Context, runtime compactionRuntime, ref *
 		if err != nil {
 			return nil, err
 		}
-		if err := RemoveCompactionStatus(live, runtime.TaskId()); err != nil {
+		if err := FailCompactionStatus(live, runtime.TaskId(), message); err != nil {
 			return nil, err
 		}
 		return failedState[CompactionCheckpoint, CompactionResult](message, noModelReason), nil

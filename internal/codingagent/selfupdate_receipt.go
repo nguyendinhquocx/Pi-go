@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/MichaelKinsy/PiG/internal/ownerfile"
@@ -65,7 +66,13 @@ func WriteStandaloneReceipt(exe, version, source string) error {
 		return fmt.Errorf("stage standalone receipt: %w", err)
 	}
 	tmpPath := tmp.Name()
-	defer func() { _ = os.Remove(tmpPath) }()
+	// Every return below, including a failed CA read, must release the handle
+	// before unlinking the name: Windows cannot remove an open file. The
+	// explicit Close further down reports its error; this one is a no-op then.
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}()
 	transportCA := ""
 	if data, err := readUpdateTransportCA(); err != nil {
 		return err
@@ -80,12 +87,10 @@ func WriteStandaloneReceipt(exe, version, source string) error {
 	if transportCA != "" {
 		content += "update-ca-sha256=" + transportCA + "\n"
 	}
-	if _, err := io.WriteString(tmp, content); err != nil {
-		_ = tmp.Close()
+	if _, err := tmp.WriteString(content); err != nil {
 		return fmt.Errorf("write standalone receipt: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
 		return fmt.Errorf("sync standalone receipt: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
@@ -155,7 +160,8 @@ func validateStandaloneReceipt(exe string) error {
 	if receipt.Kind != "standalone" {
 		return fmt.Errorf("standalone receipt kind is %q, want standalone", receipt.Kind)
 	}
-	if canonicalPath(receipt.ExecutablePath) != canonicalPath(exe) {
+	// canonicalPath is Node's realpathSync and keeps the case each path was spelled in; the receipt names an executable on a filesystem that, on Windows, does not tell `C:\Pig\pig.exe` from `c:\pig\PIG.EXE`.
+	if ownershipPath(runtime.GOOS, receipt.ExecutablePath) != ownershipPath(runtime.GOOS, exe) {
 		return fmt.Errorf("standalone receipt executable %s does not match %s", receipt.ExecutablePath, exe)
 	}
 	if InstalledPigVersion == "" {

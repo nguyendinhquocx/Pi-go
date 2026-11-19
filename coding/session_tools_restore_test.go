@@ -5,6 +5,8 @@ import (
 	"slices"
 	"testing"
 
+	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
+
 	"github.com/MichaelKinsy/PiG/agent"
 )
 
@@ -37,8 +39,8 @@ func TestNavigateTreeRestoresActiveToolsFromTranscript(t *testing.T) {
 	}
 	var firstAssistant string
 	for _, entry := range sess.Entries() {
-		if message, ok := entry.AsMessage(); ok && message.Message.Assistant != nil {
-			firstAssistant = entry.Base.ID
+		if message, ok := entry.(icodingagent.MessageEntry); ok && message.Message.Assistant != nil {
+			firstAssistant = entry.Base().ID
 			break
 		}
 	}
@@ -54,8 +56,10 @@ func TestNavigateTreeRestoresActiveToolsFromTranscript(t *testing.T) {
 	}
 }
 
-// Upstream setActiveToolsByName keeps the requested order and ignores names
-// with no registered tool.
+// Upstream setActiveToolsByName treats the requested names as a set (agent-session.ts
+// _applyToolLoadout, b9e3eef6, #11495): tools that stay active keep their current order,
+// newly active ones are appended in the requested order, and names with no registered
+// tool are ignored.
 func TestSetActiveToolsByName(t *testing.T) {
 	svcs := newTestServices(t)
 	sess, err := NewSession(svcs, SessionOptions{
@@ -67,11 +71,19 @@ func TestSetActiveToolsByName(t *testing.T) {
 	}
 	defer func() { _ = sess.Close() }()
 	sess.SetActiveToolsByName([]string{"beta", "missing", "alpha"})
-	if got := sess.ActiveToolNames(); !slices.Equal(got, []string{"beta", "alpha"}) {
-		t.Fatalf("active tools = %v, want [beta alpha]", got)
+	if got := sess.ActiveToolNames(); !slices.Equal(got, []string{"alpha", "beta"}) {
+		t.Fatalf("active tools after reordering the same tools = %v, want [alpha beta]", got)
 	}
 	sess.SetActiveToolsByName(nil)
 	if got := sess.ActiveToolNames(); len(got) != 0 {
 		t.Fatalf("active tools = %v, want none", got)
+	}
+	sess.SetActiveToolsByName([]string{"beta", "missing", "alpha"})
+	if got := sess.ActiveToolNames(); !slices.Equal(got, []string{"beta", "alpha"}) {
+		t.Fatalf("active tools = %v, want [beta alpha]", got)
+	}
+	sess.SetActiveToolsByName([]string{"alpha", "beta"})
+	if got := sess.ActiveToolNames(); !slices.Equal(got, []string{"beta", "alpha"}) {
+		t.Fatalf("active tools = %v, want [beta alpha]", got)
 	}
 }

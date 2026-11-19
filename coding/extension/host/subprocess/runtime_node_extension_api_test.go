@@ -172,6 +172,31 @@ await runtime.requestContext.run(request, async () => {
   assert.deepEqual(asyncCalls.at(-1), ["executeTool", { callerId: "call-1", name: "echo", args: {}, executeId: "e5" }, "req-1"]);
 });
 
+// pi.exec's options.signal (core/exec.ts:46-52) is the only signal of the call: an exec with one is independent of the calling request, names itself by an exec id, and its abort sends exec.cancel after the call. Without one the call stays tied to the request.
+runtime.nextResult = { stdout: "", stderr: "", code: 0, killed: false };
+await runtime.requestContext.run(request, async () => {
+  await api.exec("echo", []);
+  assert.deepEqual(asyncCalls.at(-1), ["exec", { command: "echo", args: [], options: undefined }, "req-1"]);
+  const controller = new AbortController();
+  const pending = api.exec("sleep", ["30"], { signal: controller.signal, timeout: 5 });
+  assert.deepEqual(asyncCalls.at(-1), ["exec", { command: "sleep", args: ["30"], options: { timeout: 5 }, execId: "x1", ownSignal: true }, ""]);
+  controller.abort();
+  await pending;
+  assert.deepEqual(asyncCalls.at(-1), ["exec.cancel", { execId: "x1" }, ""]);
+  // A signal that is aborted already cancels once the call is sent.
+  await api.exec("sleep", [], { signal: AbortSignal.abort() });
+  assert.deepEqual(asyncCalls.at(-1), ["exec.cancel", { execId: "x2" }, ""]);
+  // The listener ends with the call: an abort afterwards sends nothing.
+  const late = new AbortController();
+  await api.exec("echo", [], { signal: late.signal });
+  const sent = asyncCalls.length;
+  late.abort();
+  assert.equal(asyncCalls.length, sent);
+  // A null signal is no signal.
+  await api.exec("echo", [], { signal: null });
+  assert.equal(asyncCalls.at(-1)[2], "req-1");
+});
+
 // Partial results reach onUpdate in order before the outcome, each as a request the Host waits on; a throwing callback answers its request with the error, still sees every later partial result, and the call rejects with the error it threw (nested-tool-calls.ts:219-231, agent-loop.ts:833-845).
 const responses = [];
 runtime.respond = async (id, result, error) => { responses.push([id, result, error]); };
@@ -239,6 +264,83 @@ assert.equal(routed.signal, controllerRoute.signal);
 assert.equal(routed.ctx, requestCtx);
 await runtime.handleRequest("r4", { method: "virtual_model_route", args: { provider: "p", id: "nope", request: routeArgs.request } }, requestCtx);
 assert.match(responses.at(-1)[2].message, /unknown virtual model p\/nope/);
+`, (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String())
+	if output, err := exec.CommandContext(t.Context(), "node", "--input-type=module", "--eval", script).CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, output)
+	}
+}
+
+// PiG-only ownThinkingRuns: the load-time value (last call wins, false sends nothing) travels in the register frame as owns_thinking_runs; once the register frame is out, each call is a host call carrying enabled.
+func TestNodeRuntimeOwnThinkingRuns(t *testing.T) {
+	path, err := filepath.Abs("runtime-node/runtime.mjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := fmt.Sprintf(`
+import assert from "node:assert/strict";
+import net from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Runtime } from %q;
+
+let counter = 0;
+async function registerFrame(configure) {
+  const sock = process.platform === "win32"
+    ? "\\\\.\\pipe\\pig-own-thinking-" + process.pid + "-" + counter
+    : join(tmpdir(), "pig-own-thinking-" + process.pid + "-" + counter + ".sock");
+  counter++;
+  const frame = new Promise((resolve, reject) => {
+    const server = net.createServer((socket) => {
+      let buffer = Buffer.alloc(0);
+      socket.on("data", (chunk) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        if (buffer.length < 4) return;
+        const size = buffer.readUInt32BE(0);
+        if (buffer.length < 4 + size) return;
+        resolve(JSON.parse(buffer.subarray(4, 4 + size).toString("utf8")));
+        socket.destroy();
+        server.close();
+      });
+    });
+    server.on("error", reject);
+    server.listen(sock);
+  });
+  process.env.PIG_EXT_SOCKET = sock;
+  const loading = new Runtime("/ext/own.mjs");
+  configure(loading.api);
+  await loading.connect();
+  const register = (await frame).register;
+  loading.conn.socket.destroy();
+  return register;
+}
+
+assert.equal((await registerFrame(() => {})).owns_thinking_runs, undefined);
+assert.equal((await registerFrame((api) => api.ownThinkingRuns(false))).owns_thinking_runs, undefined);
+assert.equal((await registerFrame((api) => api.ownThinkingRuns())).owns_thinking_runs, true);
+assert.equal((await registerFrame((api) => api.ownThinkingRuns(true))).owns_thinking_runs, true);
+assert.equal((await registerFrame((api) => { api.ownThinkingRuns(true); api.ownThinkingRuns(false); })).owns_thinking_runs, undefined);
+assert.equal((await registerFrame((api) => { api.ownThinkingRuns(false); api.ownThinkingRuns(true); })).owns_thinking_runs, true);
+
+const runtime = new Runtime("/ext/own.mjs");
+const calls = [];
+runtime.conn = {
+  closed: false,
+  callSync() { return null; },
+  call: async (method, args) => { calls.push([method, args]); return {}; },
+  requestState() {},
+  notify() {},
+};
+runtime.hostReady = true;
+runtime.providersSent = true;
+runtime.commitLoad();
+runtime.api.ownThinkingRuns(false);
+runtime.api.ownThinkingRuns();
+runtime.api.ownThinkingRuns(true);
+assert.deepEqual(calls, [["ownThinkingRuns", { enabled: false }], ["ownThinkingRuns", { enabled: true }], ["ownThinkingRuns", { enabled: true }]]);
+for (const bad of [null, 1, "true", {}]) {
+  assert.throws(() => runtime.api.ownThinkingRuns(bad), { name: "TypeError", message: "ownThinkingRuns requires a boolean" });
+}
+assert.equal(calls.length, 3);
 `, (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String())
 	if output, err := exec.CommandContext(t.Context(), "node", "--input-type=module", "--eval", script).CombinedOutput(); err != nil {
 		t.Fatalf("%v\n%s", err, output)

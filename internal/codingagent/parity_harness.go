@@ -65,7 +65,7 @@ func withParityFixturePath(agentDir string, fn func()) {
 }
 
 func (m *InteractiveMode) probeImageFallback() (string, error) {
-	img := tui.NewImage(parityHarnessSamplePngBase64, "image/png", tui.ImageOptions{Filename: "probe.png"}, nil)
+	img := tui.NewImage(parityHarnessSamplePngBase64, "image/png", tui.DefaultImageTheme(), tui.ImageOptions{Filename: "probe.png"}, nil)
 	for _, line := range img.Render(80) {
 		if strings.TrimSpace(line) != "" {
 			return line, nil
@@ -75,7 +75,7 @@ func (m *InteractiveMode) probeImageFallback() (string, error) {
 }
 
 func (m *InteractiveMode) probeCancellableLoader() (string, error) {
-	loader := tui.NewCancellableLoader("", "", "Working...", nil)
+	loader := tui.NewCancellableLoader(nil, nil, nil, "Working...", nil)
 	aborted := false
 	loader.OnAbort = func() { aborted = true }
 	rendered := strings.Join(loader.Render(40), "\n")
@@ -91,7 +91,7 @@ func (m *InteractiveMode) probeSelectList() (string, error) {
 	list.EnableSearch = false
 	list.SetCursor(2)
 	list.HandleInput("\x1b[6~")
-	pageIgnored := list.CursorIndex() == 2
+	pageClamped := list.CursorIndex() == 2
 	list.HandleInput("\x1b[B")
 	wrapped := ""
 	if list.CursorIndex() == 0 {
@@ -106,8 +106,8 @@ func (m *InteractiveMode) probeSelectList() (string, error) {
 	cancelList.EnableSearch = false
 	cancelList.HandleInput("\x1b")
 	rendered := strings.Contains(strings.Join(list.Render(40), "\n"), "a")
-	return fmt.Sprintf("select-list:render=%t:pageIgnored=%t:wrap=%s:select=%s:cancel=%t",
-		rendered, pageIgnored, wrapped, selected, cancelList.Cancelled()), nil
+	return fmt.Sprintf("select-list:render=%t:pageClamped=%t:wrap=%s:select=%s:cancel=%t",
+		rendered, pageClamped, wrapped, selected, cancelList.Cancelled()), nil
 }
 
 func (m *InteractiveMode) probeOAuthShared() (string, error) {
@@ -232,7 +232,7 @@ func loginGitHubCopilotForParity(ctx context.Context, cb ai.CopilotLoginCallback
 		case mode == "complete" && req.URL.Host == "api.github.com" && req.URL.Path == "/copilot_internal/v2/token":
 			return jsonResponse(200, `{"token":"tid=parity;proxy-ep=proxy.individual.githubcopilot.com","expires_at":4102444800}`), nil
 		case mode == "complete" && req.URL.Host == "api.individual.githubcopilot.com" && req.URL.Path == "/models":
-			return jsonResponse(200, `{"data":[{"id":"gpt-5.4","name":"GPT-5.4","model_picker_enabled":true,"policy":{"state":"enabled"},"capabilities":{"type":"chat","family":"gpt-5.4","supports":{"tool_calls":true},"limits":{"max_context_window_tokens":1000000,"max_output_tokens":32768}}}]}`), nil
+			return jsonResponse(200, `{"data":[{"id":"gpt-6.1-sol","name":"GPT-6.1 Sol","model_picker_enabled":true,"policy":{"state":"enabled"},"capabilities":{"type":"chat","family":"gpt-6.1-sol","supports":{"tool_calls":true},"limits":{"max_context_window_tokens":1000000,"max_output_tokens":32768}}}]}`), nil
 		default:
 			return nil, fmt.Errorf("unexpected login-dialog request: %s %s", req.Method, req.URL.String())
 		}

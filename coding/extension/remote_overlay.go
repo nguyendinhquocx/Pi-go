@@ -1,6 +1,7 @@
 package extension
 
 import (
+	"context"
 	"encoding/json"
 	"strconv"
 
@@ -33,6 +34,9 @@ type RemoteOverlayOptions struct {
 	// when no legacy Title/fractions are given, an overlay is mounted
 	// component-framed with exactly upstream's showOverlay geometry.
 	Layout *OverlayLayout `json:"overlayOptions,omitempty"`
+	// Blocked mirrors upstream ui.custom()'s blocked option: while an inline component is visible the program status reports pi as
+	// blocked on it. An overlay ignores it.
+	Blocked *CustomBlocked `json:"blocked,omitempty"`
 }
 
 // OverlayLayout is the serialisable subset of upstream pi-tui
@@ -132,6 +136,9 @@ type RemoteOverlayState struct {
 	Focused bool                 `json:"focused"`
 	Visible bool                 `json:"visible"`
 	Bounds  *RemoteOverlayBounds `json:"bounds,omitempty"`
+	// FocusOwner is the component that holds TUI focus after the control, so the bridge can tell the extension which of its
+	// overlays has focus: Pi's setFocus clears the focused flag of every other component (tui.ts:602-665).
+	FocusOwner any `json:"-"`
 }
 
 // RemoteOverlayBounds is the last rendered terminal-relative rectangle.
@@ -166,4 +173,43 @@ type RemoteOverlayHost interface {
 	// after [tui.ReadInput] segmentation) while the overlay is
 	// open. Called from the input-reading goroutine.
 	OnInput(data string)
+}
+
+// RemoteOverlayFocusHost is an optional [RemoteOverlayHost] that publishes the component's TUI focus to the remote producer: Pi's
+// TUI.setFocus sets the focused flag of the component that gains focus and clears it on the one that loses it (tui.ts:602-665), so
+// a custom component that another opens over learns it lost focus, and learns it has it again when that one closes.
+//
+// pig-specific: Pi's component is in-process; a remote component learns its focus through this callback.
+type RemoteOverlayFocusHost interface {
+	// OnFocus reports a change of the component's focus after it was mounted. Called from the goroutine that delivers its input,
+	// in order with it.
+	OnFocus(focused bool)
+}
+
+// RemoteOverlayViewportHost is an optional [RemoteOverlayHost] that publishes the component's capturesViewportInput: Pi's optional
+// Component.capturesViewportInput (packages/tui/src/tui.ts) is read from the focused component whenever a fullscreen viewport key
+// arrives, and the key goes to the component instead of scrolling the transcript while it is true.
+//
+// pig-specific: Pi's component is in-process; a remote component sends its current value with each frame.
+type RemoteOverlayViewportHost interface {
+	// CapturesViewportInput reports the capturesViewportInput of the latest frame the component sent. Safe to call from any goroutine.
+	CapturesViewportInput() bool
+}
+
+// RemoteTUI is an optional [UIContext] that drives the TUI a remote component factory receives. Pi hands showExtensionCustom's
+// factory the TUI itself (interactive-mode.ts:3008), and the factory or its components may call its showOverlay, hideOverlay and
+// setFocus (tui.ts:598-842); a subprocess factory makes those calls across the process boundary.
+//
+// pig-specific: Pi's factory holds the TUI in process.
+type RemoteTUI interface {
+	// ShowRemoteOverlay is TUI.showOverlay for a remote component: it mounts a raw overlay with no ui.custom call behind it and
+	// returns once the overlay is on the stack. The handle takes the component's frames and applies OverlayHandle controls
+	// (Control); a "hide" control ends the overlay. Close ends it too, removing its entry if it is still on the stack. ended is
+	// closed once the overlay ended and stopped reading input. ok is false when the UI has no TUI.
+	ShowRemoteOverlay(opts RemoteOverlayOptions, host RemoteOverlayHost) (handle RemoteOverlayHandle, ended <-chan struct{}, ok bool)
+	// HideTopOverlay is TUI.hideOverlay: it pops the topmost overlay, whichever component it shows, and returns the component
+	// that holds focus afterwards.
+	HideTopOverlay(ctx context.Context) (focused any, err error)
+	// SetRemoteFocus is TUI.setFocus with target and returns the component that holds focus afterwards.
+	SetRemoteFocus(ctx context.Context, target RemoteOverlayFocusTarget) (focused any, err error)
 }

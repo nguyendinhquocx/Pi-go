@@ -127,8 +127,8 @@ func TestWindowsCodeMatchesLibuv(t *testing.T) {
 		{"WSAESOCKTNOSUPPORT", 10044, "ESOCKTNOSUPPORT"},
 		{"ERROR_BAD_EXE_FORMAT", 193, "EFTYPE"},
 	}
-	if len(cases) != len(windowsCodes) {
-		t.Fatalf("windowsCodes has %d entries, the libuv table here has %d", len(windowsCodes), len(cases))
+	if len(cases) != len(windowsCodes()) {
+		t.Fatalf("windowsCodes has %d entries, the libuv table here has %d", len(windowsCodes()), len(cases))
 	}
 	for _, tc := range cases {
 		got, ok := windowsCode(tc.errno)
@@ -211,8 +211,8 @@ func TestCodeNamesPlatformErrnos(t *testing.T) {
 			t.Errorf("Code(%v) = %q, %v; want %q", errno, got, ok, want)
 		}
 	}
-	for errno, code := range posixCodes {
-		if _, ok := codes[code]; !ok {
+	for errno, code := range posixCodes() {
+		if _, ok := codes()[code]; !ok {
 			t.Errorf("posix errno %d is named %s, which libuv does not name", int(errno), code)
 		}
 	}
@@ -285,10 +285,10 @@ func TestCodesMatchNode(t *testing.T) {
 			t.Errorf("Node names %s (%d) %q; Description(%s) = %q, %v", code, errno, description, code, got, ok)
 		}
 	}
-	if len(codes) != len(node) {
-		t.Errorf("codes has %d entries, Node's map has %d", len(codes), len(node))
+	if len(codes()) != len(node) {
+		t.Errorf("codes has %d entries, Node's map has %d", len(codes()), len(node))
 	}
-	for code, entry := range codes {
+	for code, entry := range codes() {
 		errno, ok := Errno(code)
 		if !ok {
 			t.Errorf("Errno(%s) has no value", code)

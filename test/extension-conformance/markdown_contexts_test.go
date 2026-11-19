@@ -8,11 +8,12 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension"
 )
 
+// packages/coding-agent/src/core/extensions/types.ts:1679 (ExtensionAPI.registerMarkdownTransformer).
 // Pi markdown-transform.ts:18-29 passes the current display context to each callback. Use the existing common fixture and compare all SDKs and placements to the real native reference without polling away a missing first answer.
 func TestMarkdownContextsAcrossSDKs(t *testing.T) {
 	t.Parallel()
 	cases := allHarnessCases()
-	for _, language := range []string{"go", "python", "rust"} {
+	for _, language := range []string{"go", "python", "rust", "lisp"} {
 		cases = append(cases, harnessCase{name: "packed-" + language, make: func(t *testing.T) *harness { return makePackedUIHarness(t, language) }})
 	}
 	for _, tc := range cases {
@@ -36,7 +37,7 @@ func TestMarkdownContextsAcrossSDKs(t *testing.T) {
 					want := fmt.Sprintf("md:%s:%s:streaming=%t:width=%d", text, messageType, ctx.IsStreaming, ctx.AvailableWidth)
 					for j, transform := range transforms {
 						if got := transform(text, ctx); got != want {
-							t.Fatalf("transform%d input bytes=%d context=%+v: got %q; want %q", j, len(text), ctx, got, want)
+							t.Fatalf("registerMarkdownTransformer transform%d input bytes=%d context=%+v: got %q; want %q", j, len(text), ctx, got, want)
 						}
 					}
 				}

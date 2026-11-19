@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
 // SPDX-License-Identifier: MIT
 
 package sdk
@@ -6,6 +5,7 @@ package sdk
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -233,12 +233,54 @@ func TestExecWithOptionsSendsOptionsAndDecodesKilled(t *testing.T) {
 	surfaceShutdown(t, host, done)
 }
 
+// Pi c466a359 (#11360) exec.ts maxBuffer. The option crosses as options.maxBuffer and the result's truncated is read; NaN and the
+// infinities cannot cross the wire, so the call fails before it is sent.
+func TestExecWithMaxBufferSendsTheOptionAndDecodesTruncated(t *testing.T) {
+	ext := New("surface")
+	type outcome struct {
+		result *ExecResult
+		err    error
+	}
+	got := make(chan outcome, 1)
+	var nonFinite []error
+	ext.Command("exec", "", func(ctx Context, _ string) error {
+		for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+			_, err := ctx.ExecWithOptions("yes", nil, ExecOptions{MaxBuffer: &value})
+			nonFinite = append(nonFinite, err)
+		}
+		limit := 8.0
+		result, err := ctx.ExecWithOptions("yes", nil, ExecOptions{MaxBuffer: &limit})
+		got <- outcome{result, err}
+		return err
+	})
+	host, _, done := surfaceHost(t, ext, nil)
+	calls, resp := runSurfaceCommand(t, host, "exec", func(*callMsg) *callResultMsg {
+		return &callResultMsg{Result: json.RawMessage(`{"stdout":"y\ny\ny\ny\n","stderr":"","code":1,"killed":true,"truncated":true}`)}
+	})
+	if resp.Error != nil || len(calls) != 1 || calls[0].Method != "exec" {
+		t.Fatalf("calls = %+v, response = %+v, want only the exec with a finite cap", calls, resp)
+	}
+	for i, err := range nonFinite {
+		if err == nil {
+			t.Errorf("non-finite maxBuffer %d: the call did not fail", i)
+		}
+	}
+	want := map[string]any{"command": "yes", "args": nil, "options": map[string]any{"maxBuffer": float64(8)}}
+	if args := decodeArgs(t, calls[0].Args); !reflect.DeepEqual(args, want) {
+		t.Fatalf("exec args = %#v, want %#v", args, want)
+	}
+	if result := <-got; result.err != nil || *result.result != (ExecResult{Stdout: "y\ny\ny\ny\n", ExitCode: 1, Killed: true, Truncated: true}) {
+		t.Fatalf("exec result = %+v, %v", result.result, result.err)
+	}
+	surfaceShutdown(t, host, done)
+}
+
 func TestDialogsWithOptionsSendTimeout(t *testing.T) {
 	ext := New("surface")
 	type outcome struct {
-		selected, text string
+		selected, text any
 		selectOK       bool
-		confirmed      bool
+		confirmed      any
 		inputOK        bool
 	}
 	got := make(chan outcome, 1)
@@ -321,9 +363,6 @@ func TestHasUIAndUIThemeFollowReplicatedState(t *testing.T) {
 	if got := theme.Fg("accent", "x"); got != "\x1b[38;5;1mx\x1b[39m" {
 		t.Fatalf("Fg = %q", got)
 	}
-	if got := theme.Fg("missing", "x"); got != "x" {
-		t.Fatalf("Fg(unknown) = %q", got)
-	}
 	if got := theme.Bg("selectedBg", "x"); got != "\x1b[48;5;3mx\x1b[49m" {
 		t.Fatalf("Bg = %q", got)
 	}
@@ -339,7 +378,7 @@ func TestHasUIAndUIThemeFollowReplicatedState(t *testing.T) {
 	if _, err := theme.GetFgAnsi("nope"); err == nil || err.Error() != "Unknown theme color: nope" {
 		t.Fatalf("GetFgAnsi(unknown) error = %v", err)
 	}
-	if _, err := theme.GetBgAnsi("nope"); err == nil || err.Error() != "Unknown theme background color: nope" {
+	if _, err := theme.GetBgAnsi("nope"); err == nil || err.Error() != "Unknown theme color: nope" {
 		t.Fatalf("GetBgAnsi(unknown) error = %v", err)
 	}
 	if got := theme.GetThinkingBorderColor("high")("x"); got != "\x1b[38;5;2mx\x1b[39m" {
@@ -363,11 +402,35 @@ func TestHasUIAndUIThemeFollowReplicatedState(t *testing.T) {
 	if got := light.GetBashModeBorderColor()("x"); got != "\x1b[38;2;1;2;3mx\x1b[39m" {
 		t.Fatalf("GetBashModeBorderColor = %q", got)
 	}
-	if got := light.Fg("accent", "x"); got != "x" {
-		t.Fatalf("Fg(accent) after change = %q, want the new palette's plain text", got)
-	}
+	func() {
+		defer func() {
+			if err, _ := recover().(error); err == nil || err.Error() != "Unknown theme color: accent" {
+				t.Fatalf("Fg(accent) after change recovered %v, want the new palette's unknown-token error", err)
+			}
+		}()
+		_ = light.Fg("accent", "x")
+	}()
 	if got := theme.Fg("accent", "x"); got != "\x1b[38;5;1mx\x1b[39m" {
 		t.Fatalf("earlier snapshot changed: %q", got)
+	}
+	surfaceShutdown(t, host, done)
+}
+
+// loop_turned is the host step a Node runtime waits for after a print prompt's last call. A Go extension has no such wait, so the notify changes nothing: the next request runs with the state the extension held before it.
+func TestLoopTurnedNotifyChangesNothing(t *testing.T) {
+	ext := New("surface")
+	got := make(chan bool, 1)
+	ext.Command("read", "", func(ctx Context, _ string) error {
+		got <- ctx.HasUI()
+		return nil
+	})
+	host, _, done := surfaceHost(t, ext, &readyMsg{Cwd: "/tmp", Width: 80, State: json.RawMessage(`{"hasUI":true}`)})
+	host.writeEnvelope(t, envelope{Type: msgNotify, Notify: &notifyMsg{Method: "loop_turned"}})
+	if _, response := runSurfaceCommand(t, host, "read", func(*callMsg) *callResultMsg { return &callResultMsg{} }); response.Error != nil {
+		t.Fatalf("read after loop_turned: %+v", response.Error)
+	}
+	if !<-got {
+		t.Fatal("HasUI after loop_turned = false, want the ready state's true")
 	}
 	surfaceShutdown(t, host, done)
 }
@@ -522,4 +585,65 @@ func startDetachedCompact(t *testing.T, host *mockHost, name string) (string, *c
 		}
 	}
 	return callID, call
+}
+
+// Pi's RPC mode resolves a dialog with whatever JSON the client sent, so select, input, editor and confirm return it as decoded JSON, with undefined (ok false) apart from null.
+func TestDialogResultsCarryTheClientsJSONTypes(t *testing.T) {
+	ext := New("typed")
+	type outcome struct {
+		value any
+		ok    bool
+	}
+	got := make(chan []outcome, 1)
+	ext.Command("dialogs", "", func(ctx Context, _ string) error {
+		var all []outcome
+		for _, title := range []string{"s-number", "s-null", "s-undefined"} {
+			value, ok, err := ctx.Select(title, []string{"a"})
+			if err != nil {
+				return err
+			}
+			all = append(all, outcome{value, ok})
+		}
+		for _, title := range []string{"c-string", "c-null", "c-absent"} {
+			value, err := ctx.Confirm(title, "m")
+			if err != nil {
+				return err
+			}
+			all = append(all, outcome{value, true})
+		}
+		value, ok, err := ctx.Input("i-object", "p")
+		if err != nil {
+			return err
+		}
+		all = append(all, outcome{value, ok})
+		value, ok, err = ctx.Editor("e-array", "p")
+		if err != nil {
+			return err
+		}
+		all = append(all, outcome{value, ok})
+		got <- all
+		return nil
+	})
+	host, _, done := surfaceHost(t, ext, nil)
+	replies := map[string]string{
+		"s-number": `{"selected":5,"ok":true}`, "s-null": `{"selected":null,"ok":true}`, "s-undefined": `{"selected":"","ok":false}`,
+		"c-string": `{"confirmed":"yes"}`, "c-null": `{"confirmed":null}`, "c-absent": `{}`,
+		"i-object": `{"text":{"a":[1,"x"]},"ok":true}`, "e-array": `{"text":[1,2],"ok":true}`,
+	}
+	_, resp := runSurfaceCommand(t, host, "dialogs", func(call *callMsg) *callResultMsg {
+		title := decodeArgs(t, call.Args)["title"].(string)
+		return &callResultMsg{Result: json.RawMessage(replies[title])}
+	})
+	if resp.Error != nil {
+		t.Fatalf("response = %+v", resp)
+	}
+	want := []outcome{
+		{float64(5), true}, {nil, true}, {nil, false},
+		{"yes", true}, {nil, true}, {false, true},
+		{map[string]any{"a": []any{float64(1), "x"}}, true}, {[]any{float64(1), float64(2)}, true},
+	}
+	if o := <-got; !reflect.DeepEqual(o, want) {
+		t.Fatalf("dialog results = %#v, want %#v", o, want)
+	}
+	surfaceShutdown(t, host, done)
 }

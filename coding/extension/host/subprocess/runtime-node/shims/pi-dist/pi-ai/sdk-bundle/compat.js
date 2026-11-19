@@ -1,10 +1,10 @@
 import {
   AssistantMessageEventStream,
-  AssistantMessageFrameEncoder,
   DEFAULT_MAX_AGENT_RETRY_DELAY_MS,
   EventStream,
+  StreamingJsonParser,
   StringEnum,
-  Type,
+  ToolCallArgumentsStream,
   cleanupSessionResources,
   createAssistantMessageEventStream,
   createFauxCore,
@@ -21,7 +21,7 @@ import {
   lazyStream,
   parseJsonWithRepair,
   parseStreamingJson,
-  reduceAssistantMessageFrames,
+  parseToolCallArguments,
   registerSessionResourceCleanup,
   repairJson,
   retryAssistantCall,
@@ -29,7 +29,7 @@ import {
   uuidv7,
   validateToolArguments,
   validateToolCall
-} from "./chunk-5YY4OANL.js";
+} from "./chunk-LM2GRTGA.js";
 import {
   ANTHROPIC_API_KEY_ENV,
   ANTHROPIC_AUTH_TOKEN_ENV,
@@ -40,7 +40,6 @@ import {
   ANTHROPIC_SERVICE_ACCOUNT_ID_ENV,
   ANTHROPIC_WORKSPACE_ID_ENV,
   IMAGE_MODELS,
-  anthropicMessagesApi,
   azureOpenAIResponsesApi,
   builtinModels,
   findEnvKeys,
@@ -52,18 +51,24 @@ import {
   googleVertexApi,
   mistralConversationsApi,
   openAICodexResponsesApi,
-  openAICompletionsApi,
   openAIResponsesApi,
   piMessagesApi
-} from "./chunk-6VYI4PEE.js";
+} from "./chunk-DH6PKDEX.js";
+import {
+  anthropicMessagesApi,
+  openAICompletionsApi
+} from "./chunk-57EFHYMA.js";
 import {
   envApiKeyAuth,
   lazyOAuth
 } from "./chunk-VLLDVPPZ.js";
 import {
+  AI_TELEMETRY_SCHEMA,
   InMemoryCredentialStore,
   InMemoryModelsStore,
   ModelsError,
+  PI_AI_VERSION,
+  PI_ATTRIBUTION,
   appendAssistantMessageDiagnostic,
   calculateCost,
   clampThinkingLevel,
@@ -77,12 +82,17 @@ import {
   defaultProviderAuthContext,
   extractDiagnosticError,
   formatThrownValue,
+  formatUserAgent,
+  getAttributionHeaders,
+  getClientVersion,
   getCurrentSystemMessage,
   getCurrentSystemPrompt,
   getCurrentTools,
   getDeclaredTools,
+  getIdentityHeaders,
   getInitialSystemMessage,
   getModelType,
+  getOpenCodeSessionHeaders,
   getSupportedThinkingLevels,
   getSystemMessageText,
   getToolStateChanges,
@@ -90,14 +100,16 @@ import {
   hasNonAdditiveToolChanges,
   hasToolRedefinitions,
   isModelType,
+  mergeClientIdentity,
   modelsAreEqual,
   normalizeContext,
   renderSystemMessageUpdate,
   resolveTranscript,
   resolveTranscriptTools,
   toToolDeclaration,
+  withClientIdentity,
   withoutInitialSystemMessage
-} from "./chunk-Y5ITVTK2.js";
+} from "./chunk-YGHTO7GP.js";
 import {
   __name
 } from "./chunk-SHUYVCID.js";
@@ -405,6 +417,7 @@ async function completeSimple(model, context, options) {
 }
 __name(completeSimple, "completeSimple");
 export {
+  AI_TELEMETRY_SCHEMA,
   ANTHROPIC_API_KEY_ENV,
   ANTHROPIC_AUTH_TOKEN_ENV,
   ANTHROPIC_FEDERATION_RULE_ID_ENV,
@@ -414,14 +427,16 @@ export {
   ANTHROPIC_SERVICE_ACCOUNT_ID_ENV,
   ANTHROPIC_WORKSPACE_ID_ENV,
   AssistantMessageEventStream,
-  AssistantMessageFrameEncoder,
   DEFAULT_MAX_AGENT_RETRY_DELAY_MS,
   EventStream,
   InMemoryCredentialStore,
   InMemoryModelsStore,
   ModelsError,
+  PI_AI_VERSION,
+  PI_ATTRIBUTION,
+  StreamingJsonParser,
   StringEnum,
-  Type,
+  ToolCallArgumentsStream,
   anthropicMessagesApi,
   appendAssistantMessageDiagnostic,
   azureOpenAIResponsesApi,
@@ -450,15 +465,19 @@ export {
   fauxToolCall,
   findEnvKeys,
   formatThrownValue,
+  formatUserAgent,
   generateImages,
   generateImagesOpenRouter,
   getApiProvider,
   getApiProviders,
+  getAttributionHeaders,
+  getClientVersion,
   getCurrentSystemMessage,
   getCurrentSystemPrompt,
   getCurrentTools,
   getDeclaredTools,
   getEnvApiKey,
+  getIdentityHeaders,
   getImageModel,
   getImageModels,
   getImageProviders,
@@ -467,6 +486,7 @@ export {
   getModel,
   getModelType,
   getModels,
+  getOpenCodeSessionHeaders,
   getOverflowPatterns,
   getProviders,
   getSupportedThinkingLevels,
@@ -484,6 +504,7 @@ export {
   lazyApi,
   lazyOAuth,
   lazyStream,
+  mergeClientIdentity,
   mistralConversationsApi,
   modelsAreEqual,
   normalizeContext,
@@ -492,8 +513,8 @@ export {
   openAIResponsesApi,
   parseJsonWithRepair,
   parseStreamingJson,
+  parseToolCallArguments,
   piMessagesApi,
-  reduceAssistantMessageFrames,
   registerApiProvider,
   registerBuiltInApiProviders,
   registerBuiltInImagesApiProviders,
@@ -531,5 +552,6 @@ export {
   uuidv7,
   validateToolArguments,
   validateToolCall,
+  withClientIdentity,
   withoutInitialSystemMessage
 };

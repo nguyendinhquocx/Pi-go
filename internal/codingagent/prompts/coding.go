@@ -12,8 +12,6 @@
 package prompts
 
 import (
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 
@@ -37,6 +35,8 @@ type Options struct {
 	Cwd string
 	// Tools are the selected tool names in the order the model sees them. Nil selects read, bash, edit, and write; an empty slice selects none.
 	Tools []string
+	// HiddenTools are the selected tools whose declarations requests leave out. They are reachable only through another tool, so the tool list and rules leave them out too.
+	HiddenTools []string
 	// ToolHints maps a tool name to its prompt snippet. Upstream lists only
 	// tools that have a snippet.
 	ToolHints map[string]string
@@ -58,6 +58,12 @@ type Options struct {
 	// PigDocsPath is the local documentation bundle synced by pigdocs. Empty
 	// uses the standard config-root location.
 	PigDocsPath string
+	// PigReadmePath is the README of that bundle; empty is README.md inside PigDocsPath.
+	// upstream: system-prompt.ts:163 getReadmePath()
+	PigReadmePath string
+	// PigExamplesPath is where the examples live; empty is [PigExamplesLocation].
+	// upstream: system-prompt.ts:165 getExamplesPath()
+	PigExamplesPath string
 	// AppendMode is "append" (default: CustomPrompt becomes the addendum
 	// section) or "replace" (CustomPrompt replaces the preamble, and the tools,
 	// rules, and docs sections are omitted, as upstream does for a custom
@@ -65,7 +71,7 @@ type Options struct {
 	AppendMode string
 }
 
-const preamble = "You are an expert coding assistant operating inside pig, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files."
+const preamble = "You are a coding assistant running inside pig, a coding agent harness. Help users inspect files, run commands, and modify code."
 
 type section struct{ name, content string }
 
@@ -88,12 +94,18 @@ func BuildSystemPromptSections(o Options) ai.OrderedSections {
 		o.Tools = []string{"read", "bash", "edit", "write"}
 	}
 	head := preamble
+	declared := make([]string, 0, len(o.Tools))
+	for _, name := range o.Tools {
+		if !slices.Contains(o.HiddenTools, name) {
+			declared = append(declared, name)
+		}
+	}
 	var sections []section
 	if o.AppendMode == "replace" && o.CustomPrompt != "" {
 		head = o.CustomPrompt
 	} else {
 		var tools []string
-		for _, name := range o.Tools {
+		for _, name := range declared {
 			if hint := o.ToolHints[name]; hint != "" {
 				tools = append(tools, "- "+name+": "+hint)
 			}
@@ -103,10 +115,11 @@ func BuildSystemPromptSections(o Options) ai.OrderedSections {
 			list = strings.Join(tools, "\n")
 		}
 		sections = append(sections,
-			section{"tools", list + "\n\nIn addition to the tools above, you may have access to other custom tools depending on the project."},
-			section{"rules", renderRules(o.Tools, o.ToolGuidelines, o.PromptGuidelines)},
-			section{"docs", docsSection(o.PigDocsPath)},
+			section{"tools", list + "\n\nAdditional tools may be available."},
+			section{"rules", renderRules(declared, o.ToolGuidelines, o.PromptGuidelines)},
 		)
+		// pig additive (D92): the docs section is absent when docs are stripped; see docs_section.go.
+		sections = append(sections, docsSections(o.PigDocsPath, o.PigReadmePath, o.PigExamplesPath)...)
 		if addendum := strings.TrimSpace(o.CustomPrompt); addendum != "" {
 			sections = append(sections, section{"addendum", addendum})
 		}
@@ -125,7 +138,8 @@ func BuildSystemPromptSections(o Options) ai.OrderedSections {
 		}
 		sections = append(sections, section{"project_context", strings.Join(parts, "\n\n")})
 	}
-	if readTool := skillReadTool(o.Tools); readTool != "" {
+	// A hidden reader is still reachable through another tool, so skills stay but the hint names no tool.
+	if readTool := skillReadTool(declared, o.Tools); readTool != "" {
 		if skills := strings.TrimSpace(formatSkills(o.Skills, readTool)); skills != "" {
 			sections = append(sections, section{"skills", skills})
 		}
@@ -142,32 +156,8 @@ func BuildSystemPromptSections(o Options) ai.OrderedSections {
 	return out
 }
 
-// docsSection points the model at PiG's documentation in upstream's format.
-func docsSection(root string) string {
-	if root == "" {
-		root = defaultPigDocsPath()
-	}
-	// pig additive (D22): the docs section points at the materialized PiG documentation bundle.
-	return "PiG documentation (read only when the user asks about pig itself, its SDK, extensions, themes, skills, or TUI):\n" +
-		"- Main documentation: " + filepath.Join(root, "README.md") + "\n" +
-		"- Additional docs: " + root + "\n" +
-		"- Examples: https://github.com/MichaelKinsy/PiG/tree/main/examples (extensions, custom tools, SDK)\n" +
-		"- When reading pig docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n" +
-		"- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pig packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)\n" +
-		"- When working on pig topics, read the docs and examples, and follow .md cross-references before implementing\n" +
-		"- Always read pig .md files completely and follow links to related docs (e.g., tui.md for TUI API details)"
-}
-
-func defaultPigDocsPath() string {
-	if v := os.Getenv("PIG_HOME"); v != "" {
-		return filepath.Join(v, "docs")
-	}
-	if v := os.Getenv("XDG_CONFIG_HOME"); v != "" {
-		return filepath.Join(v, "pig", "docs")
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".pig", "docs")
-}
+// PigExamplesLocation is PiG's examples directory. pig additive (D22): PiG's examples are published in its repository, not materialized beside the documentation bundle.
+const PigExamplesLocation = "https://github.com/MichaelKinsy/PiG/tree/main/examples"
 
 // renderRules mirrors upstream buildRules.
 func renderRules(tools []string, toolGuidelines map[string][]string, promptGuidelines []string) string {
@@ -213,10 +203,16 @@ func guidelinesFor(tools []string, toolGuidelines map[string][]string, promptGui
 	return out
 }
 
-func skillReadTool(tools []string) string {
+// skillReadTool names the tool that loads skill files: the first of read and bash that is declared, "indirect" when only a hidden one is selected, and "" when neither is selected.
+func skillReadTool(declared, selected []string) string {
 	for _, name := range []string{"read", "bash"} {
-		if slices.Contains(tools, name) {
+		if slices.Contains(declared, name) {
 			return name
+		}
+	}
+	for _, name := range []string{"read", "bash"} {
+		if slices.Contains(selected, name) {
+			return "indirect"
 		}
 	}
 	return ""
@@ -238,13 +234,16 @@ func formatSkills(skills []Skill, readTool string) string {
 		return ""
 	}
 	load := "Use the read tool to load a skill's file when the task matches its description."
-	if readTool != "read" {
+	switch readTool {
+	case "bash":
 		load = "Use bash to load a skill's file when the task matches its description."
+	case "indirect":
+		load = "Load a skill's file when the task matches its description."
 	}
 	lines := []string{
 		"\n\nThe following skills provide specialized instructions for specific tasks.",
 		load,
-		"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+		"Resolve relative paths against the skill's directory (parent of SKILL.md). Use absolute paths in tool calls.",
 		"",
 		"<available_skills>",
 	}

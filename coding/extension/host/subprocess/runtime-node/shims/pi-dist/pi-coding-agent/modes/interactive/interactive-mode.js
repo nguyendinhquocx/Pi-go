@@ -29,6 +29,7 @@ import { RADIUS_MCP_URL, RADIUS_PROVIDER_ID } from "../../core/radius.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionManager, sessionEntryToContextMessages, } from "../../core/session-manager.js";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.js";
+import { getSourcePackageKey } from "../../core/source-info.js";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.js";
 import { withBuiltInRenderers } from "../../core/tools/renderers/index.js";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.js";
@@ -39,10 +40,11 @@ import { copyToClipboard, readClipboardFilePaths, readClipboardText } from "../.
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.js";
 import { parseGitUrl } from "../../utils/git.js";
 import { ensurePngTranscoder } from "../../utils/image-convert.js";
-import { getCwdRelativePath } from "../../utils/paths.js";
+import { getCwdRelativePath, shortenHomePath } from "../../utils/paths.js";
 import { getPiUserAgent } from "../../utils/pi-user-agent.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import { loadAllHighlightLanguages } from "../../utils/syntax-highlight.js";
+import { stripBom } from "../../utils/text.js";
 import { ensureTool } from "../../utils/tools-manager.js";
 import { checkForNewPiVersion } from "../../utils/version-check.js";
 import { reportBug } from "./bug-report.js";
@@ -84,12 +86,13 @@ import { UserMessageSelectorComponent } from "./components/user-message-selector
 import { editInExternalEditor } from "./external-editor.js";
 import { refreshModelCatalogs } from "./model-catalog-refresh.js";
 import { getModelSearchText } from "./model-search.js";
+import { ProgramStatusReporter } from "./program-status-reporter.js";
 import { shareSession } from "./session-share.js";
 import { getAvailableThemes, getAvailableThemesWithPaths, getEditorTheme, getMarkdownTheme, getThemeByName, onThemeChange, SYSTEM_THEME_NAME, setRegisteredThemes, stopThemeWatcher, Theme, theme, } from "./theme/theme.js";
 import { InteractiveThemeController } from "./theme/theme-controller.js";
 import { createInteractiveTui, createInteractiveTuiReference } from "./tui-renderer.js";
 export { createInteractiveTui, createInteractiveTuiReference } from "./tui-renderer.js";
-function isWorkingStatusEditor(editor) {
+function isEmbeddedStatus(editor) {
     return ("embedWorkingStatus" in editor &&
         editor.embedWorkingStatus === true &&
         "setWorkingStatusIndicator" in editor &&
@@ -273,6 +276,7 @@ export class InteractiveMode {
     lastSigintTime = 0;
     lastEscapeTime = 0;
     changelogMarkdown = undefined;
+    extensionChangelogUpdates = [];
     startupNoticesShown = false;
     anthropicSubscriptionWarningShown = false;
     // Status line tracking (for mutating immediately-sequential status updates)
@@ -314,13 +318,15 @@ export class InteractiveMode {
     compactionQueuedMessages = [];
     // Shutdown state
     shutdownRequested = false;
+    /** Reports working, blocked, done, and error states to terminals that support OSC 7501. */
+    programStatus = new ProgramStatusReporter(() => this.ui.terminal, () => this.sessionManager.getSessionName());
     /** The `/bug` hint is shown at most once per session so error output stays readable. */
     bugReportHintShown = false;
     installChangeWarningShown = false;
     // Extension UI state
-    extensionSelector = undefined;
-    extensionInput = undefined;
-    extensionEditor = undefined;
+    // Extension dialogs shown in the editor slot (select, confirm, input, editor, inline custom).
+    // The last entry is visible; see pushExtensionDialog().
+    extensionDialogs = [];
     extensionTerminalInputSubscriptions = new Set();
     // Extension widgets (components rendered above/below the editor)
     extensionWidgetsAbove = new Map();
@@ -560,24 +566,44 @@ export class InteractiveMode {
             return;
         }
         this.startupNoticesShown = true;
-        if (!this.changelogMarkdown) {
+        if (!this.changelogMarkdown && this.extensionChangelogUpdates.length === 0) {
             return;
         }
         if (this.chatContainer.children.length > 0) {
             this.chatContainer.addChild(new Spacer(1));
         }
         this.chatContainer.addChild(new DynamicBorder());
-        if (this.settingsManager.getCollapseChangelog()) {
-            const versionMatch = this.changelogMarkdown.match(/##\s+\[?(\d+\.\d+\.\d+)\]?/);
-            const latestVersion = versionMatch ? versionMatch[1] : this.version;
-            const condensedText = `Updated to v${latestVersion}. Use ${theme.bold("/changelog")} to view full changelog.`;
-            this.chatContainer.addChild(new Text(condensedText, 1, 0));
+        if (this.changelogMarkdown) {
+            if (this.settingsManager.getCollapseChangelog()) {
+                const versionMatch = this.changelogMarkdown.match(/##\s+\[?(\d+\.\d+\.\d+)\]?/);
+                const latestVersion = versionMatch ? versionMatch[1] : this.version;
+                const condensedText = `Updated to v${latestVersion}. Use ${theme.bold("/changelog")} to view full changelog.`;
+                this.chatContainer.addChild(new Text(condensedText, 1, 0));
+            }
+            else {
+                this.chatContainer.addChild(new ThemedText(() => theme.bold(theme.fg("accent", "What's New")), 1, 0));
+                this.chatContainer.addChild(new Spacer(1));
+                this.chatContainer.addChild(new Markdown(this.changelogMarkdown.trim(), 1, 0, this.getMarkdownThemeWithSettings()));
+                this.chatContainer.addChild(new Spacer(1));
+            }
         }
-        else {
-            this.chatContainer.addChild(new ThemedText(() => theme.bold(theme.fg("accent", "What's New")), 1, 0));
-            this.chatContainer.addChild(new Spacer(1));
-            this.chatContainer.addChild(new Markdown(this.changelogMarkdown.trim(), 1, 0, this.getMarkdownThemeWithSettings()));
-            this.chatContainer.addChild(new Spacer(1));
+        if (this.extensionChangelogUpdates.length > 0) {
+            if (this.changelogMarkdown) {
+                this.chatContainer.addChild(new Spacer(1));
+            }
+            if (this.settingsManager.getCollapseChangelog()) {
+                const condensedText = this.extensionChangelogUpdates
+                    .map((update) => `Updated ${update.name} to v${update.version}.`)
+                    .join("\n");
+                this.chatContainer.addChild(new Text(condensedText, 1, 0));
+            }
+            else {
+                this.chatContainer.addChild(new ThemedText(() => theme.bold(theme.fg("accent", "Extension Updates")), 1, 0));
+                this.chatContainer.addChild(new Spacer(1));
+                const markdown = this.extensionChangelogUpdates.map((update) => update.markdown).join("\n\n");
+                this.chatContainer.addChild(new Markdown(markdown, 1, 0, this.getMarkdownThemeWithSettings()));
+                this.chatContainer.addChild(new Spacer(1));
+            }
         }
         this.chatContainer.addChild(new DynamicBorder());
     }
@@ -654,20 +680,15 @@ export class InteractiveMode {
         if (this.isInitialized)
             return;
         this.registerSignalHandlers();
-        // Load changelog (only show new entries, skip for resumed sessions)
+        // Load changelogs (only show new entries, skip for resumed sessions)
         this.changelogMarkdown = this.getChangelogForDisplay();
-        if (this.session.scopedModels.length > 0 && this.shouldShowStartupDetails()) {
-            const modelList = this.session.scopedModels
-                .map((sm) => {
-                const thinkingStr = sm.thinkingLevel ? `:${sm.thinkingLevel}` : "";
-                return `${sm.model.id}${thinkingStr}`;
-            })
-                .join(", ");
-            const cycleKeys = this.keybindings.getKeys("app.model.cycleForward");
-            const cycleHint = cycleKeys.length > 0
-                ? theme.fg("muted", ` (${formatKeyText(cycleKeys.join("/"), { capitalize: true })} to cycle)`)
-                : "";
-            console.log(theme.fg("dim", `Model scope: ${modelList}${cycleHint}`));
+        this.extensionChangelogUpdates = this.getExtensionChangelogUpdates();
+        // Fullscreen renders on the alternate screen, so text printed to stdout here would stay in the shell
+        // after exit. Fullscreen shows the notice in the header instead (#11508).
+        if (this.renderer.mode !== "fullscreen") {
+            const modelScopeNotice = this.getModelScopeNotice();
+            if (modelScopeNotice)
+                console.log(modelScopeNotice);
         }
         // Keep one component tree and remount it when changing renderers.
         this.renderWidgets(); // Initialize with default spacer
@@ -702,6 +723,7 @@ export class InteractiveMode {
         // Start the UI before initializing extensions so session_start handlers can use interactive dialogs
         this.ui.start();
         this.isInitialized = true;
+        this.programStatus.report();
         this.ensurePngTranscoder();
         this.themeController.applyFromSettings();
         // The header and startup notices bake theme colors into their text, so build them once the terminal
@@ -766,6 +788,8 @@ export class InteractiveMode {
             this.builtInHeader = new Text("", 0, 0);
             this.headerContainer.addChild(this.builtInHeader);
         }
+        if (this.renderer.mode === "fullscreen")
+            this.showFullscreenModelScopeNotice();
         this.ui.requestRender();
         // Ensure fd and rg are available after mounting the TUI (downloads if missing, adds to PATH via getBinDir)
         // so slow downloads do not make startup appear frozen.
@@ -1003,6 +1027,58 @@ export class InteractiveMode {
         }
         return undefined;
     }
+    getExtensionChangelogUpdates() {
+        // Skip changelog for resumed/continued sessions (already have messages)
+        if (this.session.state.messages.length > 0) {
+            return [];
+        }
+        const seenKeys = new Set();
+        const updates = [];
+        for (const { sourceInfo } of this.session.resourceLoader.getExtensions().extensions) {
+            if (sourceInfo.origin !== "package" || !sourceInfo.baseDir || !sourceInfo.changelogPath) {
+                continue;
+            }
+            const key = getSourcePackageKey(sourceInfo);
+            if (seenKeys.has(key)) {
+                continue;
+            }
+            seenKeys.add(key);
+            const pkg = this.readPackageJson(sourceInfo.baseDir);
+            if (!pkg?.version) {
+                continue;
+            }
+            const lastVersion = this.settingsManager.getExtensionChangelogVersion(key);
+            if (!lastVersion) {
+                // Fresh install - record the version, don't show changelog
+                this.settingsManager.setExtensionChangelogVersion(key, pkg.version);
+                continue;
+            }
+            const newEntries = getNewEntries(parseChangelog(sourceInfo.changelogPath), lastVersion);
+            if (newEntries.length > 0) {
+                this.settingsManager.setExtensionChangelogVersion(key, pkg.version);
+                const name = pkg.name || sourceInfo.source;
+                // Prefix each "## [x.y.z]" heading with the package name so entries render like Pi's own.
+                const markdown = newEntries
+                    .map((entry) => entry.content.replace(/^##\s+/, `## ${name} `))
+                    .join("\n\n")
+                    .trim();
+                updates.push({ name, version: pkg.version, markdown });
+            }
+        }
+        return updates;
+    }
+    readPackageJson(packageRoot) {
+        try {
+            const pkg = JSON.parse(stripBom(fs.readFileSync(path.join(packageRoot, "package.json"), "utf-8")));
+            return {
+                name: typeof pkg.name === "string" ? pkg.name : undefined,
+                version: typeof pkg.version === "string" ? pkg.version : undefined,
+            };
+        }
+        catch {
+            return undefined;
+        }
+    }
     reportInstallTelemetry(version) {
         if (process.env.PI_OFFLINE) {
             return;
@@ -1029,13 +1105,7 @@ export class InteractiveMode {
     // Extension System
     // =========================================================================
     formatDisplayPath(p) {
-        const home = os.homedir();
-        let result = p;
-        // Replace home directory with ~
-        if (result.startsWith(home)) {
-            result = `~${result.slice(home.length)}`;
-        }
-        return result;
+        return shortenHomePath(p);
     }
     formatExtensionDisplayPath(path) {
         let result = this.formatDisplayPath(path);
@@ -1059,6 +1129,27 @@ export class InteractiveMode {
         return this.options.verbose === true || this.settingsManager.getQuietStartup() !== true;
     }
     /** Startup details (model scope, loaded resources). Hidden by quietStartup: true or "header". */
+    getModelScopeNotice() {
+        if (this.session.scopedModels.length === 0 || !this.shouldShowStartupDetails())
+            return undefined;
+        const modelList = this.session.scopedModels
+            .map((sm) => {
+            const thinkingStr = sm.thinkingLevel ? `:${sm.thinkingLevel}` : "";
+            return `${sm.model.id}${thinkingStr}`;
+        })
+            .join(", ");
+        const cycleKeys = this.keybindings.getKeys("app.model.cycleForward");
+        const cycleHint = cycleKeys.length > 0
+            ? theme.fg("muted", ` (${formatKeyText(cycleKeys.join("/"), { capitalize: true })} to cycle)`)
+            : "";
+        return theme.fg("dim", `Model scope: ${modelList}${cycleHint}`);
+    }
+    showFullscreenModelScopeNotice() {
+        if (!this.getModelScopeNotice())
+            return;
+        this.headerContainer.addChild(new ThemedText(() => this.getModelScopeNotice() ?? "", 1, 0));
+        this.headerContainer.addChild(new Spacer(1));
+    }
     shouldShowStartupDetails() {
         return this.options.verbose === true || this.settingsManager.getQuietStartup() === false;
     }
@@ -1429,7 +1520,7 @@ export class InteractiveMode {
             const skillDiagnostics = skillsResult.diagnostics;
             if (skillDiagnostics.length > 0) {
                 const warningLines = () => this.formatDiagnostics(skillDiagnostics, sourceInfos);
-                this.loadedResourcesContainer.addChild(new ThemedText(() => `${theme.fg("warning", "[Skill conflicts]")}\n${warningLines()}`, 0, 0));
+                this.loadedResourcesContainer.addChild(new ThemedText(() => `${theme.fg("warning", "[Skill warnings]")}\n${warningLines()}`, 0, 0));
                 this.loadedResourcesContainer.addChild(new Spacer(1));
             }
             const promptDiagnostics = promptsResult.diagnostics;
@@ -1585,6 +1676,7 @@ export class InteractiveMode {
         const session = this.session;
         this.unsubscribe?.();
         this.unsubscribe = undefined;
+        this.programStatus.reset();
         this.applyRuntimeSettings();
         if (options.renderBeforeBind) {
             this.renderCurrentSessionState();
@@ -1770,7 +1862,7 @@ export class InteractiveMode {
     }
     setEditorWorkingStatusIndicator(indicator) {
         this.defaultEditor.setWorkingStatusIndicator(undefined);
-        if (!isWorkingStatusEditor(this.editor))
+        if (!isEmbeddedStatus(this.editor))
             return false;
         this.editor.setWorkingStatusIndicator(indicator);
         return true;
@@ -1806,7 +1898,7 @@ export class InteractiveMode {
         }
     }
     showWorkingStatusIndicator() {
-        const colorFn = isWorkingStatusEditor(this.editor)
+        const colorFn = isEmbeddedStatus(this.editor)
             ? (text) => (this.editor.borderColor ?? theme.getThinkingBorderColor(this.session.thinkingLevel || "off"))(text)
             : undefined;
         this.showStatusIndicator(new WorkingStatusIndicator(this.ui, this.workingMessage ?? this.defaultWorkingMessage, this.workingIndicatorOptions, colorFn));
@@ -1891,14 +1983,12 @@ export class InteractiveMode {
         this.renderWidgets();
     }
     resetExtensionUI() {
-        if (this.extensionSelector) {
-            this.hideExtensionSelector();
-        }
-        if (this.extensionInput) {
-            this.hideExtensionInput();
-        }
-        if (this.extensionEditor) {
-            this.hideExtensionEditor();
+        if (this.extensionDialogs.length > 0) {
+            for (const dialog of this.extensionDialogs) {
+                dialog.component.dispose?.();
+            }
+            this.extensionDialogs = [];
+            this.showTopExtensionDialog();
         }
         this.ui.hideOverlay();
         this.clearExtensionTerminalInputListeners();
@@ -2099,51 +2189,63 @@ export class InteractiveMode {
         };
     }
     /**
+     * Show an extension dialog in the editor slot.
+     * Dialogs form a stack: a new dialog hides the visible one, and closing the visible dialog shows
+     * the previous one again. Every dialog stays answerable, so no dialog promise is left pending,
+     * and dialogs opened from inside another dialog (for example a confirm from a custom component) work.
+     */
+    pushExtensionDialog(component, blocked) {
+        this.disposeActiveSelector();
+        this.extensionDialogs.push({ component, blocked });
+        this.showTopExtensionDialog();
+    }
+    /** Remove an extension dialog. If it was visible, show the previous dialog or the editor. */
+    removeExtensionDialog(component) {
+        const index = this.extensionDialogs.findIndex((dialog) => dialog.component === component);
+        if (index === -1)
+            return;
+        this.extensionDialogs.splice(index, 1);
+        if (index === this.extensionDialogs.length)
+            this.showTopExtensionDialog();
+    }
+    showTopExtensionDialog() {
+        const top = this.extensionDialogs.at(-1);
+        const component = top?.component ?? this.editor;
+        this.editorContainer.clear();
+        this.editorContainer.addChild(component);
+        this.ui.setFocus(component);
+        this.programStatus.setBlocked("extension-dialog", top?.blocked);
+        this.ui.requestRender();
+    }
+    /**
      * Show a selector for extensions.
      */
-    showExtensionSelector(title, options, opts) {
+    showExtensionSelector(title, options, opts, blocked = { kind: "question", message: title }) {
         return new Promise((resolve) => {
             if (opts?.signal?.aborted) {
                 resolve(undefined);
                 return;
             }
-            const onAbort = () => {
-                this.hideExtensionSelector();
-                resolve(undefined);
-            };
-            opts?.signal?.addEventListener("abort", onAbort, { once: true });
-            this.extensionSelector = new ExtensionSelectorComponent(title, options, (option) => {
+            const finish = (option) => {
                 opts?.signal?.removeEventListener("abort", onAbort);
-                this.hideExtensionSelector();
+                selector.dispose();
+                this.removeExtensionDialog(selector);
                 resolve(option);
-            }, () => {
-                opts?.signal?.removeEventListener("abort", onAbort);
-                this.hideExtensionSelector();
-                resolve(undefined);
-            }, { tui: this.ui, timeout: opts?.timeout, onToggleToolsExpanded: () => this.toggleToolOutputExpansion() });
-            this.disposeActiveSelector();
-            this.editorContainer.clear();
-            this.editorContainer.addChild(this.extensionSelector);
-            this.ui.setFocus(this.extensionSelector);
-            this.ui.requestRender();
+            };
+            const onAbort = () => finish(undefined);
+            opts?.signal?.addEventListener("abort", onAbort, { once: true });
+            const selector = new ExtensionSelectorComponent(title, options, (option) => finish(option), () => finish(undefined), { tui: this.ui, timeout: opts?.timeout, onToggleToolsExpanded: () => this.toggleToolOutputExpansion() });
+            this.pushExtensionDialog(selector, blocked);
         });
-    }
-    /**
-     * Hide the extension selector.
-     */
-    hideExtensionSelector() {
-        this.extensionSelector?.dispose();
-        this.editorContainer.clear();
-        this.editorContainer.addChild(this.editor);
-        this.extensionSelector = undefined;
-        this.ui.setFocus(this.editor);
-        this.ui.requestRender();
     }
     /**
      * Show a confirmation dialog for extensions.
      */
     async showExtensionConfirm(title, message, opts) {
-        const result = await this.showExtensionSelector(`${title}\n${message}`, ["Yes", "No"], opts);
+        const result = await this.showExtensionSelector(`${title}\n${message}`, ["Yes", "No"], opts, {
+            kind: "permission",
+            message: title,
+        });
         return result === "Yes";
     }
     async promptForMissingSessionCwd(error) {
@@ -2159,66 +2261,30 @@ export class InteractiveMode {
                 resolve(undefined);
                 return;
             }
-            const onAbort = () => {
-                this.hideExtensionInput();
-                resolve(undefined);
-            };
-            opts?.signal?.addEventListener("abort", onAbort, { once: true });
-            this.extensionInput = new ExtensionInputComponent(title, placeholder, (value) => {
+            const finish = (value) => {
                 opts?.signal?.removeEventListener("abort", onAbort);
-                this.hideExtensionInput();
+                input.dispose();
+                this.removeExtensionDialog(input);
                 resolve(value);
-            }, () => {
-                opts?.signal?.removeEventListener("abort", onAbort);
-                this.hideExtensionInput();
-                resolve(undefined);
-            }, { tui: this.ui, timeout: opts?.timeout });
-            this.disposeActiveSelector();
-            this.editorContainer.clear();
-            this.editorContainer.addChild(this.extensionInput);
-            this.ui.setFocus(this.extensionInput);
-            this.ui.requestRender();
+            };
+            const onAbort = () => finish(undefined);
+            opts?.signal?.addEventListener("abort", onAbort, { once: true });
+            const input = new ExtensionInputComponent(title, placeholder, (value) => finish(value), () => finish(undefined), { tui: this.ui, timeout: opts?.timeout });
+            this.pushExtensionDialog(input, { kind: "question", message: title });
         });
-    }
-    /**
-     * Hide the extension input.
-     */
-    hideExtensionInput() {
-        this.extensionInput?.dispose();
-        this.editorContainer.clear();
-        this.editorContainer.addChild(this.editor);
-        this.extensionInput = undefined;
-        this.ui.setFocus(this.editor);
-        this.ui.requestRender();
     }
     /**
      * Show a multi-line editor for extensions (with Ctrl+G support).
      */
     showExtensionEditor(title, prefill) {
         return new Promise((resolve) => {
-            this.extensionEditor = new ExtensionEditorComponent(this.ui, this.keybindings, title, prefill, (value) => {
-                this.hideExtensionEditor();
+            const finish = (value) => {
+                this.removeExtensionDialog(editor);
                 resolve(value);
-            }, () => {
-                this.hideExtensionEditor();
-                resolve(undefined);
-            }, undefined, this.settingsManager.getExternalEditorCommand());
-            this.disposeActiveSelector();
-            this.editorContainer.clear();
-            this.editorContainer.addChild(this.extensionEditor);
-            this.ui.setFocus(this.extensionEditor);
-            this.ui.requestRender();
+            };
+            const editor = new ExtensionEditorComponent(this.ui, this.keybindings, title, prefill, (value) => finish(value), () => finish(undefined), undefined, this.settingsManager.getExternalEditorCommand());
+            this.pushExtensionDialog(editor, { kind: "question", message: title });
         });
-    }
-    /**
-     * Hide the extension editor.
-     */
-    hideExtensionEditor() {
-        this.editorContainer.clear();
-        this.editorContainer.addChild(this.editor);
-        this.extensionEditor = undefined;
-        this.ui.setFocus(this.editor);
-        this.ui.requestRender();
     }
     /**
      * Set a custom editor component from an extension.
@@ -2228,8 +2294,12 @@ export class InteractiveMode {
         this.editorComponentFactory = factory;
         // Save text from current editor before switching
         const currentText = this.editor.getText();
-        this.disposeActiveSelector();
-        this.editorContainer.clear();
+        // An open extension dialog keeps the editor slot; the new editor is shown when the last dialog closes.
+        const dialogOpen = this.extensionDialogs.length > 0;
+        if (!dialogOpen) {
+            this.disposeActiveSelector();
+            this.editorContainer.clear();
+        }
         if (factory) {
             // Create the custom editor with tui, theme, and keybindings
             const newEditor = factory(this.ui, getEditorTheme(), this.keybindings);
@@ -2280,7 +2350,8 @@ export class InteractiveMode {
             this.defaultEditor.setText(currentText);
             this.editor = this.defaultEditor;
         }
-        this.editorContainer.addChild(this.editor);
+        if (!dialogOpen)
+            this.editorContainer.addChild(this.editor);
         if (this.activeStatusIndicator) {
             this.statusContainer.clear();
             this.activeWorkingIndicatorEmbedded = this.setEditorWorkingStatusIndicator(this.activeStatusIndicator);
@@ -2288,7 +2359,8 @@ export class InteractiveMode {
                 this.statusContainer.addChild(this.activeStatusIndicator);
             }
         }
-        this.ui.setFocus(this.editor);
+        if (!dialogOpen)
+            this.ui.setFocus(this.editor);
         this.ui.requestRender();
     }
     /**
@@ -2309,22 +2381,23 @@ export class InteractiveMode {
     async showExtensionCustom(factory, options) {
         const savedText = this.editor.getText();
         const isOverlay = options?.overlay ?? false;
-        const restoreEditor = () => {
-            this.editorContainer.clear();
-            this.editorContainer.addChild(this.editor);
-            this.editor.setText(savedText);
-            this.ui.setFocus(this.editor);
-            this.ui.requestRender();
-        };
         return new Promise((resolve, reject) => {
             let component;
+            let overlayHandle;
             let closed = false;
+            const restoreEditor = () => {
+                if (component)
+                    this.removeExtensionDialog(component);
+                this.editor.setText(savedText);
+                this.ui.requestRender();
+            };
             const close = (result) => {
                 if (closed)
                     return;
                 closed = true;
+                // Remove this overlay, not the topmost one: another overlay may have opened above it.
                 if (isOverlay)
-                    this.ui.hideOverlay();
+                    overlayHandle?.hide();
                 else
                     restoreEditor();
                 // Note: both branches above already call requestRender
@@ -2351,19 +2424,15 @@ export class InteractiveMode {
                             return opts;
                         }
                         // Fallback: use component's width property if available
-                        const w = component.width;
+                        const w = c.width;
                         return w ? { width: w } : undefined;
                     };
-                    const handle = this.ui.showOverlay(component, resolveOptions());
+                    overlayHandle = this.ui.showOverlay(c, resolveOptions());
                     // Expose handle to caller for visibility control
-                    options?.onHandle?.(handle);
+                    options?.onHandle?.(overlayHandle);
                 }
                 else {
-                    this.disposeActiveSelector();
-                    this.editorContainer.clear();
-                    this.editorContainer.addChild(component);
-                    this.ui.setFocus(component);
-                    this.ui.requestRender();
+                    this.pushExtensionDialog(c, options?.blocked);
                 }
             })
                 .catch((err) => {
@@ -2729,6 +2798,7 @@ export class InteractiveMode {
             await this.init();
         }
         this.footer.invalidate();
+        this.programStatus.handleEvent(event);
         switch (event.type) {
             case "agent_start":
                 this.pendingTools.clear();
@@ -2834,6 +2904,7 @@ export class InteractiveMode {
                                 const component = new ToolExecutionComponent(content.name, content.id, content.arguments, {
                                     showImages: this.settingsManager.getShowImages(),
                                     imageWidthCells: this.settingsManager.getImageWidthCells(),
+                                    outputPad: this.outputPad,
                                 }, this.getRegisteredToolDefinition(content.name), this.ui, this.sessionManager.getCwd());
                                 component.setExpanded(this.toolOutputExpanded);
                                 this.chatContainer.addChild(component);
@@ -2904,6 +2975,7 @@ export class InteractiveMode {
                     component = new ToolExecutionComponent(event.toolName, event.toolCallId, event.args, {
                         showImages: this.settingsManager.getShowImages(),
                         imageWidthCells: this.settingsManager.getImageWidthCells(),
+                        outputPad: this.outputPad,
                     }, this.getRegisteredToolDefinition(event.toolName), this.ui, this.sessionManager.getCwd());
                     component.setExpanded(this.toolOutputExpanded);
                     this.chatContainer.addChild(component);
@@ -2926,7 +2998,7 @@ export class InteractiveMode {
                     this.maybeShowInstallChangeWarning();
                 const component = this.pendingTools.get(event.toolCallId);
                 if (component) {
-                    component.updateResult({ ...event.result, isError: event.isError });
+                    component.updateResult({ ...event.result, isError: event.isError, durationMs: event.durationMs });
                     this.pendingTools.delete(event.toolCallId);
                     this.ui.requestRender();
                 }
@@ -2957,7 +3029,10 @@ export class InteractiveMode {
                 this.defaultEditor.onEscape = () => {
                     this.session.abortCompaction();
                 };
-                this.showStatusIndicator(new CompactionStatusIndicator(this.ui, event.reason));
+                const colorFn = isEmbeddedStatus(this.editor)
+                    ? (text) => (this.editor.borderColor ?? theme.getThinkingBorderColor(this.session.thinkingLevel || "off"))(text)
+                    : undefined;
+                this.showStatusIndicator(new CompactionStatusIndicator(this.ui, event.reason, colorFn));
                 this.ui.requestRender();
                 break;
             }
@@ -3046,7 +3121,10 @@ export class InteractiveMode {
                     this.showStatusIndicator(new BranchSummaryStatusIndicator(this.ui));
                 }
                 else {
-                    this.showStatusIndicator(new CompactionStatusIndicator(this.ui, event.reason));
+                    const colorFn = isEmbeddedStatus(this.editor)
+                        ? (text) => (this.editor.borderColor ?? theme.getThinkingBorderColor(this.session.thinkingLevel || "off"))(text)
+                        : undefined;
+                    this.showStatusIndicator(new CompactionStatusIndicator(this.ui, event.reason, colorFn));
                 }
                 this.ui.requestRender();
                 break;
@@ -3110,7 +3188,7 @@ export class InteractiveMode {
         if (!renderer) {
             return;
         }
-        const component = new CustomEntryComponent(entry, renderer);
+        const component = new CustomEntryComponent(entry, renderer, this.outputPad);
         component.setExpanded(this.toolOutputExpanded);
         if (!component.hasContent()) {
             return;
@@ -3127,7 +3205,7 @@ export class InteractiveMode {
     addMessageToChat(message, options) {
         switch (message.role) {
             case "bashExecution": {
-                const component = new BashExecutionComponent(message.command, this.ui, message.excludeFromContext);
+                const component = new BashExecutionComponent(message.command, this.ui, message.excludeFromContext, this.outputPad);
                 if (message.output) {
                     component.appendOutput(message.output);
                 }
@@ -3146,14 +3224,14 @@ export class InteractiveMode {
             }
             case "compactionSummary": {
                 this.chatContainer.addChild(new Spacer(1));
-                const component = new CompactionSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
+                const component = new CompactionSummaryMessageComponent(message, this.getMarkdownThemeWithSettings(), this.outputPad);
                 component.setExpanded(this.toolOutputExpanded);
                 this.chatContainer.addChild(component);
                 break;
             }
             case "branchSummary": {
                 this.chatContainer.addChild(new Spacer(1));
-                const component = new BranchSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
+                const component = new BranchSummaryMessageComponent(message, this.getMarkdownThemeWithSettings(), this.outputPad);
                 component.setExpanded(this.toolOutputExpanded);
                 this.chatContainer.addChild(component);
                 break;
@@ -3169,18 +3247,18 @@ export class InteractiveMode {
                     const skillBlock = parseSkillBlock(textContent);
                     if (skillBlock) {
                         // Render skill block (collapsible)
-                        const component = new SkillInvocationMessageComponent(skillBlock, this.getMarkdownThemeWithSettings());
+                        const component = new SkillInvocationMessageComponent(skillBlock, this.getMarkdownThemeWithSettings(), this.outputPad);
                         component.setExpanded(this.toolOutputExpanded);
                         this.chatContainer.addChild(component);
                         // Render user message separately if present
                         if (skillBlock.userMessage) {
                             this.chatContainer.addChild(new Spacer(1));
-                            const userComponent = new UserMessageComponent(skillBlock.userMessage, this.getMarkdownThemeWithSettings(), this.outputPad, this.getMarkdownTransformers());
+                            const userComponent = new UserMessageComponent(skillBlock.userMessage, this.getMarkdownThemeWithSettings(), this.outputPad, this.getMarkdownTransformers(), options?.messageId, options?.timestamp);
                             this.chatContainer.addChild(userComponent);
                         }
                     }
                     else {
-                        const userComponent = new UserMessageComponent(textContent, this.getMarkdownThemeWithSettings(), this.outputPad, this.getMarkdownTransformers());
+                        const userComponent = new UserMessageComponent(textContent, this.getMarkdownThemeWithSettings(), this.outputPad, this.getMarkdownTransformers(), options?.messageId, options?.timestamp);
                         this.chatContainer.addChild(userComponent);
                     }
                     if (options?.populateHistory) {
@@ -3190,7 +3268,7 @@ export class InteractiveMode {
                 break;
             }
             case "assistant": {
-                const assistantComponent = new AssistantMessageComponent(message, this.hideThinkingBlock, this.getMarkdownThemeWithSettings(), this.hiddenThinkingLabel, this.outputPad, this.getMarkdownTransformers());
+                const assistantComponent = new AssistantMessageComponent(message, this.hideThinkingBlock, this.getMarkdownThemeWithSettings(), this.hiddenThinkingLabel, this.outputPad, this.getMarkdownTransformers(), options?.messageId, options?.timestamp);
                 this.chatContainer.addChild(assistantComponent);
                 break;
             }
@@ -3203,7 +3281,7 @@ export class InteractiveMode {
             }
         }
     }
-    renderSessionItems(items, options = {}) {
+    renderSessionItems(items, messageMeta, options = {}) {
         this.pendingTools.clear();
         const renderedPendingTools = new Map();
         // Cache misses are not persisted, unlike successful cache-warming usage.
@@ -3231,13 +3309,18 @@ export class InteractiveMode {
             const message = item;
             // Assistant messages need special handling for tool calls
             if (message.role === "assistant") {
-                this.addMessageToChat(message);
+                const meta = messageMeta?.get(message);
+                this.addMessageToChat(message, {
+                    messageId: meta?.id,
+                    timestamp: meta?.timestamp,
+                });
                 // Render tool call components
                 for (const content of message.content) {
                     if (content.type === "toolCall") {
                         const component = new ToolExecutionComponent(content.name, content.id, content.arguments, {
                             showImages: this.settingsManager.getShowImages(),
                             imageWidthCells: this.settingsManager.getImageWidthCells(),
+                            outputPad: this.outputPad,
                         }, this.getRegisteredToolDefinition(content.name), this.ui, this.sessionManager.getCwd());
                         component.setExpanded(this.toolOutputExpanded);
                         this.chatContainer.addChild(component);
@@ -3276,7 +3359,12 @@ export class InteractiveMode {
             }
             else {
                 // All other messages use standard rendering
-                this.addMessageToChat(message, options);
+                const meta = messageMeta?.get(message);
+                this.addMessageToChat(message, {
+                    ...options,
+                    messageId: meta?.id,
+                    timestamp: meta?.timestamp,
+                });
             }
         }
         for (const [toolCallId, component] of renderedPendingTools) {
@@ -3291,17 +3379,24 @@ export class InteractiveMode {
      * @param options.populateHistory Add user messages to editor history
      */
     renderSessionEntries(entries, options = {}) {
+        // Selection coordinates point into the transcript being replaced (#9311).
+        if (this.renderer instanceof TuiAltScreen)
+            this.renderer.resetTextSelection();
+        const messageMeta = new Map();
         const items = entries.flatMap((entry) => {
             if (entry.type === "custom" || (entry.type === "usage" && entry.kind === "cache_warm")) {
                 return [entry];
             }
             const messages = sessionEntryToContextMessages(entry);
+            for (const msg of messages) {
+                messageMeta.set(msg, { id: entry.id, timestamp: entry.timestamp });
+            }
             if ((entry.type === "compaction" || entry.type === "branch_summary") && entry.usage && messages.length > 0) {
                 return [...messages, { type: "compaction_cost", kind: entry.type, usage: entry.usage }];
             }
             return messages;
         });
-        this.renderSessionItems(items, options);
+        this.renderSessionItems(items, messageMeta, options);
     }
     addCacheWarmingUsage(entry) {
         if (!this.settingsManager.getShowCacheMissNotices())
@@ -3750,6 +3845,9 @@ export class InteractiveMode {
             if (result.status === "complete") {
                 this.editor.setText(result.content);
             }
+            else {
+                this.showStatus(result.message);
+            }
         }
         finally {
             this.ui.start();
@@ -4029,6 +4127,7 @@ export class InteractiveMode {
                 steeringMode: this.session.steeringMode,
                 followUpMode: this.session.followUpMode,
                 transport: this.settingsManager.getTransport(),
+                sessionShareDestination: this.settingsManager.getSessionShareDestination(),
                 httpIdleTimeoutMs: this.settingsManager.getHttpIdleTimeoutMs(),
                 cacheWarmingMode: this.settingsManager.getCacheWarmingMode(),
                 thinkingLevel: this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
@@ -4098,6 +4197,9 @@ export class InteractiveMode {
                 onTransportChange: (transport) => {
                     this.settingsManager.setTransport(transport);
                     this.session.agent.transport = transport;
+                },
+                onSessionShareDestinationChange: (destination) => {
+                    this.settingsManager.setSessionShareDestination(destination);
                 },
                 onHttpIdleTimeoutMsChange: (timeoutMs) => {
                     this.settingsManager.setHttpIdleTimeoutMs(timeoutMs);
@@ -4180,21 +4282,14 @@ export class InteractiveMode {
                 onOutputPadChange: (padding) => {
                     this.settingsManager.setOutputPad(padding);
                     this.outputPad = padding;
-                    if (this.streamingComponent || this.session.isStreaming) {
-                        for (const child of this.chatContainer.children) {
-                            if (child instanceof AssistantMessageComponent ||
-                                child instanceof CustomMessageComponent ||
-                                child instanceof UserMessageComponent) {
+                    for (const container of [this.chatContainer, this.pendingMessagesContainer]) {
+                        for (const child of container.children) {
+                            if ("setOutputPad" in child && typeof child.setOutputPad === "function") {
                                 child.setOutputPad(padding);
                             }
                         }
-                        if (this.streamingComponent) {
-                            this.streamingComponent.setOutputPad(padding);
-                        }
-                        this.ui.requestRender();
-                        return;
                     }
-                    this.rebuildChatFromMessages();
+                    this.ui.requestRender();
                 },
                 onAutocompleteMaxVisibleChange: (maxVisible) => {
                     this.settingsManager.setAutocompleteMaxVisible(maxVisible);
@@ -5157,7 +5252,7 @@ export class InteractiveMode {
             this.ui.requestRender();
         };
         try {
-            await this.loginProvider(dialog, providerId, "api_key");
+            await this.loginProvider(dialog, providerId, providerName, "api_key");
             restoreEditor();
             await this.completeProviderAuthentication(providerId, providerName, "api_key", previousModel);
         }
@@ -5245,12 +5340,18 @@ export class InteractiveMode {
             dialog.showProgress(event.message);
         }
     }
-    async loginProvider(dialog, providerId, method) {
-        await this.session.modelRuntime.login(providerId, method, {
-            signal: dialog.signal,
-            prompt: (prompt) => this.showAuthPrompt(dialog, prompt, providerId),
-            notify: (event) => this.notifyAuthDialog(dialog, event),
-        }, { getDeviceId: () => this.settingsManager.getOrCreateDeviceId() });
+    async loginProvider(dialog, providerId, providerName, method) {
+        this.programStatus.setBlocked("login", { kind: "auth", message: `Log in to ${providerName}` });
+        try {
+            await this.session.modelRuntime.login(providerId, method, {
+                signal: dialog.signal,
+                prompt: (prompt) => this.showAuthPrompt(dialog, prompt, providerId),
+                notify: (event) => this.notifyAuthDialog(dialog, event),
+            }, { getDeviceId: () => this.settingsManager.getOrCreateDeviceId() });
+        }
+        finally {
+            this.programStatus.setBlocked("login", undefined);
+        }
     }
     async showLoginDialog(providerId, providerName, onBack) {
         const previousModel = this.session.model;
@@ -5266,7 +5367,7 @@ export class InteractiveMode {
             this.ui.requestRender();
         };
         try {
-            await this.loginProvider(dialog, providerId, "oauth");
+            await this.loginProvider(dialog, providerId, providerName, "oauth");
             restoreEditor();
             await this.completeProviderAuthentication(providerId, providerName, "oauth", previousModel);
             if (providerId === RADIUS_PROVIDER_ID)
@@ -5853,7 +5954,7 @@ export class InteractiveMode {
         if (eventResult?.result) {
             const result = eventResult.result;
             // Create UI component for display
-            this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
+            this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext, this.outputPad);
             if (this.session.isStreaming) {
                 this.pendingMessagesContainer.addChild(this.bashComponent);
                 this.pendingBashComponents.push(this.bashComponent);
@@ -5874,7 +5975,7 @@ export class InteractiveMode {
         }
         // Normal execution path (possibly with custom operations)
         const isDeferred = this.session.isStreaming;
-        this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
+        this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext, this.outputPad);
         if (isDeferred) {
             // Show in pending area when agent is streaming
             this.pendingMessagesContainer.addChild(this.bashComponent);

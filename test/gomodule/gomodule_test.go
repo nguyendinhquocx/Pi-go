@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
 // SPDX-License-Identifier: MIT
 
 // Package gomodule guards the public Go module contract. Dependency versions and checksums describe published modules, independently of the PiG development version. Workspace builds use the local SDK; the separate module-publication CI gate verifies that required tags exist remotely.
@@ -12,6 +11,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MichaelKinsy/PiG/internal/testenv"
+
 	"go.yaml.in/yaml/v3"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
@@ -24,11 +25,7 @@ const rootModule = "github.com/MichaelKinsy/PiG"
 
 func repoRoot(t *testing.T) string {
 	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("resolve test path")
-	}
-	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	return testenv.ModuleRoot(t)
 }
 
 func parseMod(t *testing.T, path string) *modfile.File {
@@ -214,5 +211,31 @@ func TestModuleTagsScriptListsEveryReleaseTag(t *testing.T) {
 	out, err = exec.Command("bash", script, version, filepath.Join(dir, "go.mod")).CombinedOutput()
 	if err == nil || !strings.Contains(string(out), "replace or exclude") {
 		t.Errorf("module-tags.sh accepted a go.mod with a replace directive: %v\n%s", err, out)
+	}
+}
+
+// Between releases main requires extensions/sdk at the pseudo-version of a main commit. The release plan must refuse that pin for any release
+// until make set-version --release-modules replaces it with the release tag, so a release cannot publish a root module that requires a commit.
+func TestModuleTagsScriptRefusesAPseudoVersionPin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("module-tags.sh runs on the Linux release runner")
+	}
+	root := repoRoot(t)
+	script := filepath.Join(root, "automation", "release", "module-tags.sh")
+	dir := t.TempDir()
+	const pin = "v0.3.1-0.20261020232631-3ee123c6d5f4"
+	goMod := "module " + rootModule + "\n\ngo 1.26.0\n\nrequire " + rootModule + "/extensions/sdk " + pin + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "extensions", "sdk"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "extensions", "sdk", "go.mod"), []byte("module "+rootModule+"/extensions/sdk\n\ngo 1.26.0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("bash", script, "0.5.2", filepath.Join(dir, "go.mod")).CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "the release commit must require v0.5.2") {
+		t.Fatalf("module-tags.sh 0.5.2 did not refuse a pseudo-version pin: %v\n%s", err, out)
 	}
 }

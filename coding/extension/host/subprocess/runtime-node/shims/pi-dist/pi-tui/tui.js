@@ -67,6 +67,15 @@ export function isFocusable(component) {
  * TUI finds and strips this marker, then positions the hardware cursor there.
  */
 export const CURSOR_MARKER = "\x1b_pi:c\x07";
+/** Fake cursor markers - zero-width APC sequences around the text drawn as the cursor. See resolveFakeCursors(). */
+export const FAKE_CURSOR_START = "\x1b_pi:fc\x07";
+export const FAKE_CURSOR_END = "\x1b_pi:/fc\x07";
+// CURSOR_MARKER + FAKE_CURSOR_START + text + FAKE_CURSOR_END. Truncating the line right after the cursor cell drops the end.
+const FOCUSED_FAKE_CURSOR = /(\x1b_pi:c\x07)\x1b_pi:fc\x07(.*?)(?:\x1b_pi:\/fc\x07|$)/s;
+/** Wrap text in fake cursor markers. */
+export function renderFakeCursor(text) {
+    return `${FAKE_CURSOR_START}${text}${FAKE_CURSOR_END}`;
+}
 export { visibleWidth };
 /** Parse a SizeValue into absolute value given a reference size */
 function parseSizeValue(value, referenceSize) {
@@ -216,6 +225,28 @@ export class TuiBase extends Container {
     afterTerminalStart() { }
     beforeTerminalStop(_options) { }
     afterTerminalStop(_options) { }
+    /** Mode resets written before the terminal's own resets when the process exits without stop(). */
+    getExitRestorePrefix() {
+        return `${this.terminalColorSchemeNotificationsEnabled ? "\x1b[?2031l" : ""}\x1b[?25h`;
+    }
+    /** Mode resets written after the terminal's own resets when the process exits without stop(). */
+    getExitRestoreSuffix() {
+        return "";
+    }
+    /**
+     * Last-resort restore for exit paths that skip stop(), e.g. a direct process.exit() (#11170).
+     * Hard kills and native aborts run no JavaScript and cannot be covered.
+     */
+    exitRestoreHandler = () => {
+        if (this.stopped)
+            return;
+        try {
+            this.terminal.restoreOnExit?.(this.getExitRestorePrefix(), this.getExitRestoreSuffix());
+        }
+        catch {
+            // Never throw from an exit handler.
+        }
+    };
     get fullRedraws() {
         return this.fullRedrawCount;
     }
@@ -559,6 +590,8 @@ export class TuiBase extends Container {
     }
     start() {
         this.stopped = false;
+        process.off("exit", this.exitRestoreHandler);
+        process.on("exit", this.exitRestoreHandler);
         this.beforeTerminalStart();
         this.terminal.start((data) => this.handleTerminalInput(data), () => this.requestRender());
         this.afterTerminalStart();
@@ -604,6 +637,7 @@ export class TuiBase extends Container {
     }
     stop(options = {}) {
         this.stopped = true;
+        process.off("exit", this.exitRestoreHandler);
         this.cancelRenderTimer();
         if (this.terminalColorSchemeNotificationsEnabled) {
             this.terminal.write("\x1b[?2031l");
@@ -966,7 +1000,7 @@ export class TuiBase extends Container {
             // (width and maxHeight don't depend on overlay height)
             const { width, maxHeight } = this.resolveOverlayLayout(options, 0, termWidth, termHeight);
             // Render component at calculated width
-            let overlayLines = component.render(width);
+            let overlayLines = this.resolveFakeCursors(component.render(width));
             // Apply maxHeight if specified
             if (maxHeight !== undefined && overlayLines.length > maxHeight) {
                 overlayLines = overlayLines.slice(0, maxHeight);
@@ -1044,6 +1078,19 @@ export class TuiBase extends Container {
             }
         }
         return null;
+    }
+    /**
+     * Resolve fake cursor markers to reverse video. When the hardware cursor is shown, a fake cursor
+     * directly after CURSOR_MARKER is dropped because the terminal cursor is drawn there. Fake cursors
+     * of components without focus have no CURSOR_MARKER and stay visible.
+     */
+    resolveFakeCursors(lines) {
+        return lines.map((line) => {
+            if (!line.includes(FAKE_CURSOR_START))
+                return line;
+            const resolved = this.showHardwareCursor ? line.replace(FOCUSED_FAKE_CURSOR, "$1$2") : line;
+            return resolved.replaceAll(FAKE_CURSOR_START, "\x1b[7m").replaceAll(FAKE_CURSOR_END, "\x1b[27m");
+        });
     }
     /**
      * Query the terminal's theme colors: the default foreground (OSC 10), the default background

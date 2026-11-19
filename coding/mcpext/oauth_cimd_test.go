@@ -1,5 +1,7 @@
 package mcpext_test
 
+// pi: packages/coding-agent/src/extensions/mcp/oauth.ts
+
 import (
 	"context"
 	"crypto/sha256"
@@ -11,15 +13,23 @@ import (
 	"testing"
 
 	"github.com/MichaelKinsy/PiG/coding/mcpext"
+	"github.com/MichaelKinsy/PiG/mcp/oauth"
 )
 
 // Ports packages/coding-agent/test/mcp-oauth-refresh.test.ts ("MCP OAuth client ID metadata documents", #10302).
 
-var cimdSettings = mcpext.McpOAuthSettings{ClientRegistration: "cimd"}
+var (
+	cimdSettings = mcpext.McpOAuthSettings{ClientRegistration: "cimd"}
+	dcrSettings  = mcpext.McpOAuthSettings{ClientRegistration: "dcr"}
+)
+
+// piAppName is the APP_NAME of the pi these cases port: `auto` identifies with pi's documents only as that application.
+const piAppName = "pi"
 
 type cimdHarness struct {
-	server *oauthMcpServer
-	store  mcpext.McpOAuthServerStore
+	server  *oauthMcpServer
+	store   mcpext.McpOAuthServerStore
+	appName string
 }
 
 func startCimdServer(t *testing.T, options oauthMcpServerOptions) *cimdHarness {
@@ -29,7 +39,7 @@ func startCimdServer(t *testing.T, options oauthMcpServerOptions) *cimdHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &cimdHarness{server: server, store: store}
+	return &cimdHarness{server: server, store: store, appName: piAppName}
 }
 
 func (h *cimdHarness) signIn(t *testing.T, settings mcpext.McpOAuthSettings, prompt mcpext.McpSignInPrompt) error {
@@ -37,7 +47,7 @@ func (h *cimdHarness) signIn(t *testing.T, settings mcpext.McpOAuthSettings, pro
 	if prompt == nil {
 		prompt = followPrompt{}
 	}
-	return mcpext.SignInMcpServer(t.Context(), mcpext.SignInOptions{ServerURL: h.server.URL, Store: h.store, Settings: settings, Prompt: prompt})
+	return mcpext.SignInMcpServer(t.Context(), mcpext.SignInOptions{ServerURL: h.server.URL, Store: h.store, Settings: settings, Prompt: prompt, AppName: h.appName})
 }
 
 func (h *cimdHarness) storedClientID(t *testing.T) (string, bool) {
@@ -52,9 +62,9 @@ func (h *cimdHarness) storedClientID(t *testing.T) (string, bool) {
 	return state.ClientInformation.ClientID, true
 }
 
-func TestMCPOAuthCIMDRegistersDynamicallyByDefaultEvenWhenTheServerSupportsDocuments(t *testing.T) {
+func TestMCPOAuthCIMDRegistersDynamicallyWithDcrEvenWhenTheServerSupportsDocuments(t *testing.T) {
 	h := startCimdServer(t, oauthMcpServerOptions{Cimd: true, IssParameter: true})
-	if err := h.signIn(t, mcpext.McpOAuthSettings{}, nil); err != nil {
+	if err := h.signIn(t, dcrSettings, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := h.server.registrationCount(); got != 1 {
@@ -65,9 +75,10 @@ func TestMCPOAuthCIMDRegistersDynamicallyByDefaultEvenWhenTheServerSupportsDocum
 	}
 }
 
+// #11426
 func TestMCPOAuthCIMDUsesPisDocumentWhenAuthorizationResponsesNameTheirIssuer(t *testing.T) {
 	h := startCimdServer(t, oauthMcpServerOptions{Cimd: true, IssParameter: true})
-	if err := h.signIn(t, cimdSettings, nil); err != nil {
+	if err := h.signIn(t, mcpext.McpOAuthSettings{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	authorization := h.server.recordedAuthorizations()[0]
@@ -92,7 +103,7 @@ func TestMCPOAuthCIMDUsesPisDocumentWhenAuthorizationResponsesNameTheirIssuer(t 
 	if id, ok := h.storedClientID(t); ok {
 		t.Fatalf("stored client = %q", id)
 	}
-	if err := h.signIn(t, cimdSettings, nil); err != nil {
+	if err := h.signIn(t, mcpext.McpOAuthSettings{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(h.server.recordedAuthorizations()); got != 1 {
@@ -101,6 +112,69 @@ func TestMCPOAuthCIMDUsesPisDocumentWhenAuthorizationResponsesNameTheirIssuer(t 
 	tokens = h.server.recordedTokenRequests()
 	if tokens[1].Get("grant_type") != "refresh_token" || tokens[1].Get("client_id") != "https://pi.dev/oauth/client.json" {
 		t.Fatalf("second token request = %v", tokens[1])
+	}
+}
+
+// #11426
+func TestMCPOAuthCIMDRegistersDynamicallyByDefaultWhenTheServerDoesNotSupportDocuments(t *testing.T) {
+	h := startCimdServer(t, oauthMcpServerOptions{IssParameter: true})
+	if err := h.signIn(t, mcpext.McpOAuthSettings{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.server.registrationCount(); got != 1 {
+		t.Fatalf("registrations = %d", got)
+	}
+	if got := h.server.recordedAuthorizations()[0].Get("client_id"); got != "client-1" {
+		t.Fatalf("client_id = %q", got)
+	}
+}
+
+// #11426
+func TestMCPOAuthCIMDRegistersDynamicallyByDefaultWithAClientName(t *testing.T) {
+	h := startCimdServer(t, oauthMcpServerOptions{Cimd: true, IssParameter: true})
+	if err := h.signIn(t, mcpext.McpOAuthSettings{ClientName: "Claude Code"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.server.registrationCount(); got != 1 {
+		t.Fatalf("registrations = %d", got)
+	}
+	if got := h.server.registrationClientNames(); len(got) != 1 || got[0] != "Claude Code" {
+		t.Fatalf("client_name = %v", got)
+	}
+}
+
+// pig divergence (D2): inherited from Pi (oauth.ts offersClientMetadataDocument): a build whose application is not pi
+// would show up as pi, so `auto` registers instead, and only `cimd` identifies with pi's document.
+func TestMCPOAuthCIMDRegistersDynamicallyByDefaultEvenWhenTheServerSupportsDocuments(t *testing.T) {
+	h := startCimdServer(t, oauthMcpServerOptions{Cimd: true, IssParameter: true})
+	h.appName = "pig"
+	if err := h.signIn(t, mcpext.McpOAuthSettings{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.server.registrationCount(); got != 1 {
+		t.Fatalf("registrations = %d", got)
+	}
+}
+
+// #11426
+func TestMCPOAuthCIMDKeepsARegisteredClientByDefault(t *testing.T) {
+	h := startCimdServer(t, oauthMcpServerOptions{Cimd: true, IssParameter: true})
+	if err := h.signIn(t, dcrSettings, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.signIn(t, mcpext.McpOAuthSettings{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// The registered client's tokens are refreshed instead of signing in with the document.
+	if got := len(h.server.recordedAuthorizations()); got != 1 {
+		t.Fatalf("authorizations = %d", got)
+	}
+	tokens := h.server.recordedTokenRequests()
+	if tokens[1].Get("grant_type") != "refresh_token" || tokens[1].Get("client_id") != "client-1" {
+		t.Fatalf("second token request = %v", tokens[1])
+	}
+	if id, _ := h.storedClientID(t); id != "client-1" {
+		t.Fatalf("stored client = %q", id)
 	}
 }
 
@@ -133,7 +207,7 @@ func TestMCPOAuthCIMDUsesADocumentAndCallbackPathSpecificToTheMCPServerWithoutTh
 
 func TestMCPOAuthCIMDReplacesARegisteredClientWhenSwitchingToTheDocument(t *testing.T) {
 	h := startCimdServer(t, oauthMcpServerOptions{Cimd: true, IssParameter: true})
-	if err := h.signIn(t, mcpext.McpOAuthSettings{}, nil); err != nil {
+	if err := h.signIn(t, dcrSettings, nil); err != nil {
 		t.Fatal(err)
 	}
 	if id, _ := h.storedClientID(t); id != "client-1" {
@@ -162,7 +236,8 @@ type pastePrompt struct {
 	ready chan struct{}
 }
 
-func (p *pastePrompt) ShowAuthorizationURL(u *url.URL) {
+func (p *pastePrompt) ShowAuthorizationURL(shown oauth.URL) {
+	u, _ := url.Parse(shown.Href())
 	p.mu.Lock()
 	p.shown = u
 	p.mu.Unlock()

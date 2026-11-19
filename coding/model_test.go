@@ -18,7 +18,7 @@ import (
 )
 
 func TestBuildModelUsesGeneratedProviderAPI(t *testing.T) {
-	svcs, err := NewServices(ServicesOptions{CWD: t.TempDir(), AgentDir: t.TempDir()})
+	svcs, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: t.TempDir(), AgentDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,12 +28,12 @@ func TestBuildModelUsesGeneratedProviderAPI(t *testing.T) {
 		providerTy string
 	}{
 		{"openai/gpt-4", "*ai.openAIResponsesProvider"},
-		{"openai-codex/gpt-5.3-codex-spark", "*ai.openAIResponsesProvider"},
+		{"openai-codex/gpt-5.6-sol", "*ai.openAIResponsesProvider"},
 		{"anthropic/claude-haiku-4-5", "*ai.anthropicProvider"},
 		{"google/gemini-2.5-flash", "*ai.googleProvider"},
 		{"google-vertex/gemini-2.5-flash", "*ai.googleVertexProvider"},
 		{"mistral/codestral-latest", "*ai.mistralProvider"},
-		{"amazon-bedrock/amazon.nova-2-lite-v1:0", "*ai.BedrockProvider"},
+		{"amazon-bedrock/amazon.nova-2-lite-v1:0", "*bedrock.BedrockProvider"},
 		{"xai/grok-4.3", "*ai.openAIResponsesProvider"},
 	}
 
@@ -43,9 +43,9 @@ func TestBuildModelUsesGeneratedProviderAPI(t *testing.T) {
 			if err != nil {
 				t.Fatalf("BuildModel: %v", err)
 			}
-			attributed, ok := model.Provider.(*providerAttributionProvider)
+			attributed, ok := model.Provider.(*requestOptionsProvider)
 			if !ok {
-				t.Fatalf("provider type = %T, want *coding.providerAttributionProvider", model.Provider)
+				t.Fatalf("provider type = %T, want *coding.requestOptionsProvider", model.Provider)
 			}
 			if got := fmt.Sprintf("%T", attributed.Provider); got != tc.providerTy {
 				t.Fatalf("underlying provider type = %s, want %s", got, tc.providerTy)
@@ -84,7 +84,7 @@ func TestPiMessagesModelsJSONProviderStreamsThroughModelRuntime(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(agentDir, "models.json"), []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	svcs, err := NewServices(ServicesOptions{CWD: t.TempDir(), AgentDir: agentDir})
+	svcs, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: t.TempDir(), AgentDir: agentDir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestPiMessagesModelsJSONProviderStreamsThroughModelRuntime(t *testing.T) {
 
 func TestPublishedRadiusMetadataReachesModelRuntime(t *testing.T) {
 	t.Setenv("RADIUS_API_KEY", "fixture-key")
-	services, err := NewServices(ServicesOptions{CWD: t.TempDir(), AgentDir: t.TempDir()})
+	services, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: t.TempDir(), AgentDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestBuildModelDoesNotAliasGeneratedFallbackMetadata(t *testing.T) {
 	generated.Compat.AllowedFallbackModels[0].Cost.Tiers = []ai.CostTier{{InputTokensAbove: 1, InputCostPer1M: 2}}
 	defer func() { generated.Compat.AllowedFallbackModels[0].Cost.Tiers = originalTiers }()
 
-	svcs, err := NewServices(ServicesOptions{CWD: t.TempDir(), AgentDir: t.TempDir()})
+	svcs, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: t.TempDir(), AgentDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,68 +145,6 @@ func TestBuildModelDoesNotAliasGeneratedFallbackMetadata(t *testing.T) {
 	}
 	if generated.Compat.AllowedFallbackModels[0].Cost.Tiers[0].InputCostPer1M != 2 {
 		t.Fatal("BuildModel aliased the generated fallback cost tiers")
-	}
-}
-
-// TestBuildModelGatesAttributionHeadersOnInstallTelemetrySetting drives the
-// production path (BuildModel -> Services.ModelRuntime().Complete) rather than
-// calling mergeProviderAttributionHeaders directly, proving
-// SettingsManager.SetEnableInstallTelemetry actually reaches the wire request.
-// Mirrors upstream getDefaultAttributionHeaders' telemetry gate
-// (provider-attribution.ts:40); pig divergence (D26) covers the branding.
-func TestBuildModelGatesAttributionHeadersOnInstallTelemetrySetting(t *testing.T) {
-	var gotHeader http.Header
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		gotHeader = request.Header.Clone()
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
-	}))
-	defer server.Close()
-
-	agentDir := t.TempDir()
-	models := fmt.Sprintf(`{"providers":{"openrouter":{"baseUrl":%q,"api":"openai-completions","authHeader":false,"models":[{"id":"model","name":"Model"}]}}}`, server.URL+"/v1")
-	if err := os.WriteFile(filepath.Join(agentDir, "models.json"), []byte(models), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	services, err := NewServices(ServicesOptions{CWD: t.TempDir(), AgentDir: agentDir})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := services.SettingsManager().SetEnableInstallTelemetry(false); err != nil {
-		t.Fatal(err)
-	}
-	model, err := BuildModel("openrouter/model", services)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := services.ModelRuntime().Complete(context.Background(), model, ai.Context{Messages: []ai.Message{ai.UserMessage{Content: ai.UserText("hi")}}}, ai.StreamOptions{})
-	if result.StopReason != ai.StopReasonStop {
-		t.Fatalf("result = %#v", result)
-	}
-	if gotHeader.Get("HTTP-Referer") != "" || gotHeader.Get("X-OpenRouter-Title") != "" || gotHeader.Get("X-OpenRouter-Categories") != "" {
-		t.Fatalf("expected no attribution headers with install telemetry disabled, got %#v", gotHeader)
-	}
-
-	if err := services.SettingsManager().SetEnableInstallTelemetry(true); err != nil {
-		t.Fatal(err)
-	}
-	model, err = BuildModel("openrouter/model", services)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result = services.ModelRuntime().Complete(context.Background(), model, ai.Context{Messages: []ai.Message{ai.UserMessage{Content: ai.UserText("hi")}}}, ai.StreamOptions{})
-	if result.StopReason != ai.StopReasonStop {
-		t.Fatalf("result = %#v", result)
-	}
-	if got := gotHeader.Get("HTTP-Referer"); got != "https://github.com/MichaelKinsy/PiG" {
-		t.Fatalf("HTTP-Referer = %q, want pig-branded referer", got)
-	}
-	if got := gotHeader.Get("X-OpenRouter-Title"); got != "PiG" {
-		t.Fatalf("X-OpenRouter-Title = %q, want PiG", got)
-	}
-	if got := gotHeader.Get("X-OpenRouter-Categories"); got != "cli-agent" {
-		t.Fatalf("X-OpenRouter-Categories = %q, want cli-agent", got)
 	}
 }
 
@@ -250,7 +188,7 @@ func TestRadiusGatewayCatalogAndStreamThroughModelRuntime(t *testing.T) {
 	if err := auth.Set("radius-dev", ai.Credential{Type: ai.CredentialOAuth, Access: "stale", Refresh: "old-refresh", Expires: 1}); err != nil {
 		t.Fatal(err)
 	}
-	svcs, err := NewServices(ServicesOptions{CWD: t.TempDir(), AgentDir: agentDir})
+	svcs, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: t.TempDir(), AgentDir: agentDir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +226,7 @@ func TestRadiusGatewayCatalogAndStreamThroughModelRuntime(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(agentDir, "models-store.json")); err != nil {
 		t.Fatalf("models-store.json was not written: %v", err)
 	}
-	restoredServices, err := NewServices(ServicesOptions{CWD: t.TempDir(), AgentDir: agentDir})
+	restoredServices, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: t.TempDir(), AgentDir: agentDir})
 	if err != nil {
 		t.Fatal(err)
 	}

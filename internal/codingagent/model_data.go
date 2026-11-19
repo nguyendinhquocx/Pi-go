@@ -3,8 +3,10 @@ package codingagent
 // Ports packages/coding-agent/src/core/provider-composer.ts.
 
 import (
+	"encoding/json"
 	"maps"
 	"slices"
+	"sync"
 
 	"github.com/MichaelKinsy/PiG/ai"
 )
@@ -37,12 +39,44 @@ func anyModelFromDefinition(providerID string, prov providerConfig, md modelDefi
 		if md.ContextWindow != nil {
 			model.ContextWindow = *md.ContextWindow
 		}
+		if md.Compat != nil {
+			compat := overlaySystemOneCompat(nil, md.Compat)
+			model.Compat = &compat
+		}
 		return model
 	}
 	return nativeModelFromEntry(modelDefinitionEntry(providerID, prov, md))
 }
 
+// registeredDefinition is the definition an extension registered and the catalog record built from it. Every copy of a modelDefinition shares one, so
+// a registry change that rebuilds the entry of each model (a namespace switch, a provider registration, a /model listing) encodes the record of a
+// definition once, not once per rebuild: the record is a function of the definition and the three members taken from the provider. The cache holds the
+// record of the last members it was asked for, one record per registered model, which the definition already costs.
+type registeredDefinition struct {
+	raw json.RawMessage
+
+	mu     sync.Mutex
+	api    ai.API
+	id     string
+	base   string
+	record string
+	cached bool
+}
+
+func (d *registeredDefinition) catalogRecord(api ai.API, providerID, baseURL string) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.cached || d.api != api || d.id != providerID || d.base != baseURL {
+		d.record, d.api, d.id, d.base, d.cached = ai.ExtensionModelRecord(d.raw, api, providerID, baseURL), api, providerID, baseURL, true
+	}
+	return d.record
+}
+
+// modelDefinitionEntry resolves a provider's model definition. A registered definition (one an extension registered) is Pi's spread
+// of the definition (provider-composer.ts extensionModelFromDefinition): the entry carries that object as its record, and its input
+// stays as the extension wrote it, where modelFromJson defaults a models.json model's to ["text"].
 func modelDefinitionEntry(providerID string, prov providerConfig, md modelDefinition) ModelEntry {
+	registered := md.registration != nil
 	// Model-level overrides provider-level.
 	baseURL := md.BaseURL
 	if baseURL == "" {
@@ -65,9 +99,11 @@ func modelDefinitionEntry(providerID string, prov providerConfig, md modelDefini
 		reasoning = *md.Reasoning
 	}
 
-	input := []string{"text"}
+	var input []string
 	if md.Input != nil {
 		input = append([]string{}, (*md.Input)...)
+	} else if !registered {
+		input = []string{"text"}
 	}
 
 	ctxWindow := 128000
@@ -79,6 +115,10 @@ func modelDefinitionEntry(providerID string, prov providerConfig, md modelDefini
 	if md.MaxTokens != nil {
 		maxTokens = *md.MaxTokens
 	}
+	var record string
+	if registered && (md.Type == "" || md.Type == ai.ModelTypeChat) {
+		record = md.registration.catalogRecord(ai.API(api), providerID, baseURL)
+	}
 	var inputCost, outputCost, cacheReadCost, cacheWriteCost float64
 	var costTiers []ai.CostTier
 	if md.Cost != nil {
@@ -86,10 +126,12 @@ func modelDefinitionEntry(providerID string, prov providerConfig, md modelDefini
 		outputCost = md.Cost.Output
 		cacheReadCost = md.Cost.CacheRead
 		cacheWriteCost = md.Cost.CacheWrite
-		costTiers = append([]ai.CostTier(nil), md.Cost.Tiers...)
+		costTiers = slices.Clone(md.Cost.Tiers)
 	}
 
 	return ModelEntry{
+		Type:                          md.Type,
+		CatalogRecord:                 record,
 		ProviderID:                    providerID,
 		ModelID:                       md.ID,
 		BaseURL:                       baseURL,
@@ -155,7 +197,7 @@ func applyModelOverride(e *ModelEntry, ovr modelOverrideJSON) {
 			e.CacheWriteCost = *ovr.Cost.CacheWrite
 		}
 		if ovr.Cost.Tiers != nil {
-			e.CostTiers = append([]ai.CostTier(nil), (*ovr.Cost.Tiers)...)
+			e.CostTiers = slices.Clone(*ovr.Cost.Tiers)
 		}
 	}
 	if ovr.PromptCache != nil {

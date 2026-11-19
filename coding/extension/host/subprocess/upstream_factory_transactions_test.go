@@ -1,3 +1,5 @@
+//go:build !pig_strip_node_extensions
+
 package subprocess
 
 import (
@@ -42,6 +44,7 @@ func (r *factoryProviderRecording) bind(host *Host) {
 
 func (r *factoryProviderRecording) assertWorkingOnly(t *testing.T, host *Host) {
 	t.Helper()
+	applyQueuedRegistrations(host)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	want := []factoryProviderRegistration{{Name: "working-provider", Config: extension.ProviderConfig{BaseURL: "https://provider.test/v1", APIKey: "provider-test-key"}}}

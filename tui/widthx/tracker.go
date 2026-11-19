@@ -1,4 +1,4 @@
-// Ports upstream `AnsiCodeTracker` (utils.ts:302).
+// Ports packages/tui/src/utils.ts (AnsiCodeTracker, utils.ts:302).
 //
 // Tracks active SGR attributes and OSC 8 hyperlink state so styling can be
 // preserved across line breaks (wrapTextWithAnsi) and across overlay splices
@@ -33,6 +33,7 @@ func (t *AnsiCodeTracker) Process(code string) {
 		// Preserve the original terminator (BEL \x07 or ST \x1b\\) because
 		// some terminals (e.g. Apple Terminal) only make BEL-terminated links
 		// clickable. Re-opening wrapped lines must use the same terminator.
+		//portlint:allow utf16units utils.ts AnsiCodeTracker.process: code starts with the ASCII "\x1b]8;" that HasPrefix just matched, so its byte length is its unit length
 		body := code[len("\x1b]8;"):]
 		var terminator, closeTerminator string
 		switch {
@@ -74,18 +75,37 @@ func (t *AnsiCodeTracker) Process(code string) {
 		return
 	}
 
-	parts := strings.Split(params, ";")
-	for i := 0; i < len(parts); {
-		c, err := strconv.Atoi(parts[i])
+	// The parameters as strings.Split(params, ";") would give them, kept as offsets so a frame's codes allocate nothing:
+	// parameter k is params[starts[k] : starts[k+1]-1]. A code with more parameters than the stack array holds spills to
+	// the heap.
+	var stack [sgrStackParams + 1]int
+	starts := append(stack[:0], 0)
+	for j := range len(params) {
+		if params[j] == ';' {
+			starts = append(starts, j+1)
+		}
+	}
+	starts = append(starts, len(params)+1)
+	n := len(starts) - 1
+	for i := 0; i < n; {
+		part := sgrParam(params, starts, i)
+		if part == "" {
+			// strconv.Atoi rejects an empty parameter; skip it without building the error.
+			i++
+			continue
+		}
+		//portlint:allow numbers utils.ts AnsiCodeTracker.process parseInt(part, 10) over the [\d;]* SGR parameters: a part is empty or ASCII digits; Atoi's only extra failure is overflow, which no SGR code matches either way
+		c, err := strconv.Atoi(part)
 		if err != nil {
 			i++
 			continue
 		}
 
-		// 256-color / RGB consume multiple params.
-		if (c == 38 || c == 48) && i+1 < len(parts) {
-			if parts[i+1] == "5" && i+2 < len(parts) {
-				colorCode := parts[i] + ";" + parts[i+1] + ";" + parts[i+2]
+		// 256-color / RGB consume multiple params. The color code is the parameters joined by ";", which is the span
+		// of params they occupy.
+		if (c == 38 || c == 48) && i+1 < n {
+			if sgrParam(params, starts, i+1) == "5" && i+2 < n {
+				colorCode := params[starts[i] : starts[i+3]-1]
 				if c == 38 {
 					t.fgColor = colorCode
 				} else {
@@ -94,8 +114,8 @@ func (t *AnsiCodeTracker) Process(code string) {
 				i += 3
 				continue
 			}
-			if parts[i+1] == "2" && i+4 < len(parts) {
-				colorCode := parts[i] + ";" + parts[i+1] + ";" + parts[i+2] + ";" + parts[i+3] + ";" + parts[i+4]
+			if sgrParam(params, starts, i+1) == "2" && i+4 < n {
+				colorCode := params[starts[i] : starts[i+5]-1]
 				if c == 38 {
 					t.fgColor = colorCode
 				} else {
@@ -153,6 +173,15 @@ func (t *AnsiCodeTracker) Process(code string) {
 		}
 		i++
 	}
+}
+
+// sgrStackParams is how many SGR parameters Process walks without a heap allocation; 38;2;r;g;b and 48;2;r;g;b with a few
+// attributes fit.
+const sgrStackParams = 16
+
+// sgrParam is parameter k of params, whose parameter k starts at starts[k] and ends one byte (the ";") before starts[k+1].
+func sgrParam(params string, starts []int, k int) string {
+	return params[starts[k] : starts[k+1]-1]
 }
 
 func (t *AnsiCodeTracker) resetSGR() {
@@ -225,7 +254,7 @@ func (t *AnsiCodeTracker) HasActiveCodes() bool {
 }
 
 // LineEndReset returns the escape string needed at end-of-line to prevent
-// underline from bleeding into padding and to close any active OSC 8
+// underline and strikethrough from bleeding into padding and to close any active OSC 8
 // hyperlink. The hyperlink is re-opened at the start of the next line via
 // ActiveCodes(). Returns "" if no reset is needed.
 //
@@ -234,6 +263,9 @@ func (t *AnsiCodeTracker) LineEndReset() string {
 	var b strings.Builder
 	if t.underline {
 		b.WriteString("\x1b[24m")
+	}
+	if t.strike {
+		b.WriteString("\x1b[29m")
 	}
 	if t.activeHyperlinkOpen != "" {
 		b.WriteString(t.activeHyperlinkClose)

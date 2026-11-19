@@ -1,31 +1,7 @@
-import { calculateCost } from "../models.js";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.js";
-import { headersToRecord, providerHeadersToRecord } from "../utils/headers.js";
-import { retryProviderRequest } from "../utils/provider-retry.js";
-function httpError(label, response, body) {
-    const error = new Error(`${label} returned ${response.status}`);
-    error.status = response.status;
-    error.headers = response.headers;
-    error.body = body;
-    return error;
-}
-function timeoutError(timeoutMs) {
-    const error = new Error(`Request timed out after ${timeoutMs}ms`);
-    error.name = "TimeoutError";
-    error.status = undefined;
-    error.headers = undefined;
-    error.body = "";
-    return error;
-}
-export function isRecord(value) {
-    return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function requiredNumber(label, value, field) {
-    if (typeof value !== "number" || !Number.isFinite(value)) {
-        throw new Error(`${label} returned an invalid ${field}`);
-    }
-    return value;
-}
+import { isRecord, parseClassifierUsage, postClassifierRequest, requiredNumber } from "./classifier-shared.js";
+/** TypeSafe's opt-in header for its experimental image input. */
+const IMAGE_OPT_IN_HEADERS = { "TypeSafe-Danger-Zone-Images": "true" };
 function probabilities(label, value, id) {
     if (!isRecord(value))
         throw new Error(`${label} returned invalid probabilities for ${id}`);
@@ -82,28 +58,44 @@ function parseAnswers(label, value, context) {
     }
     return Object.fromEntries(answers);
 }
-function tokenCount(value) {
-    return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
-}
-/**
- * Usage from System One's `{ input_tokens, output_tokens }`, priced from the model catalog like chat
- * usage. A missing or malformed usage object leaves the result without usage instead of failing it.
- */
-function parseUsage(value, model) {
-    if (!isRecord(value) || (value.input_tokens === undefined && value.output_tokens === undefined))
-        return undefined;
-    const input = tokenCount(value.input_tokens);
-    const output = tokenCount(value.output_tokens);
-    const usage = {
-        input,
-        output,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: input + output,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    };
-    calculateCost(model, usage);
-    return usage;
+const ASSET_FORMATS = { "image/png": "png", "image/jpeg": "jpeg" };
+const DATA_URL_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+/** Clef accepts at most this many images per request. */
+const MAX_DATA_URL_IMAGES = 4;
+/** Adds the context images to `request` in the service's form. */
+function addImages(label, model, input, images, request) {
+    if (input === "images") {
+        if (images.length > MAX_DATA_URL_IMAGES) {
+            throw new Error(`${label} accepts at most ${MAX_DATA_URL_IMAGES} images for ${model.id}, got ${images.length}`);
+        }
+        request.images = images.map((image) => {
+            if (!DATA_URL_TYPES.has(image.mimeType)) {
+                throw new Error(`${label} accepts PNG, JPEG, and WebP images for ${model.id}, got ${image.mimeType}`);
+            }
+            return `data:${image.mimeType};base64,${image.data}`;
+        });
+        return;
+    }
+    if (input === "state-image-urls") {
+        // OpenRouter validates the images against the model that serves the request.
+        const parts = images.map((image) => ({
+            type: "image_url",
+            image_url: { url: `data:${image.mimeType};base64,${image.data}` },
+        }));
+        request.state = [...parts, request.state];
+        return;
+    }
+    const assets = {};
+    images.forEach((image, index) => {
+        const format = ASSET_FORMATS[image.mimeType];
+        if (!format)
+            throw new Error(`${label} accepts PNG and JPEG images for ${model.id}, got ${image.mimeType}`);
+        assets[`<image-${index + 1}>`] = { type: "image", format, data_base64: image.data };
+    });
+    request.assets = assets;
+    // Every asset must be referenced from the request. The names go before the state, where Clef
+    // also places its images.
+    request.state = [...Object.keys(assets), request.state];
 }
 /** Maps public `bool` questions to TypeSafe's wire-level `noul` type. */
 function wireRequest(context) {
@@ -114,9 +106,6 @@ function wireRequest(context) {
             question.type === "bool" ? { ...question, type: "noul" } : question,
         ])),
     };
-}
-function requestHeaders(model, apiKey, optionsHeaders) {
-    return (providerHeadersToRecord({ authorization: `Bearer ${apiKey}`, "content-type": "application/json" }, model.headers, optionsHeaders) ?? {});
 }
 /** Runs one System One classification over the given transport. */
 export async function classifySystemOne(transport, model, context, options) {
@@ -131,44 +120,23 @@ export async function classifySystemOne(transport, model, context, options) {
     try {
         if (model.api !== transport.api)
             throw new Error(`Unsupported classifier API: ${model.api}`);
-        if (!options?.apiKey)
-            throw new Error(`No API key for provider: ${model.provider}`);
-        const apiKey = options.apiKey;
-        let payload = transport.payload(model, wireRequest(context));
-        const transformed = await options.onPayload?.(payload, model);
-        if (transformed !== undefined)
-            payload = transformed;
-        const requestFetch = options.fetch ?? globalThis.fetch;
-        const { response, body } = await retryProviderRequest(async () => {
-            const timeoutSignal = options.timeoutMs !== undefined ? AbortSignal.timeout(options.timeoutMs) : undefined;
-            const signal = options.signal && timeoutSignal
-                ? AbortSignal.any([options.signal, timeoutSignal])
-                : (options.signal ?? timeoutSignal);
-            try {
-                const next = await requestFetch(transport.url(model), {
-                    method: "POST",
-                    headers: requestHeaders(model, apiKey, options.headers),
-                    body: JSON.stringify(payload),
-                    signal,
-                });
-                if (!next.ok)
-                    throw httpError(transport.label, next, await next.text());
-                return { response: next, body: (await next.json()) };
+        const request = wireRequest(context);
+        let requestOptions = options;
+        if (context.images?.length) {
+            if (!model.input.includes("image")) {
+                throw new Error(`${transport.label} does not support image input for ${model.id}`);
             }
-            catch (error) {
-                if (timeoutSignal?.aborted && !options.signal?.aborted)
-                    throw timeoutError(options.timeoutMs);
-                throw error;
+            const detected = transport.detectCompat(model);
+            const imageInput = model.compat?.imageInput ?? detected.imageInput;
+            addImages(transport.label, model, imageInput, context.images, request);
+            if (model.compat?.sendImageOptInHeader ?? detected.sendImageOptInHeader) {
+                requestOptions = { ...options, headers: { ...IMAGE_OPT_IN_HEADERS, ...options?.headers } };
             }
-        }, {
-            maxRetries: options.maxRetries ?? 2,
-            maxRetryDelayMs: options.maxRetryDelayMs,
-            signal: options.signal,
-        });
-        await options.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+        }
+        const body = await postClassifierRequest(transport.label, transport.url(model), model, transport.payload(model, request), requestOptions);
         const result = transport.output(body);
         // Set before parsing answers: a request with malformed answers was still billed.
-        const usage = parseUsage(result.usage, model);
+        const usage = parseClassifierUsage(result.usage, model);
         if (usage)
             output.usage = usage;
         output.answers = parseAnswers(transport.label, result.answers, context);

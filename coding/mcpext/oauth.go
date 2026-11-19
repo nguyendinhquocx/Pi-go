@@ -23,6 +23,8 @@ import (
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/nodeurl"
 	"github.com/MichaelKinsy/PiG/internal/orderedjson"
 	"github.com/MichaelKinsy/PiG/internal/pilock"
 	"github.com/MichaelKinsy/PiG/mcp"
@@ -52,10 +54,10 @@ const (
 	// refreshSkew: access tokens this close to expiry are refreshed before they are sent.
 	// upstream: packages/coding-agent/src/extensions/mcp/oauth.ts:REFRESH_SKEW_MS
 	refreshSkew = 30 * time.Second
-	// refreshRequestTimeout bounds each request of a refresh, so it cannot hold
-	// the refresh lock or delay shutdown for long.
-	// upstream: packages/coding-agent/src/extensions/mcp/oauth.ts:REFRESH_REQUEST_TIMEOUT_MS
-	refreshRequestTimeout = 15 * time.Second
+	// oauthRequestTimeout bounds each request to the authorization server, so an unresponsive one cannot hold the refresh lock,
+	// delay shutdown, or keep a sign-in waiting for long.
+	// upstream: packages/coding-agent/src/extensions/mcp/oauth.ts:OAUTH_REQUEST_TIMEOUT_MS
+	oauthRequestTimeout = 15 * time.Second
 	// refreshLockStale: a refresh lock that its holder stopped renewing (the
 	// process was killed) is taken over after this.
 	// upstream: packages/coding-agent/src/extensions/mcp/oauth.ts:REFRESH_LOCK_STALE_MS
@@ -80,11 +82,11 @@ type McpOAuthSettings struct {
 	Scope string
 	// ClientName is the `client_name` of dynamic client registration. Default: the app name.
 	ClientName string
-	// ClientRegistration is `dcr` (default) or `cimd`; see [extension.McpOAuthConfig].
+	// ClientRegistration is `auto` (default), `dcr` or `cimd`; see [extension.McpOAuthConfig].
 	ClientRegistration string
 	// AuthServerMetadataURL is the authorization server metadata document to
 	// use instead of discovery; see [extension.McpOAuthConfig].
-	AuthServerMetadataURL *url.URL
+	AuthServerMetadataURL *oauth.URL
 }
 
 // callbackSettings is where the loopback callback server listens and the
@@ -105,32 +107,28 @@ func newCallbackSettings(settings McpOAuthSettings) (callbackSettings, error) {
 	if raw == "" {
 		raw = "http://" + callbackHost + callbackPath
 	}
-	u, err := url.Parse(raw)
+	u, err := nodeurl.ParseURL(raw)
 	if err != nil {
 		return callbackSettings{}, err
 	}
-	address := strings.TrimSuffix(strings.TrimPrefix(u.Hostname(), "["), "]")
+	address := strings.TrimSuffix(strings.TrimPrefix(u.Hostname, "["), "]")
 	var port *int
 	fixed := ""
-	if u.Port() != "" {
-		p, _ := strconv.Atoi(u.Port())
+	if u.Port != "" {
+		p, _ := strconv.Atoi(u.Port)
 		port = &p
 		// A configured URI with a port is sent exactly as written, since servers compare it as a string.
 		fixed = settings.CallbackURL
 	} else if settings.CallbackPort != nil {
 		port = settings.CallbackPort
-		host := u.Hostname()
-		if strings.Contains(host, ":") {
-			host = "[" + host + "]"
-		}
-		fixed = u.Scheme + "://" + host + ":" + strconv.Itoa(*port) + pathOrSlash(u.EscapedPath())
+		fixed = u.WithPort(strconv.Itoa(*port)).Href()
 	}
 	host := address
 	// `localhost` is served on 127.0.0.1; browsers fall back to it when ::1 refuses.
 	if address == "localhost" {
 		host = callbackHost
 	}
-	return callbackSettings{host: host, redirectHost: address, port: port, path: pathOrSlash(u.EscapedPath()), fixedRedirectURL: fixed}, nil
+	return callbackSettings{host: host, redirectHost: address, port: port, path: u.Pathname, fixedRedirectURL: fixed}, nil
 }
 
 func pathOrSlash(p string) string {
@@ -161,9 +159,23 @@ type McpOAuthServerStore interface {
 	WithRefreshLock(ctx context.Context, fn func(ctx context.Context) error) error
 }
 
+// McpOAuthCredentials is what the extension asks of a credential store, and what a host that keeps the credentials elsewhere implements (see [NewMcpOAuthCredentialStoreOver]): Pi's `credentials` option takes any object with these members (index.ts:508, 622, cli.ts:241).
+type McpOAuthCredentials interface {
+	// ForServer returns the store of the server with the given name and URL.
+	ForServer(name, serverURL string) (McpOAuthServerStore, error)
+	// Tokens returns the stored tokens of the server, nil when there are none.
+	Tokens(name, serverURL string) *oauth.OAuthTokens
+	// Remove deletes the stored state of the server and returns whether credentials were stored for it.
+	Remove(name, serverURL string) (bool, error)
+}
+
+var _ McpOAuthCredentials = (*McpOAuthCredentialStore)(nil)
+
 // McpOAuthCredentialStore keeps per-server OAuth state (client registration,
 // tokens, pending PKCE verifier) in `mcp-auth.json`.
 type McpOAuthCredentialStore struct {
+	// custom, when set, answers every operation: the store is a view of the host's own credentials.
+	custom  McpOAuthCredentials
 	backend AuthStorageBackend
 	// lockDir holds the refresh lock files. Without one, refreshes are only
 	// serialized in this process.
@@ -181,6 +193,11 @@ func NewMcpOAuthCredentialStore(agentDir string) *McpOAuthCredentialStore {
 	}
 }
 
+// NewMcpOAuthCredentialStoreOver returns a store whose operations are those of custom.
+func NewMcpOAuthCredentialStoreOver(custom McpOAuthCredentials) *McpOAuthCredentialStore {
+	return &McpOAuthCredentialStore{custom: custom}
+}
+
 // NewMcpOAuthCredentialStoreWithBackend returns a store over backend. Refresh
 // locks live in lockDir; an empty lockDir serializes refreshes in this process
 // only.
@@ -193,29 +210,26 @@ func NewMcpOAuthCredentialStoreWithBackend(backend AuthStorageBackend, lockDir s
 type storedStates = *orderedjson.Object
 
 func parseStates(content string) (storedStates, error) {
-	if strings.TrimSpace(content) == "" {
+	if strings.TrimFunc(content, isJSWhitespace) == "" {
 		return orderedjson.New(), nil
 	}
-	var parsed any
-	if err := json.Unmarshal([]byte(content), &parsed); err != nil {
+	// JSON.parse reads a number beyond float64 as Infinity, which the rewrite stores as null; decoding into a Go value would reject the whole file.
+	var syntax json.RawMessage
+	if err := json.Unmarshal([]byte(content), &syntax); err != nil {
 		return nil, err
 	}
-	if _, ok := parsed.(map[string]any); !ok {
+	if len(syntax) == 0 || syntax[0] != '{' {
 		return orderedjson.New(), nil
 	}
-	return orderedjson.Parse([]byte(content))
+	return orderedjson.Parse(syntax)
 }
 
 func serverKey(serverURL string) (string, error) {
-	u, err := url.Parse(serverURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
+	u, err := nodeurl.ParseURL(serverURL)
+	if err != nil {
 		return "", fmt.Errorf("Invalid URL: %s", serverURL)
 	}
-	u.Scheme, u.Host = strings.ToLower(u.Scheme), strings.ToLower(u.Host)
-	if u.Path == "" {
-		u.Path = "/"
-	}
-	return u.String(), nil
+	return u.Href(), nil
 }
 
 // storeKeys returns the keys of a server's state: by name and URL, so servers
@@ -250,6 +264,9 @@ type serverStore struct {
 
 // ForServer returns the store of the server with the given name and URL.
 func (c *McpOAuthCredentialStore) ForServer(name, serverURL string) (McpOAuthServerStore, error) {
+	if c.custom != nil {
+		return c.custom.ForServer(name, serverURL)
+	}
 	key, legacyKey, err := storeKeys(name, serverURL)
 	if err != nil {
 		return nil, err
@@ -347,6 +364,9 @@ func (c *McpOAuthCredentialStore) withRefreshLock(ctx context.Context, key strin
 // for noticing sign-ins done by another process. It does not take over legacy
 // state.
 func (c *McpOAuthCredentialStore) Tokens(name, serverURL string) *oauth.OAuthTokens {
+	if c.custom != nil {
+		return c.custom.Tokens(name, serverURL)
+	}
 	key, legacyKey, err := storeKeys(name, serverURL)
 	if err != nil {
 		return nil
@@ -370,6 +390,9 @@ func (c *McpOAuthCredentialStore) Tokens(name, serverURL string) *oauth.OAuthTok
 // or the legacy state it would take over. It returns whether credentials were
 // stored for it.
 func (c *McpOAuthCredentialStore) Remove(name, serverURL string) (bool, error) {
+	if c.custom != nil {
+		return c.custom.Remove(name, serverURL)
+	}
 	key, legacyKey, err := storeKeys(name, serverURL)
 	if err != nil {
 		return false, err
@@ -456,30 +479,41 @@ func registeredRedirectURLs(client *oauth.OAuthClientInformationMixed) []string 
 // paths, computed like Codex does.
 // upstream: packages/coding-agent/src/extensions/mcp/oauth.ts:callbackId
 func callbackID(serverURL string) (string, error) {
-	u, err := url.Parse(serverURL)
+	u, err := nodeurl.ParseURL(serverURL)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("Invalid URL: %s", serverURL)
 	}
-	u.Fragment, u.RawFragment = "", ""
-	href, err := serverKey(u.String())
-	if err != nil {
-		return "", err
-	}
+	href := u.WithoutHash().Href()
 	sum := sha256.Sum256([]byte(href))
 	return base64.RawURLEncoding.EncodeToString(sum[:9]), nil
 }
 
-// clientMetadataDocument is pi's Client ID Metadata Document, for
-// `clientRegistration: "cimd"`, chosen like Codex chooses its own. The
-// configuration ensures the default callback path. Without the `iss`
-// parameter in authorization responses (RFC 9207), the redirect URI and the
-// document are specific to the MCP server, so a response cannot be mixed up
-// with one from another authorization server (RFC 9700 section 4.4.2.2).
+// offersClientMetadataDocument reports whether sign-in may identify with pi's Client ID Metadata Document instead of
+// registering. `auto` registers when the user asked for a client name, the redirect URI is not one the documents list,
+// or a rebranded build would show up as pi.
+// pig divergence (D2): PiG's application name is not pi, so `auto` registers a client dynamically, as Pi does for any
+// rebranded build; only `cimd` identifies as pi's document.
+// upstream: packages/coding-agent/src/extensions/mcp/oauth.ts:offersClientMetadataDocument
+func offersClientMetadataDocument(settings McpOAuthSettings, appName string) bool {
+	registration := cmp.Or(settings.ClientRegistration, "auto")
+	if registration != "auto" {
+		return registration == "cimd"
+	}
+	if settings.ClientID != "" || settings.ClientName != "" || appName != "pi" {
+		return false
+	}
+	return extension.IsClientMetadataDocumentCallback(settings.CallbackURL)
+}
+
+// clientMetadataDocument is pi's Client ID Metadata Document, chosen like Codex chooses its own, or nil when the
+// authorization server does not support documents for public clients. Without the `iss` parameter in authorization
+// responses (RFC 9207), the redirect URI and the document are specific to the MCP server, so a response cannot be
+// mixed up with one from another authorization server (RFC 9700 section 4.4.2.2).
 // upstream: packages/coding-agent/src/extensions/mcp/oauth.ts:clientMetadataDocument
 func clientMetadataDocument(serverURL, redirectURL string, metadata *oauth.AuthorizationServerMetadata) (*oauth.OAuthClientMetadataDocument, error) {
 	if metadata == nil || metadata.ClientIDMetadataDocumentSupported == nil || !*metadata.ClientIDMetadataDocumentSupported ||
 		!slices.Contains(metadata.TokenEndpointAuthMethodsSupported, "none") {
-		return nil, errors.New(`The authorization server does not support Client ID Metadata Documents for public clients; remove oauth.clientRegistration "cimd"`)
+		return nil, nil
 	}
 	if metadata.AuthorizationResponseIssParameterSupported != nil && *metadata.AuthorizationResponseIssParameterSupported {
 		return &oauth.OAuthClientMetadataDocument{URL: clientMetadataBaseURL + "/client.json", RedirectURL: redirectURL}, nil
@@ -488,19 +522,22 @@ func clientMetadataDocument(serverURL, redirectURL string, metadata *oauth.Autho
 	if err != nil {
 		return nil, err
 	}
-	redirect, err := url.Parse(redirectURL)
+	redirect, err := nodeurl.ParseURL(redirectURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Invalid URL: %s", redirectURL)
 	}
-	redirect.Path, redirect.RawPath = callbackPath+"/"+id, ""
-	return &oauth.OAuthClientMetadataDocument{URL: clientMetadataBaseURL + "/" + id + "/client.json", RedirectURL: redirect.String()}, nil
+	return &oauth.OAuthClientMetadataDocument{URL: clientMetadataBaseURL + "/" + id + "/client.json", RedirectURL: redirect.WithPathname(callbackPath + "/" + id)}, nil
 }
 
-func createProvider(serverURL string, store oauth.McpOAuthStateStore, settings McpOAuthSettings, redirectURL, appName string, onRedirect func(*url.URL)) (*oauth.McpOAuthProvider, error) {
+func createProvider(serverURL string, store oauth.McpOAuthStateStore, settings McpOAuthSettings, redirectURL, appName string, onRedirect func(oauth.URL)) (*oauth.McpOAuthProvider, error) {
 	var document func(*oauth.AuthorizationServerMetadata) (*oauth.OAuthClientMetadataDocument, error)
-	if settings.ClientRegistration == "cimd" {
+	if offersClientMetadataDocument(settings, appName) {
 		document = func(metadata *oauth.AuthorizationServerMetadata) (*oauth.OAuthClientMetadataDocument, error) {
-			return clientMetadataDocument(serverURL, redirectURL, metadata)
+			doc, err := clientMetadataDocument(serverURL, redirectURL, metadata)
+			if err == nil && doc == nil && settings.ClientRegistration == "cimd" {
+				return nil, errors.New(`The authorization server does not support Client ID Metadata Documents for public clients; remove oauth.clientRegistration "cimd"`)
+			}
+			return doc, err
 		}
 	}
 	return oauth.NewMcpOAuthProvider(oauth.McpOAuthProviderOptions{
@@ -511,7 +548,7 @@ func createProvider(serverURL string, store oauth.McpOAuthStateStore, settings M
 		ClientID:               settings.ClientID,
 		ClientSecret:           settings.ClientSecret,
 		Store:                  store,
-		OnRedirect: func(_ context.Context, u *url.URL) error {
+		OnRedirect: func(_ context.Context, u oauth.URL) error {
 			onRedirect(u)
 			return nil
 		},
@@ -574,6 +611,12 @@ func (p *authProvider) running() *refreshFlight {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.current
+}
+
+// timedFetch is `timedFetch` of upstream's oauth.ts: fetch with oauthRequestTimeout per request, on top of the
+// request's own context.
+func timedFetch(fetch mcp.McpFetch) mcp.McpFetch {
+	return timeoutFetch{inner: orDefaultFetch(fetch), timeout: oauthRequestTimeout}
 }
 
 type timeoutFetch struct {
@@ -644,7 +687,7 @@ func (p *authProvider) refreshLocked(ctx context.Context, staleToken string, fet
 		return nil
 	}
 	if state == nil || state.Tokens == nil || state.Tokens.RefreshToken == "" {
-		return &oauth.McpOAuthAuthorizationRequiredError{}
+		return oauth.NewMcpOAuthAuthorizationRequiredError()
 	}
 	settings, err := p.options.Settings()
 	if err != nil {
@@ -663,31 +706,36 @@ func (p *authProvider) refreshLocked(ctx context.Context, staleToken string, fet
 	if redirectURL == "" {
 		redirectURL = fallbackRedirectURL
 	}
-	provider, err := createProvider(p.options.ServerURL, p.options.Store, settings, redirectURL, p.options.AppName, func(*url.URL) {})
+	provider, err := createProvider(p.options.ServerURL, p.options.Store, settings, redirectURL, p.options.AppName, func(oauth.URL) {})
 	if err != nil {
 		return err
 	}
 	flow := oauth.OAuthFlowOptions{
 		ServerURL: p.options.ServerURL, AuthorizationServerMetadataURL: settings.AuthServerMetadataURL,
-		Fetch: timeoutFetch{inner: orDefaultFetch(fetch), timeout: refreshRequestTimeout},
+		Fetch: timeoutFetch{inner: orDefaultFetch(fetch), timeout: oauthRequestTimeout},
 	}
 	if challenge != nil {
 		flow.ResourceMetadataURL, flow.Scope = challenge.ResourceMetadataURL, challenge.Scope
 	}
-	// Refreshes the tokens, or reports that a new sign-in is needed.
+	// Refreshes the tokens, or reports that a new sign-in is needed. Not cancellable: a refresh the server
+	// answered may have rotated the refresh token, so its answer must be saved (the caller passes a context
+	// detached from the request).
 	result, err := oauth.AuthorizeMcp(ctx, provider, flow)
 	if err != nil {
 		return err
 	}
 	if result == oauth.OAuthRedirect {
-		return &oauth.McpOAuthAuthorizationRequiredError{}
+		return oauth.NewMcpOAuthAuthorizationRequiredError()
 	}
 	return nil
 }
 
+// nodeFetch is the one client of the MCP transports and OAuth requests that Pi sends through the global fetch.
+var nodeFetch func() mcp.McpFetch = sync.OnceValue(func() mcp.McpFetch { return ai.NewNodeFetch() })
+
 func orDefaultFetch(fetch mcp.McpFetch) mcp.McpFetch {
 	if fetch == nil {
-		return http.DefaultClient
+		return nodeFetch()
 	}
 	return fetch
 }
@@ -709,7 +757,7 @@ func (p *authProvider) Token(ctx context.Context) (string, error) {
 		return "", nil
 	}
 	token := state.Tokens.AccessToken
-	expired := state.TokensExpireAt != nil && *state.TokensExpireAt-refreshSkew.Milliseconds() <= time.Now().UnixMilli()
+	expired := state.TokensExpireAt != nil && *state.TokensExpireAt-float64(refreshSkew.Milliseconds()) <= float64(time.Now().UnixMilli())
 	if !expired || state.Tokens.RefreshToken == "" {
 		return token, nil
 	}
@@ -724,13 +772,13 @@ func (p *authProvider) Token(ctx context.Context) (string, error) {
 
 // OnUnauthorized implements [mcp.UnauthorizedHandler].
 func (p *authProvider) OnUnauthorized(ctx context.Context, unauthorized mcp.UnauthorizedContext) error {
-	challenge := oauth.ParseWWWAuthenticate(strings.Join(unauthorized.Response.Header.Values("Www-Authenticate"), ", "))
+	challenge := oauth.ParseWWWAuthenticate(jsstring.FromLatin1(strings.Join(unauthorized.Response.Header.Values("Www-Authenticate"), ", ")))
 	if p.options.OnChallenge != nil {
 		p.options.OnChallenge(challenge)
 	}
 	// A refresh keeps the granted scope, so more scope needs a new sign-in.
 	if challenge.Error == "insufficient_scope" {
-		return &oauth.McpOAuthAuthorizationRequiredError{}
+		return oauth.NewMcpOAuthAuthorizationRequiredError()
 	}
 	return p.refresh(ctx, unauthorized.Token, unauthorized.Fetch, &challenge)
 }
@@ -749,11 +797,11 @@ func (p *authProvider) Settled(ctx context.Context) {
 type McpSignInPrompt interface {
 	// ShowAuthorizationURL shows the authorization URL to the user and opens it
 	// in a browser.
-	ShowAuthorizationURL(u *url.URL)
+	ShowAuthorizationURL(u oauth.URL)
 	// PromptForRedirectURL asks for the redirect URL from the browser address
 	// bar, for when the browser cannot reach the loopback callback (for example
-	// over SSH). The context ends once the callback arrives. It returns an
-	// empty string when the user cancels.
+	// over SSH). The context ends once the callback arrives or the sign-in is
+	// cancelled. It returns an empty string when the user cancels.
 	PromptForRedirectURL(ctx context.Context) (string, error)
 }
 
@@ -770,32 +818,43 @@ type authorizationResponse struct {
 }
 
 func responseFromRedirectURL(input, state string, redirectURL *url.URL) (authorizationResponse, error) {
-	u, err := url.Parse(strings.TrimSpace(input))
-	if err != nil || u.Scheme == "" {
+	u, err := nodeurl.ParseURL(strings.TrimFunc(input, isJSWhitespace))
+	if err != nil {
 		return authorizationResponse{}, errors.New("Expected the full redirect URL from the browser address bar")
 	}
+	redirect, err := nodeurl.ParseURL(redirectURL.String())
+	if err != nil {
+		return authorizationResponse{}, err
+	}
 	// A server-specific redirect URI tells authorization servers apart, so it must match exactly.
-	if !strings.EqualFold(u.Scheme, redirectURL.Scheme) || !strings.EqualFold(u.Host, redirectURL.Host) || pathOrSlash(u.EscapedPath()) != pathOrSlash(redirectURL.EscapedPath()) {
+	if u.Origin() != redirect.Origin() || u.Pathname != redirect.Pathname {
 		return authorizationResponse{}, errors.New("The redirect URL does not match this sign-in's redirect URI")
 	}
-	query := u.Query()
-	if failure := query.Get("error"); failure != "" {
-		if query.Has("error_description") {
-			return authorizationResponse{}, errors.New(query.Get("error_description"))
+	pairs := nodeurl.SearchPairs(u.Query)
+	get := func(name string) (string, bool) {
+		for _, pair := range pairs {
+			if pair[0] == name {
+				return pair[1], true
+			}
+		}
+		return "", false
+	}
+	if failure, _ := get("error"); failure != "" {
+		if description, ok := get("error_description"); ok {
+			return authorizationResponse{}, errors.New(description)
 		}
 		return authorizationResponse{}, errors.New(failure)
 	}
-	if query.Get("state") != state {
+	if got, _ := get("state"); got != state {
 		return authorizationResponse{}, errors.New("The redirect URL belongs to a different sign-in")
 	}
-	code := query.Get("code")
+	code, _ := get("code")
 	if code == "" {
 		return authorizationResponse{}, errors.New("The redirect URL does not contain an authorization code")
 	}
 	response := authorizationResponse{code: code}
 	// `searchParams.get("iss") ?? undefined`: a present but empty iss is still checked.
-	if query.Has("iss") {
-		iss := query.Get("iss")
+	if iss, ok := get("iss"); ok {
 		response.iss = &iss
 	}
 	return response, nil
@@ -806,17 +865,17 @@ type responseResult struct {
 	err      error
 }
 
-// waitForAuthorizationResponse waits for the browser callback or a pasted
-// redirect URL, whichever comes first. The prompt runs on a goroutine that
-// ends when the prompt returns; its result is dropped once the browser wins.
-// The callers register wait before they show the authorization URL: a browser
-// can reach the callback before this function runs.
-func waitForAuthorizationResponse(ctx context.Context, wait *oauth.CallbackWait, state string, redirectURL *url.URL, prompt McpSignInPrompt) (authorizationResponse, error) {
+// waitForAuthorizationResponse shows the authorization URL, then waits for the browser callback or a pasted redirect URL, whichever
+// comes first. The callback wait runs on a goroutine, as upstream's promise does; the URL is shown once the state is pending, so a
+// browser that follows the redirect at once reaches a registered wait. The prompt runs on a goroutine that ends when the prompt
+// returns; its result is dropped once the browser wins.
+func waitForAuthorizationResponse(ctx context.Context, callback *oauth.OAuthCallbackServer, authorizationURL oauth.URL, redirectURL *url.URL, state string, prompt McpSignInPrompt) (authorizationResponse, error) {
 	promptCtx, cancelPrompt := context.WithCancel(ctx)
 	defer cancelPrompt()
+	registered := make(chan struct{})
 	fromBrowser := make(chan responseResult, 1)
 	go func() {
-		received, err := wait.Wait(promptCtx)
+		received, err := callback.WaitForCallback(oauth.WithCallbackRegistered(promptCtx, func() { close(registered) }), state, pathOrSlash(redirectURL.EscapedPath()))
 		response := authorizationResponse{code: received.Code}
 		// The callback server drops an empty iss.
 		if received.Iss != "" {
@@ -824,6 +883,12 @@ func waitForAuthorizationResponse(ctx context.Context, wait *oauth.CallbackWait,
 		}
 		fromBrowser <- responseResult{response, err}
 	}()
+	select {
+	case <-registered:
+	case r := <-fromBrowser:
+		return r.response, r.err
+	}
+	prompt.ShowAuthorizationURL(authorizationURL)
 	fromUser := make(chan responseResult, 1)
 	go func() {
 		input, err := prompt.PromptForRedirectURL(promptCtx)
@@ -831,7 +896,7 @@ func waitForAuthorizationResponse(ctx context.Context, wait *oauth.CallbackWait,
 			fromUser <- responseResult{err: err}
 			return
 		}
-		if strings.TrimSpace(input) == "" {
+		if strings.TrimFunc(input, isJSWhitespace) == "" {
 			fromUser <- responseResult{err: &McpSignInCancelledError{}}
 			return
 		}
@@ -887,8 +952,12 @@ type SignInOptions struct {
 
 // SignInMcpServer signs in to an MCP server. It uses the stored refresh token
 // when possible; otherwise it runs the browser authorization code flow.
-// Tokens are saved to the store.
-func SignInMcpServer(ctx context.Context, options SignInOptions) error {
+// Tokens are saved to the store. Ending ctx stops the sign-in at any step with
+// [McpSignInCancelledError]; requests to the authorization server are also time-limited.
+func SignInMcpServer(ctx context.Context, options SignInOptions) (err error) {
+	if ctx.Err() != nil {
+		return &McpSignInCancelledError{}
+	}
 	if options.AppName == "" {
 		options.AppName = "pig"
 	}
@@ -904,17 +973,17 @@ func SignInMcpServer(ctx context.Context, options SignInOptions) error {
 	preferredPort := callbackOptions.port
 	if preferredPort == nil && stored != nil {
 		if registered := registeredRedirectURLs(stored.ClientInformation); len(registered) > 0 {
-			if u, err := url.Parse(registered[0]); err == nil {
-				if p, err := strconv.Atoi(u.Port()); err == nil && p != 0 {
+			if u, err := nodeurl.ParseURL(registered[0]); err == nil {
+				if p, err := strconv.Atoi(u.Port); err == nil && p != 0 {
 					preferredPort = &p
 				}
 			}
 		}
 	}
-	cimd := options.Settings.ClientRegistration == "cimd"
+	offersDocument := offersClientMetadataDocument(options.Settings, options.AppName)
 	// The redirect URI of a server-specific Client ID Metadata Document.
 	var extraPaths []string
-	if cimd {
+	if offersDocument {
 		id, err := callbackID(options.ServerURL)
 		if err != nil {
 			return err
@@ -926,6 +995,12 @@ func SignInMcpServer(ctx context.Context, options SignInOptions) error {
 		return err
 	}
 	defer func() { _ = callback.Close() }()
+	// Aborted requests fail with the context's cause; report them as the cancellation they are.
+	defer func() {
+		if err != nil && ctx.Err() != nil {
+			err = &McpSignInCancelledError{}
+		}
+	}()
 	redirectURL := callbackOptions.fixedRedirectURL
 	if redirectURL == "" {
 		redirectURL = callback.RedirectURL
@@ -934,13 +1009,16 @@ func SignInMcpServer(ctx context.Context, options SignInOptions) error {
 		next := stored.Clone()
 		// Every sign-in gets a fresh `state` parameter.
 		next.OAuthState = ""
-		// A registered client cannot use another redirect URI, and its tokens belong to it. A Client ID
-		// Metadata Document is not stored, so with one, a stored client was registered before and is replaced.
+		// A registered client cannot use another redirect URI, and its tokens belong to it. `cimd` replaces a
+		// registered client; `auto` keeps it. A Client ID Metadata Document is not stored, so tokens without a
+		// stored client belong to the document.
 		keepClient := options.Settings.ClientID != ""
-		if !keepClient && cimd {
-			keepClient = stored.ClientInformation == nil
-		} else if !keepClient {
-			keepClient = slices.Contains(registeredRedirectURLs(stored.ClientInformation), redirectURL)
+		if !keepClient {
+			if stored.ClientInformation != nil {
+				keepClient = options.Settings.ClientRegistration != "cimd" && slices.Contains(registeredRedirectURLs(stored.ClientInformation), redirectURL)
+			} else {
+				keepClient = offersDocument
+			}
 		}
 		if !keepClient {
 			next.ClientInformation, next.Tokens, next.TokensExpireAt = nil, nil, nil
@@ -950,12 +1028,12 @@ func SignInMcpServer(ctx context.Context, options SignInOptions) error {
 		}
 	}
 
-	var authorizationURL *url.URL
-	provider, err := createProvider(options.ServerURL, options.Store, options.Settings, redirectURL, options.AppName, func(u *url.URL) { authorizationURL = u })
+	var authorizationURL *oauth.URL
+	provider, err := createProvider(options.ServerURL, options.Store, options.Settings, redirectURL, options.AppName, func(u oauth.URL) { authorizationURL = &u })
 	if err != nil {
 		return err
 	}
-	flow := oauth.OAuthFlowOptions{ServerURL: options.ServerURL, AuthorizationServerMetadataURL: options.Settings.AuthServerMetadataURL}
+	flow := oauth.OAuthFlowOptions{ServerURL: options.ServerURL, AuthorizationServerMetadataURL: options.Settings.AuthServerMetadataURL, Fetch: timeoutFetch{inner: orDefaultFetch(nil), timeout: oauthRequestTimeout}}
 	stepUp := options.Challenge != nil && options.Challenge.Error == "insufficient_scope"
 	var challengeScope string
 	if options.Challenge != nil {
@@ -991,21 +1069,18 @@ func SignInMcpServer(ctx context.Context, options SignInOptions) error {
 	}
 	// The flow picks the redirect URI, which may be specific to the MCP server.
 	authorizationRedirectRaw := redirectURL
-	if authorizationURL.Query().Has("redirect_uri") {
-		authorizationRedirectRaw = authorizationURL.Query().Get("redirect_uri")
+	if query := nodeurl.SearchParams(authorizationURL.Query); query.Has("redirect_uri") {
+		authorizationRedirectRaw = query.Get("redirect_uri")
 	}
-	authorizationRedirectURL, err := url.Parse(authorizationRedirectRaw)
+	authorizationRedirect, err := nodeurl.ParseURL(authorizationRedirectRaw)
+	if err != nil {
+		return fmt.Errorf("Invalid URL: %s", authorizationRedirectRaw)
+	}
+	authorizationRedirectURL, err := url.Parse(authorizationRedirect.Href())
 	if err != nil {
 		return err
 	}
-	// The wait is registered before the URL is shown: a browser that follows the
-	// redirect at once reaches the callback before this goroutine goes on.
-	wait, err := callback.WaitForCallback(state, pathOrSlash(authorizationRedirectURL.EscapedPath()))
-	if err != nil {
-		return err
-	}
-	options.Prompt.ShowAuthorizationURL(authorizationURL)
-	response, err := waitForAuthorizationResponse(ctx, wait, state, authorizationRedirectURL, options.Prompt)
+	response, err := waitForAuthorizationResponse(ctx, callback, *authorizationURL, authorizationRedirectURL, state, options.Prompt)
 	if err != nil {
 		return err
 	}

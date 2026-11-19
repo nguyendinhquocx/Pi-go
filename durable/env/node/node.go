@@ -20,6 +20,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/nodeerrno"
+	"github.com/MichaelKinsy/PiG/internal/nodefs"
 	"github.com/MichaelKinsy/PiG/internal/nodespawn"
 )
 
@@ -64,6 +65,12 @@ type NodeExecutionEnv struct {
 }
 
 var _ durableenv.ExecutionEnv = (*NodeExecutionEnv)(nil)
+
+// ListFiles fails with not_supported: upstream's NodeExecutionEnv leaves the optional listFiles undefined. LocalExecutionEnv
+// in the env package adds it through a pi-env daemon.
+func (env *NodeExecutionEnv) ListFiles(ctx context.Context, path string, options *durableenv.ListFilesOptions) (durableenv.FileListing, error) {
+	return durableenv.FileListing{}, durableenv.NewFileError(durableenv.FileErrorNotSupported, "This environment does not list files", path, nil)
+}
 
 // NewNodeExecutionEnv constructs an environment rooted at options.Cwd.
 func NewNodeExecutionEnv(options NodeExecutionEnvOptions) *NodeExecutionEnv {
@@ -131,7 +138,7 @@ func (env *NodeExecutionEnv) OpenTextLineReader(ctx context.Context, path string
 	if err := abortedFileError(ctx, resolved); err != nil {
 		return nil, err
 	}
-	file, err := os.Open(resolved)
+	file, err := nodefs.OpenFile(resolved, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, toFileError(err, fsCall{syscall: "open", path: resolved})
 	}
@@ -186,7 +193,7 @@ func (env *NodeExecutionEnv) ReadBinaryFile(ctx context.Context, path string) ([
 	if err := abortedFileError(ctx, resolved); err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(resolved)
+	data, err := nodefs.ReadFile(resolved)
 	if err != nil {
 		return nil, toFileError(err, fsCall{syscall: "open", path: resolved})
 	}
@@ -222,7 +229,7 @@ func (env *NodeExecutionEnv) writeWithParents(ctx context.Context, resolved stri
 	}
 	data, err := fileContent(content)
 	if err != nil {
-		return &durableenv.FileError{Code: durableenv.FileErrorInvalid, Message: err.Error(), Path: resolved}
+		return durableenv.NewFileError(durableenv.FileErrorInvalid, err.Error(), resolved, nil)
 	}
 	parent := filepath.Dir(resolved)
 	if err := nodeerrno.MkdirAll(parent, 0o777); err != nil {
@@ -231,7 +238,7 @@ func (env *NodeExecutionEnv) writeWithParents(ctx context.Context, resolved stri
 	if err := abortedFileError(ctx, resolved); err != nil {
 		return err
 	}
-	file, err := os.OpenFile(resolved, flags, 0o666)
+	file, err := nodefs.OpenFile(resolved, flags, 0o666)
 	if err != nil {
 		return toFileError(err, fsCall{syscall: "open", path: resolved})
 	}
@@ -252,7 +259,7 @@ func (env *NodeExecutionEnv) TruncateFile(ctx context.Context, path string, size
 		return err
 	}
 	if size < 0 || size > maxSafeInteger {
-		return &durableenv.FileError{Code: durableenv.FileErrorInvalid, Message: "File size must be a non-negative safe integer", Path: resolved}
+		return durableenv.NewFileError(durableenv.FileErrorInvalid, "File size must be a non-negative safe integer", resolved, nil)
 	}
 	file, err := os.OpenFile(resolved, os.O_RDWR, 0)
 	if err != nil {
@@ -281,7 +288,7 @@ func (env *NodeExecutionEnv) FlushFile(ctx context.Context, path string) error {
 		// POSIX refuses to open a directory for writing with EISDIR; Windows refuses it as access denied, where Node
 		// opens it, so a directory is reported as one.
 		if stats, statErr := os.Stat(resolved); statErr == nil && stats.IsDir() && errnoCode(err) != "EISDIR" {
-			return &durableenv.FileError{Code: durableenv.FileErrorIsDirectory, Message: "Is a directory", Path: resolved}
+			return durableenv.NewFileError(durableenv.FileErrorIsDirectory, "Is a directory", resolved, nil)
 		}
 		return toFileError(err, fsCall{syscall: "open", path: resolved})
 	}
@@ -314,7 +321,7 @@ func (env *NodeExecutionEnv) RenameFile(ctx context.Context, sourcePath, destina
 	if err := abortedFileError(ctx, destination); err != nil {
 		return err
 	}
-	if err := os.Rename(source, destination); err != nil {
+	if err := nodeerrno.Rename(source, destination); err != nil {
 		return toFileError(err, fsCall{syscall: "rename", path: source, dest: destination})
 	}
 	return nil
@@ -343,7 +350,7 @@ func fileInfoFromStats(path string, stats fs.FileInfo) (durableenv.FileInfo, err
 	case mode&fs.ModeSymlink != 0:
 		kind = durableenv.FileKindSymlink
 	default:
-		return durableenv.FileInfo{}, &durableenv.FileError{Code: durableenv.FileErrorInvalid, Message: "Unsupported file type", Path: path}
+		return durableenv.FileInfo{}, durableenv.NewFileError(durableenv.FileErrorInvalid, "Unsupported file type", path, nil)
 	}
 	return durableenv.FileInfo{
 		Name:    filepath.Base(path),
@@ -462,7 +469,7 @@ func (env *NodeExecutionEnv) Remove(ctx context.Context, path string, options *d
 	case err != nil:
 		return toFileError(err, fsCall{syscall: "lstat", path: resolved})
 	case stats.IsDir() && !options.Recursive:
-		return &durableenv.FileError{Code: durableenv.FileErrorUnknown, Message: "Path is a directory: rm returned EISDIR (is a directory) " + resolved, Path: resolved}
+		return durableenv.NewFileError(durableenv.FileErrorUnknown, "Path is a directory: rm returned EISDIR (is a directory) "+resolved, resolved, nil)
 	}
 	if err := os.RemoveAll(resolved); err != nil {
 		return toFileError(err, fsCall{syscall: "rm", path: resolved})

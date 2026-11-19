@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -38,12 +39,12 @@ func (probe *lazyProbe) microtask(label string) { probe.executor.post(func() { p
 
 // awaitFirst is lazyStream(model, async () => { await null; ... }): lazy.ts:48 with the setup body in the first reaction.
 func (probe *lazyProbe) awaitFirst(ctx context.Context, setup func(context.Context) (*AssistantMessageEventStream, error)) *AssistantMessageEventStream {
-	return startLazyStream(ctx, probe.model, setup, probe.launch)
+	return startLazyStream(ctx, probe.model, setup, probe.launch, nil)
 }
 
 // synchronous is lazyStream(model, async () => { ...no await... }).
 func (probe *lazyProbe) synchronous(ctx context.Context, setup func(context.Context) (*AssistantMessageEventStream, error)) *AssistantMessageEventStream {
-	return startLazyStreamSync(ctx, probe.model, setup, probe.launch)
+	return startLazyStreamSync(ctx, probe.model, setup, probe.launch, nil)
 }
 
 // chain is the probe's chain(n): n microtasks, each queued by the previous one.
@@ -267,7 +268,7 @@ func TestLazyProbeGoldenMatchesPi(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(live) != string(golden) {
+	if !bytes.Equal(live, golden) {
 		t.Fatalf("lazy-golden.json is stale; regenerate it with the probe.\nlive:\n%s", live)
 	}
 }

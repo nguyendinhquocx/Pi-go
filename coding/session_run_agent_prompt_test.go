@@ -27,12 +27,14 @@ func TestRunAgentPromptWaitsForTheEventConsumerBeforeContinuing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_ = session.Events()
 	barrierSeen := make(chan struct{}, 4)
 	release := make(chan struct{})
 	consumerDone := make(chan struct{})
+	eventsCh := session.Events()
 	go func() {
 		defer close(consumerDone)
-		for event := range session.Events() {
+		for event := range eventsCh {
 			if _, ok := event.(*sessionEventBarrier); ok {
 				barrierSeen <- struct{}{}
 				<-release
@@ -90,6 +92,7 @@ func TestRunAgentPromptWaitsForTheEventConsumerBeforeContinuing(t *testing.T) {
 // stopReason "stop").
 func TestCheckCompactionSilentOverflowCompactsWithoutRetry(t *testing.T) {
 	sess := buildSessionWithMessages(t, newTestServicesSmallKeep(t), 3)
+	_ = sess.Events()
 	defer func() { _ = sess.Close() }()
 	sess.completer = &fakeCompleter{summary: "overflow summary"}
 
@@ -103,15 +106,15 @@ func TestCheckCompactionSilentOverflowCompactsWithoutRetry(t *testing.T) {
 	}
 	sess.refreshContext()
 
-	continueRun, err := sess.checkCompaction(context.Background(), lastAssistantMessage(sess.agent.Messages()), true, nil)
+	continueRun, err := sess.checkCompaction(context.Background(), lastAssistantMessage(sess.agent.Messages()), true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if continueRun {
 		t.Fatal("a completed overflowing response must not be retried")
 	}
-	for _, entry := range sess.inner.Entries() {
-		if entry.Base.Type == "context_edit" {
+	for _, entry := range sess.inner.GetEntries() {
+		if entry.Base().Type == "context_edit" {
 			t.Fatal("a completed response must stay in context, not be omitted")
 		}
 	}
@@ -131,6 +134,7 @@ func TestCheckCompactionSilentOverflowCompactsWithoutRetry(t *testing.T) {
 // _checkCompaction estimate path).
 func TestCheckCompactionErrorWithoutUsageEstimatesFromLastUsage(t *testing.T) {
 	sess := buildSessionWithMessages(t, newTestServicesSmallKeep(t), 3)
+	_ = sess.Events()
 	defer func() { _ = sess.Close() }()
 	sess.completer = &fakeCompleter{summary: "threshold summary"}
 	model := fakeModel()
@@ -148,7 +152,7 @@ func TestCheckCompactionErrorWithoutUsageEstimatesFromLastUsage(t *testing.T) {
 	}
 	sess.refreshContext()
 
-	if _, err := sess.checkCompaction(context.Background(), lastAssistantMessage(sess.agent.Messages()), true, nil); err != nil {
+	if _, err := sess.checkCompaction(context.Background(), lastAssistantMessage(sess.agent.Messages()), true); err != nil {
 		t.Fatal(err)
 	}
 	var end *agent.CompactionEndEvent
@@ -161,9 +165,9 @@ func TestCheckCompactionErrorWithoutUsageEstimatesFromLastUsage(t *testing.T) {
 		t.Fatalf("compaction_end = %+v, want a threshold compaction from the usage estimate", end)
 	}
 	compacted := false
-	for _, entry := range sess.inner.Entries() {
+	for _, entry := range sess.inner.GetEntries() {
 		var compaction icodingagent.CompactionEntry
-		if entry.Base.Type == "compaction" && json.Unmarshal(entry.Raw(), &compaction) == nil {
+		if entry.Base().Type == "compaction" && json.Unmarshal(entry.Raw(), &compaction) == nil {
 			compacted = true
 		}
 	}

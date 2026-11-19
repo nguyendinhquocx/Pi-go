@@ -12,7 +12,7 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension"
 )
 
-// Upstream 0.87.1 types.ts gives the powershell tool its own
+// Upstream 0.87.1 types.ts gives the powershell tool its own call and result variants; the Session emits the call as a CustomToolCallEvent for every tool. Original text: its own
 // PowerShellToolCallEvent and PowerShellToolResultEvent variants, with the
 // bash input and details shapes. Every SDK must receive both variants with
 // that shape, block a call, and replace a result exactly as the in-process
@@ -33,9 +33,10 @@ func TestToolEventVariantsMatchAcrossSDKs(t *testing.T) {
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
+			h := test.make(t)
+			// The deadline starts after make: a harness may first build its fixture, which can outlast it, and an emit under an expired context delivers nothing yet reports no error.
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			h := test.make(t)
 			t.Cleanup(func() {
 				if h.cleanup != nil {
 					h.cleanup()
@@ -89,11 +90,7 @@ func TestToolEventVariantsMatchAcrossSDKs(t *testing.T) {
 
 func conformanceToolCall(tool, command string, timeout float64) extension.ToolCallEvent {
 	base := extension.ToolCallEventBase{Type: "tool_call", ToolCallID: tool + "-" + command}
-	input := map[string]any{"command": command, "timeout": timeout}
-	if tool == "powershell" {
-		return extension.PowerShellToolCallEvent{ToolCallEventBase: base, ToolName: tool, Input: input}
-	}
-	return extension.BashToolCallEvent{ToolCallEventBase: base, ToolName: tool, Input: input}
+	return extension.CustomToolCallEvent{ToolCallEventBase: base, ToolName: tool, Input: map[string]any{"command": command, "timeout": timeout}}
 }
 
 func conformanceToolResult(tool string) extension.ToolResultEvent {
@@ -103,7 +100,7 @@ func conformanceToolResult(tool string) extension.ToolResultEvent {
 	}
 	details := &extension.BashToolDetails{
 		FullOutputPath: `C:\pig\tool-output.log`,
-		Truncation: &extension.ToolTruncation{
+		Truncation: &extension.TruncationResult{
 			Content: "output", Truncated: true, TruncatedBy: "lines", TotalLines: 9, TotalBytes: 90,
 			OutputLines: 1, OutputBytes: 6, MaxLines: 1, MaxBytes: 50000,
 		},

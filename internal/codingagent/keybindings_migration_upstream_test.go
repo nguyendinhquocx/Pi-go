@@ -1,10 +1,13 @@
 package codingagent
 
+// pi: packages/coding-agent/src/migrations.ts
+
 import (
 	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -13,6 +16,7 @@ import (
 )
 
 func TestUpstreamKeybindingsMigration(t *testing.T) {
+	restoreTUIKeybindings(t)
 	for _, tc := range []struct{ name, input, want string }{
 		// Ports packages/coding-agent/test/keybindings-migration.test.ts:25.
 		{"rewrites old key names to namespaced ids", `{"cursorUp":["up","ctrl+p"],"expandTools":"ctrl+x"}`, "{\n  \"tui.editor.cursorUp\": [\n    \"up\",\n    \"ctrl+p\"\n  ],\n  \"app.tools.expand\": \"ctrl+x\"\n}\n"},
@@ -63,7 +67,7 @@ func TestUpstreamKeybindingsMigration(t *testing.T) {
 			t.Fatalf("user bindings = %#v, want %#v", kb.userBindings, want)
 		}
 		effective := kb.merged.GetResolvedBindings()
-		if effective["tui.select.confirm"] != "enter" || effective["app.interrupt"] != "ctrl+x" {
+		if !slices.Equal(effective["tui.select.confirm"], []string{"enter"}) || !slices.Equal(effective["app.interrupt"], []string{"ctrl+x"}) {
 			t.Fatalf("effective bindings = %#v", effective)
 		}
 		data, err := os.ReadFile(file)

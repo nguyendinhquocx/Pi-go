@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
 # SPDX-License-Identifier: MIT
 set -euo pipefail
 
@@ -12,12 +11,30 @@ set -euo pipefail
 # against it. Each apt call has its own deadline, and timeout kills a call that ignores
 # SIGTERM. The whole script stays inside one budget (default 480s) that fits the 10-minute workflow step limit:
 # every deadline is capped by the budget that remains, so retries cannot outlive the step.
-# APT_SOURCES_DIR, APT_SOURCES_LIST, APT_BUDGET_SECONDS and SUDO exist so a test can run this script without root.
+# APT_SOURCES_DIR, APT_SOURCES_LIST, APT_BUDGET_SECONDS, APT_CLOCK and SUDO exist so a test can run this script without root
+# and without its deadlines depending on how long the machine takes. APT_CLOCK names a command that prints the elapsed seconds;
+# without it the script reads bash's SECONDS.
 
 if [ "$#" -eq 0 ]; then
   echo "usage: automation/ci/install-apt-packages.sh <package>..." >&2
   exit 2
 fi
+
+# A package the runner image already ships needs no mirror: ask dpkg, install only what is missing, and leave apt, the sources and
+# the network alone when nothing is. The Ubuntu mirrors have been unreachable for whole runs, and a job whose packages are all in
+# the image must not fail on them. dpkg-query prints "installed" only for a package that is configured; an unknown name, a
+# virtual package or a version-pinned spec counts as missing and goes to apt.
+missing=()
+for package in "$@"; do
+  if [ "$(dpkg-query --show --showformat='${db:Status-Status}' "$package" 2>/dev/null || true)" != installed ]; then
+    missing+=("$package")
+  fi
+done
+if [ "${#missing[@]}" -eq 0 ]; then
+  echo "install-apt-packages.sh: already installed, apt not run: $*" >&2
+  exit 0
+fi
+set -- "${missing[@]}"
 
 sources_dir="${APT_SOURCES_DIR:-/etc/apt/sources.list.d}"
 sources_list="${APT_SOURCES_LIST:-/etc/apt/sources.list}"
@@ -30,11 +47,16 @@ kill_after=10
 update_limit=90
 install_limit=150
 attempts=3
-deadline=$((SECONDS + budget))
+
+# now prints the elapsed seconds that the budget counts.
+now() {
+  if [ -n "${APT_CLOCK:-}" ]; then "$APT_CLOCK"; else echo "$SECONDS"; fi
+}
+deadline=$(($(now) + budget))
 
 # run_apt <seconds> <apt-get args...> runs apt-get under the smaller of <seconds> and the remaining budget, plus the kill grace.
 run_apt() {
-  local limit="$1" left=$((deadline - SECONDS - kill_after))
+  local limit="$1" left=$((deadline - $(now) - kill_after))
   shift
   [ "$left" -lt "$limit" ] && limit="$left"
   if [ "$limit" -lt 1 ]; then
@@ -88,7 +110,7 @@ for attempt in $(seq 1 "$attempts"); do
     use_public || true
   fi
   echo "apt attempt $attempt of $attempts failed" >&2
-  if [ "$attempt" -lt "$attempts" ] && [ $((deadline - SECONDS)) -gt $((attempt * 10 + kill_after)) ]; then
+  if [ "$attempt" -lt "$attempts" ] && [ $((deadline - $(now))) -gt $((attempt * 10 + kill_after)) ]; then
     sleep $((attempt * 10))
   fi
 done

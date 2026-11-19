@@ -7,9 +7,11 @@ package codingagent
 import (
 	"errors"
 	"fmt"
-	"os"
-	"strings"
 	"time"
+
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/nodepath"
+	"github.com/MichaelKinsy/PiG/internal/sessionentry"
 )
 
 const (
@@ -41,7 +43,7 @@ type bugReportChoices struct {
 
 // bugHandler runs /bug. The optional argument prefills the description.
 func bugHandler(sc *SlashContext) error {
-	if sc.ShowExtensionEditor == nil || sc.ShowExtensionSelector == nil || sc.BugReportInputs == nil {
+	if sc.ShowBugReportEditor == nil || sc.ShowBugReportSelector == nil || sc.BugReportInputs == nil {
 		sc.Append("/bug needs the interactive UI.")
 		return nil
 	}
@@ -87,15 +89,15 @@ func bugReportModelName(sc *SlashContext) string {
 // summary consent, then confirms the export. It mirrors upstream
 // promptForOptions without the upload choice.
 func promptBugReportChoices(sc *SlashContext) (bugReportChoices, bool) {
-	hint, ok := sc.ShowExtensionEditor("Report a bug", bugReportDisclaimer+"\n\nWhat went wrong? (optional)", strings.TrimSpace(sc.Args))
+	hint, ok := sc.ShowBugReportEditor("Report a bug", bugReportDisclaimer+"\n\nWhat went wrong? (optional)", jsstring.Trim(sc.Args))
 	if !ok {
 		return bugReportChoices{}, false
 	}
-	transcript, ok := sc.ShowExtensionSelector("Include the session transcript?", []string{"Yes, include the transcript", "No"}, bugReportTranscriptNote)
+	transcript, ok := sc.ShowBugReportSelector("Include the session transcript?", []string{"Yes, include the transcript", "No"}, bugReportTranscriptNote)
 	if !ok {
 		return bugReportChoices{}, false
 	}
-	choices := bugReportChoices{hint: strings.TrimSpace(hint), includeSession: transcript != "No"}
+	choices := bugReportChoices{hint: jsstring.Trim(hint), includeSession: transcript != "No"}
 	modelName := bugReportModelName(sc)
 	if !choices.includeSession {
 		provider := "your provider"
@@ -104,7 +106,7 @@ func promptBugReportChoices(sc *SlashContext) (bugReportChoices, bool) {
 				provider = name
 			}
 		}
-		summary, ok := sc.ShowExtensionSelector(
+		summary, ok := sc.ShowBugReportSelector(
 			"Attach a summary written by "+modelName+" instead?",
 			[]string{"Yes, generate a summary", "No"},
 			"The transcript is sent to "+provider+" with your credentials and tokens. Only the generated summary is attached; the transcript stays on your machine.",
@@ -127,7 +129,7 @@ func promptBugReportChoices(sc *SlashContext) (bugReportChoices, bool) {
 		summaryState = "written by " + modelName
 	}
 	// pig divergence (D62): export is the only delivery; PiG never uploads.
-	delivery, ok := sc.ShowExtensionSelector("Bug report", []string{bugReportExport, "Cancel"}, fmt.Sprintf(
+	delivery, ok := sc.ShowBugReportSelector("Bug report", []string{bugReportExport, "Cancel"}, fmt.Sprintf(
 		"Description: %s\nTranscript: %s\nSummary: %s\n\nExport writes a zip archive to the current directory. Nothing is uploaded; you can attach the archive to a PiG issue.",
 		description, transcriptState, summaryState,
 	))
@@ -149,9 +151,14 @@ func buildBugReportBundle(sc *SlashContext, choices bugReportChoices, summary *s
 	if session != nil {
 		inputs.SessionID = session.ID()
 		inputs.CWD = session.CWD()
-		inputs.Header = session.Header()
-		inputs.Entries = session.Entries()
-		inputs.Branch = BugReportBranch(session)
+		inputs.Header = session.ExportHeader()
+		// The report reads every entry: a record that changed on disk under the session fails it.
+		if inputs.Entries, err = sessionentry.MaterializeAll(session.GetEntries()); err != nil {
+			return BugReportBundle{}, err
+		}
+		if inputs.Branch, err = sessionentry.MaterializeAll(BugReportBranch(session)); err != nil {
+			return BugReportBundle{}, err
+		}
 	}
 	now := time.Now()
 	metadata, err := CollectBugReportMetadata(inputs, BugReportOptions{Hint: choices.hint, IncludeSession: choices.includeSession}, summary != nil, now)
@@ -181,7 +188,7 @@ func buildBugReportBundle(sc *SlashContext, choices bugReportChoices, summary *s
 // exportBugReport writes the archive to the working directory, records the
 // report in the session, and prints the PiG issue link.
 func exportBugReport(sc *SlashContext, bundle BugReportBundle) error {
-	dir, err := os.Getwd()
+	dir, err := nodepath.Cwd() // bug-report.ts:202 process.cwd()
 	if err != nil {
 		return fmt.Errorf("Failed to write bug report: %w", err)
 	}
@@ -203,7 +210,7 @@ func exportBugReport(sc *SlashContext, bundle BugReportBundle) error {
 		upstreamVersion = sc.UpstreamVersion()
 	}
 	// pig divergence (D62): link to the PiG issue form; the user attaches the archive.
-	sc.Append(fmt.Sprintf("To report it, open a PiG issue and attach `%s`:\n\n%s", archiveName, BugReportIssueLink(bundle.Metadata, archiveName, upstreamVersion)))
+	sc.Append(fmt.Sprintf("To report it, open this link, drag `%s` into the issue and submit. The link fills in your versions and report ID, and \"What happened\" is the only field you need:\n\n%s", archiveName, BugReportIssueLink(bundle.Metadata, archiveName, upstreamVersion)))
 	return nil
 }
 

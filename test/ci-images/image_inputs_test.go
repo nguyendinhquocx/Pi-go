@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
 // SPDX-License-Identifier: MIT
 
 package ciimages
@@ -66,10 +65,12 @@ func TestCIImageValidationDerivesToolchainInputs(t *testing.T) {
 	for _, image := range []string{"ci-go", "ci-parity"} {
 		copyCIFixture(t, root, "automation/images/"+image+"/metadata.env")
 	}
+	copyCIFixture(t, root, "automation/pin/pin.py")
+	copyCIFixture(t, root, "automation/pin/pinlib.py")
 	for path, content := range map[string]string{
 		".go-version":   "9.8.7\n",
 		".node-version": "98.7.6\n",
-		"internal/coding/pigversion/pigversion.go":   "const UpstreamVersion = \"7.6.5\"\n",
+		".upstream/pin": "ref=v7.6.5\ncommit=" + strings.Repeat("a", 40) + "\npackage_version=7.6.5\nversion=7.6.5\n",
 		"automation/images/npm-runtime/package.json": `{"dependencies":{"npm":"8.7.6"}}`,
 		".github/workflows/ci.yml":                   "env:\n  RUST_VERSION: 6.5.4\n",
 		"bin/docker": `#!/usr/bin/env bash
@@ -138,14 +139,19 @@ func TestCIImageWorkflowWatchesAuthoritativePins(t *testing.T) {
 		t.Fatal(err)
 	}
 	var workflow struct {
-		On map[string]struct{ Paths []string }
+		On map[string]yaml.Node
 	}
 	if err := yaml.Unmarshal(data, &workflow); err != nil {
 		t.Fatal(err)
 	}
 	for _, event := range []string{"push", "pull_request"} {
-		paths := "\n" + strings.Join(workflow.On[event].Paths, "\n") + "\n"
-		for _, input := range []string{".go-version", ".node-version", "internal/coding/pigversion/pigversion.go", ".github/workflows/ci.yml"} {
+		var trigger struct{ Paths []string }
+		node := workflow.On[event]
+		if err := node.Decode(&trigger); err != nil {
+			t.Fatalf("%s trigger: %v", event, err)
+		}
+		paths := "\n" + strings.Join(trigger.Paths, "\n") + "\n"
+		for _, input := range []string{".go-version", ".node-version", ".upstream/pin", ".github/workflows/ci.yml"} {
 			if !strings.Contains(paths, "\n"+input+"\n") {
 				t.Errorf("%s ignores authoritative image input %s", event, input)
 			}
@@ -156,14 +162,14 @@ func TestCIImageWorkflowWatchesAuthoritativePins(t *testing.T) {
 func TestCIImageSeederUsesDockerfileDigests(t *testing.T) {
 	root := t.TempDir()
 	copyCIFixture(t, root, "automation/ci/seed-ci-image-bases.sh")
+	copyCIFixture(t, root, "automation/ci/fetch-pinned.sh")
 	digest := "@sha256:" + strings.Repeat("a", 64)
 	writeCIFixture(t, root, "automation/images/ci-go/Dockerfile", "ARG GO_IMAGE=fixture/go"+digest+"\n")
 	writeCIFixture(t, root, "automation/images/ci-parity/Dockerfile", "ARG GO_BUILDER=fixture/builder"+digest+"\nARG WOLFI_BASE=fixture/wolfi"+digest+"\n")
 	for name, script := range map[string]string{
-		"curl": "#!/bin/sh\nexit 0\n",
-		// Like the real `sha256sum -c -`, read the whole check list: exiting
-		// unread would SIGPIPE the seeder's echo and fail its pipefail pipeline.
-		"sha256sum": "#!/bin/sh\ncat >/dev/null\n",
+		// The download writes its -o file; the pinned digest is what the stand-in sha256sum reports.
+		"curl":      "#!/bin/sh\nwhile [ $# -gt 0 ]; do if [ \"$1\" = -o ]; then echo crane > \"$2\"; fi; shift; done\n",
+		"sha256sum": "#!/bin/sh\necho c1d593d01551f2c9a3df5ca0a0be4385a839bd9b86d4a76e18d7b17d16559127  \"$1\"\n",
 		"tar": `#!/usr/bin/env bash
 set -euo pipefail
 while [[ "$1" != -C ]]; do shift; done
@@ -180,6 +186,7 @@ cp "$MOCK_CRANE" "$2/crane"
 	t.Setenv("PULL_LOG", filepath.Join(root, "pulls"))
 	t.Setenv("TMPDIR", t.TempDir())
 	t.Setenv("PLATFORM", "linux/amd64")
+	t.Setenv("FETCH_CACHE_DIR", t.TempDir())
 	for _, image := range []string{"go", "parity"} {
 		t.Setenv("CI_BASE_DIR", filepath.Join(root, "bases-"+image))
 		cmd := mockedBash(t, filepath.Join(root, "bin"), filepath.Join(root, "automation/ci/seed-ci-image-bases.sh"), image)

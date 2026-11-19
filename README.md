@@ -1,5 +1,4 @@
 <!--
-SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
 SPDX-License-Identifier: MIT
 -->
 
@@ -18,14 +17,14 @@ SPDX-License-Identifier: MIT
 [![Minimum Go version](https://img.shields.io/github/go-mod/go-version/MichaelKinsy/PiG?label=Go%20%E2%89%A5)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Latest release](https://img.shields.io/github/v/release/MichaelKinsy/PiG?sort=semver)](https://github.com/MichaelKinsy/PiG/releases)
-[![Pi pin 1.0.3](https://img.shields.io/badge/Pi%20pin-1.0.3-8A2BE2)](https://github.com/earendil-works/pi/releases/tag/v1.0.3)
+[![Pi pin 1.5.0](https://img.shields.io/badge/Pi%20pin-1.5.0-8A2BE2)](https://github.com/earendil-works/pi/releases/tag/v1.5.0)
 [![Pi port progress](.github/badges/parity-coverage.svg)](test/parity/coverage.md)
 [![Follow PiG on X](https://img.shields.io/badge/X-%40PiGCodingAgent-000000?logo=x&logoColor=white)](https://x.com/PiGCodingAgent)
 [![Join r/PiGCodingAgent](https://img.shields.io/badge/Reddit-r%2FPiGCodingAgent-FF4500?logo=reddit&logoColor=white)](https://www.reddit.com/r/PiGCodingAgent/)
 
 PiG is [Pi](https://github.com/earendil-works/pi), the minimal and extensible coding agent for the terminal, rebuilt in Go as one native binary. It starts quickly, needs no Node.js, and runs Pi's TypeScript extensions unchanged. You can also write extensions in Go, Rust, or Python, and bundle extensions, skills, and prompts into a Piglet: one named agent you can share or build into its own executable.
 
-PiG is a pre-stable 0.x release. Core paths are ported and checked against Pi 1.0.3 with paired parity scenarios; edge cases are still hardening. See the [port status](test/parity/coverage.md) and [file map](docs/parity/PORT_MAP.md) for current scope and evidence.
+PiG is a pre-stable 0.x release. Core paths are ported and checked against Pi 1.5.0 with paired parity scenarios; edge cases are still hardening. See the [port status](test/parity/coverage.md) and [file map](docs/parity/PORT_MAP.md) for current scope and evidence.
 
 If PiG behaves differently from Pi, that is either a bug or a documented divergence. Windows support is a preview.
 
@@ -53,6 +52,12 @@ With Go:
 
 ```bash
 go install github.com/MichaelKinsy/PiG/cmd/pig@latest
+```
+
+With Nix:
+
+```bash
+nix run github:MichaelKinsy/PiG
 ```
 
 You can also download an archive from [GitHub Releases](https://github.com/MichaelKinsy/PiG/releases) or [build from source](#build-from-source). [pi-in-go.dev/install](https://pi-in-go.dev/install) covers every method, including updates and uninstalling.
@@ -100,7 +105,7 @@ PiG adds a Go implementation to the Pi ecosystem and follows the Pi reference im
 - Prefer changes that reduce the cost of the next upstream sync.
 - Share generally useful findings with the broader ecosystem when the contribution route permits it.
 
-The pinned Pi release is 0.99.1 at commit `d86654abb8862e201933517d6f1fce9f88dd117f`. The pin names the behavior oracle. It does not claim that every upstream change is already ported: [`test/parity/coverage.md`](test/parity/coverage.md) reports verified behavior, and the upgrade ledgers under [`test/parity/upstream-sync/`](test/parity/upstream-sync/) list each upstream change and its disposition.
+The pinned Pi release is 1.5.0 at commit `f9a26365568127461c47a07a37dcb42c140a3ac5`. The pin names the behavior oracle. It does not claim that every upstream change is already ported: [`test/parity/coverage.md`](test/parity/coverage.md) reports verified behavior, and the upgrade ledgers under [`test/parity/upstream-sync/`](test/parity/upstream-sync/) list each upstream change and its disposition.
 
 PiG's current package scope covers Pi's agent, AI, coding-agent, and TUI
 packages. It does not implement Pi's experimental remote Session packages or
@@ -113,12 +118,12 @@ its standalone telemetry and evaluation packages. See
 - Go module: `github.com/MichaelKinsy/PiG`
 - Configuration root: `~/.pig/`, or `PIG_HOME`
 - Agent directory: `~/.pig/agent`, or `PIG_CODING_AGENT_DIR`
-- Pi version pin: [`internal/coding/pigversion/pigversion.go`](internal/coding/pigversion/pigversion.go)
+- Pi version pin: [`.upstream/pin`](.upstream/pin) (a release tag or a pinned commit; `PI_UPSTREAM_REF=<tag|commit>` overrides it for one run, `make pin-bump` moves it)
 - Local upstream mirror: `.upstream/current/`
 - Main verification gate: `make check`
 - Full verification and coverage refresh: `make verify`
 
-`pig --version` prints PiG's version as `<PiG release>+<Pi release>`, for example `0.3.0+0.99.1` (D63): the Pi release is semver build metadata, so the version sorts as the PiG release. `pig version` prints the PiG release and the pinned Pi release as separate fields. Neither command reads user configuration.
+`pig --version` prints PiG's version as `<PiG release>+<Pi release>`, for example `0.7.0+1.5.0` (D63): the Pi release is semver build metadata, so the version sorts as the PiG release. `pig version` prints the PiG release and the pinned Pi release as separate fields. Neither command reads user configuration.
 
 ## Repository map
 
@@ -207,12 +212,27 @@ Go writes the `pig` executable to `GOBIN`, or to the `bin` directory of the firs
 `~/go/bin` by default (`%USERPROFILE%\go\bin` on Windows). Add that directory to
 `PATH`. With an older Go 1.21 or later and the default `GOTOOLCHAIN=auto`, Go
 downloads a new enough toolchain automatically. Release binaries are built with
-Go 1.27.2.
+Go 1.27.4.
 
 Use an exact release such as `@v0.2.0` when reproducibility matters. Update a Go
 installation by running `go install` again. Each release tags the root module
 (`v0.2.0`) and the Go extension SDK module (`extensions/sdk/v0.2.0`) on the same
 commit; `go install` needs both.
+
+## Install with Nix
+
+The flake builds PiG from source in the Nix sandbox, with every input pinned by `flake.lock`:
+
+```bash
+nix run github:MichaelKinsy/PiG -- --version
+nix profile add github:MichaelKinsy/PiG
+```
+
+Nix before 2.30 and Lix spell the second command `nix profile install`.
+
+On NixOS or with Home Manager, add the flake as an input and install `inputs.pig.packages.${system}.default`, or apply `inputs.pig.overlays.default` and install `pkgs.pig`.
+
+The package wraps `pig` as Pi's flake does: `fd`, `ripgrep`, and the clipboard commands come first on `PATH`, and Node.js comes last so that `npm` is available for package installs. Extensions build and run as in any other installation, with the toolchains on your `PATH` and the SDKs PiG stages under `~/.pig`. `pig update` does not replace a Nix installation; update the flake input instead. The flake is verified on x86_64-linux; the other systems evaluate but are not yet verified natively.
 
 ## Build from source
 
@@ -220,10 +240,10 @@ PiG currently supports source builds on Linux, macOS, and Windows. Do not treat 
 
 Requirements:
 
-- Go 1.27.2
+- Go 1.27.4
 - Git
 - macOS 13 or later for native macOS builds
-- Node.js 24.19.0 and npm 12.1.0 for parity tooling
+- Node.js 24.22.1 and npm 12.1.0 for parity tooling
 - Python 3.12 for Python SDK tests
 - Rust 1.97.1 for Rust SDK tests
 - tmux for terminal parity tests on Unix
@@ -247,7 +267,7 @@ Run the main local gate:
 make check
 ```
 
-The `upstream-mirror` target installs the lockfile-pinned Pi package. It retrieves the exact tagged Pi source and verifies its commit against [`internal/coding/pigversion/pigversion.go`](internal/coding/pigversion/pigversion.go).
+The `upstream-mirror` target installs the Pi comparator of the pin: the lockfile-pinned package for a release tag, or a build of the pinned commit. It retrieves the exact Pi source and verifies its commit against [`.upstream/pin`](.upstream/pin).
 
 ## Contract model
 

@@ -25,13 +25,23 @@ pub type ProviderOperationFn = Arc<
 >;
 /// The legacy `streamSimple` of a provider config: it runs in the extension with the request's context and returns the provider's event stream.
 pub type ProviderStreamSimpleFn = Arc<
-    dyn Fn(&crate::Context, Value, Value, Value) -> ProviderResult<Arc<ModelEventStream>> + Send + Sync,
+    dyn Fn(&crate::Context, Value, Value, Value) -> ProviderResult<Arc<ModelEventStream>>
+        + Send
+        + Sync,
 >;
 pub type ProviderFilterFn = Arc<
     dyn Fn(&[ProviderModel], Option<Value>) -> ProviderResult<Vec<ProviderModel>> + Send + Sync,
 >;
 type Callback = Arc<dyn Fn(Value) -> ProviderResult<Value> + Send + Sync>;
 type Callbacks = HashMap<String, Callback>;
+type APIKeyCheckFn =
+    Arc<dyn Fn(APIKeyAuthInput) -> ProviderResult<Option<AuthCheck>> + Send + Sync>;
+type ProviderPayloadHook = Arc<dyn Fn(Value, ProviderModel) -> ProviderResult<Value> + Send + Sync>;
+type ProviderEventHook = Arc<dyn Fn(Value, ProviderModel) -> ProviderResult<()> + Send + Sync>;
+type CancelDeferredFn =
+    Arc<dyn Fn(ProviderModel, Value, ProviderStreamOptions) -> ProviderResult<()> + Send + Sync>;
+type UpdateFn = Arc<dyn Fn() -> ProviderResult<()> + Send + Sync>;
+type MethodCallback = Arc<dyn Fn(&str, Value) -> ProviderResult<Value> + Send + Sync>;
 
 #[derive(Default)]
 struct SignalState {
@@ -42,6 +52,19 @@ struct SignalState {
 #[derive(Clone, Default)]
 pub struct ProviderSignal {
     inner: Arc<(Mutex<SignalState>, Condvar)>,
+}
+/// Two signals are equal when they are the same signal: a clone is equal to its source.
+impl PartialEq for ProviderSignal {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+impl std::fmt::Debug for ProviderSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderSignal")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
 }
 pub struct ProviderSignalSubscription {
     signal: Weak<(Mutex<SignalState>, Condvar)>,
@@ -149,10 +172,17 @@ pub struct AuthInteraction {
     pub prompt: Arc<dyn Fn(Value) -> ProviderResult<String> + Send + Sync>,
     pub notify: Arc<dyn Fn(Value) -> ProviderResult<()> + Send + Sync>,
 }
+/// Pi's LoginOptions (packages/ai/src/auth/types.ts:202-214), which the app passes to an OAuth login.
+#[derive(Clone, Default)]
+pub struct LoginOptions {
+    /// Returns the stable ID of this app installation. Call it only when the flow needs it: the app creates the ID on first use. None means the app supplies none.
+    pub get_device_id: Option<Arc<dyn Fn() -> ProviderResult<String> + Send + Sync>>,
+    /// The name the app introduces itself with during login; None means the flow's own default.
+    pub agent_name: Option<String>,
+}
 pub struct APIKeyAuth {
     pub name: String,
-    pub check:
-        Option<Arc<dyn Fn(APIKeyAuthInput) -> ProviderResult<Option<AuthCheck>> + Send + Sync>>,
+    pub check: Option<APIKeyCheckFn>,
     pub resolve: Arc<dyn Fn(APIKeyAuthInput) -> ProviderResult<Option<AuthResult>> + Send + Sync>,
     pub login: Option<Arc<dyn Fn(AuthInteraction) -> ProviderResult<Value> + Send + Sync>>,
 }
@@ -160,7 +190,7 @@ pub struct OAuthAuth {
     pub name: String,
     pub is_subscription: Option<bool>,
     pub login_label: Option<String>,
-    pub login: Arc<dyn Fn(AuthInteraction) -> ProviderResult<Value> + Send + Sync>,
+    pub login: Arc<dyn Fn(AuthInteraction, LoginOptions) -> ProviderResult<Value> + Send + Sync>,
     pub refresh: Arc<dyn Fn(Value, ProviderSignal) -> ProviderResult<Value> + Send + Sync>,
     pub to_auth: Arc<dyn Fn(Value) -> ProviderResult<Value> + Send + Sync>,
 }
@@ -173,10 +203,10 @@ pub struct ProviderAuth {
 pub struct ProviderStreamOptions {
     pub signal: ProviderSignal,
     pub values: Value,
-    pub on_payload:
-        Option<Arc<dyn Fn(Value, ProviderModel) -> ProviderResult<Value> + Send + Sync>>,
-    pub on_response: Option<Arc<dyn Fn(Value, ProviderModel) -> ProviderResult<()> + Send + Sync>>,
-    pub transform_headers: Option<Arc<dyn Fn(Value) -> ProviderResult<Value> + Send + Sync>>,
+    pub on_payload: Option<ProviderPayloadHook>,
+    pub on_response: Option<ProviderEventHook>,
+    /// The caller's onProviderStreamEvent (upstream types.ts StreamOptions.onProviderStreamEvent). Pi's Models strips transformHeaders before Provider.stream (model-runtime.ts:671), so the options carry no transformHeaders.
+    pub on_provider_stream_event: Option<ProviderEventHook>,
 }
 /// What an image or classifier implementation receives besides the model and the request: the resolved request options, and the request's cancellation.
 #[derive(Clone, Default)]
@@ -196,17 +226,37 @@ impl ProviderOperations {
         Self::default()
     }
     /// Adds the implementation of one image API.
-    pub fn images(mut self, api: impl Into<String>, generate: impl Fn(ProviderModel, Value, ProviderOperationOptions) -> ProviderResult<Value> + Send + Sync + 'static) -> Self {
+    pub fn images(
+        mut self,
+        api: impl Into<String>,
+        generate: impl Fn(ProviderModel, Value, ProviderOperationOptions) -> ProviderResult<Value>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
         self.images.push((api.into(), Arc::new(generate)));
         self
     }
     /// Sets the config's `streamSimple`.
-    pub fn stream_simple(mut self, handler: impl Fn(&crate::Context, Value, Value, Value) -> ProviderResult<Arc<ModelEventStream>> + Send + Sync + 'static) -> Self {
+    pub fn stream_simple(
+        mut self,
+        handler: impl Fn(&crate::Context, Value, Value, Value) -> ProviderResult<Arc<ModelEventStream>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
         self.stream_simple = Some(Arc::new(handler));
         self
     }
     /// Adds the implementation of one classifier API.
-    pub fn classifier(mut self, api: impl Into<String>, classify: impl Fn(ProviderModel, Value, ProviderOperationOptions) -> ProviderResult<Value> + Send + Sync + 'static) -> Self {
+    pub fn classifier(
+        mut self,
+        api: impl Into<String>,
+        classify: impl Fn(ProviderModel, Value, ProviderOperationOptions) -> ProviderResult<Value>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
         self.classifiers.push((api.into(), Arc::new(classify)));
         self
     }
@@ -219,9 +269,22 @@ pub(crate) struct ProviderCallbacks {
 
 impl ProviderCallbacks {
     /// Keeps the implementations of a registration and returns the declaration the host receives. A re-registration replaces only the kinds it defines, as registerProvider merges defined values (model-runtime.ts registerProvider) and the host keeps the APIs it wired.
-    pub(crate) fn declare(&self, name: String, config: Value, operations: ProviderOperations) -> ProviderDef {
-        let mut image_apis: Vec<String> = operations.images.iter().map(|(api, _)| api.clone()).collect();
-        let mut classifier_apis: Vec<String> = operations.classifiers.iter().map(|(api, _)| api.clone()).collect();
+    pub(crate) fn declare(
+        &self,
+        name: String,
+        config: Value,
+        operations: ProviderOperations,
+    ) -> ProviderDef {
+        let mut image_apis: Vec<String> = operations
+            .images
+            .iter()
+            .map(|(api, _)| api.clone())
+            .collect();
+        let mut classifier_apis: Vec<String> = operations
+            .classifiers
+            .iter()
+            .map(|(api, _)| api.clone())
+            .collect();
         image_apis.sort();
         image_apis.dedup();
         classifier_apis.sort();
@@ -240,7 +303,14 @@ impl ProviderCallbacks {
                 kept.stream_simple = operations.stream_simple;
             }
         }
-        ProviderDef { name, config, native: None, stream_simple, image_apis, classifier_apis }
+        ProviderDef {
+            name,
+            config,
+            native: None,
+            stream_simple,
+            image_apis,
+            classifier_apis,
+        }
     }
 
     /// What the extension holds for a provider, to restore it when the host refuses a registration.
@@ -261,16 +331,34 @@ impl ProviderCallbacks {
         }
     }
 
-    pub(crate) fn operation(&self, provider: &str, images: bool, api: &str) -> Option<ProviderOperationFn> {
+    pub(crate) fn operation(
+        &self,
+        provider: &str,
+        images: bool,
+        api: &str,
+    ) -> Option<ProviderOperationFn> {
         let held = self.held.lock().unwrap();
         let operations = held.get(provider)?;
-        let implementations = if images { &operations.images } else { &operations.classifiers };
+        let implementations = if images {
+            &operations.images
+        } else {
+            &operations.classifiers
+        };
         // A later implementation of the same API replaces an earlier one, as a repeated key of Pi's `images`/`classifiers` object does.
-        implementations.iter().rev().find(|(name, _)| name == api).map(|(_, callback)| callback.clone())
+        implementations
+            .iter()
+            .rev()
+            .find(|(name, _)| name == api)
+            .map(|(_, callback)| callback.clone())
     }
 
     pub(crate) fn stream_simple(&self, provider: &str) -> Option<ProviderStreamSimpleFn> {
-        self.held.lock().unwrap().get(provider)?.stream_simple.clone()
+        self.held
+            .lock()
+            .unwrap()
+            .get(provider)?
+            .stream_simple
+            .clone()
     }
 }
 
@@ -285,6 +373,8 @@ pub struct RefreshModelsContext {
     pub force: Option<bool>,
     pub signal: ProviderSignal,
     pub publish: Arc<dyn Fn(ModelsPublication) -> ProviderResult<bool> + Send + Sync>,
+    /// The registered provider's base URL, including configuration overrides that wrappers apply outside the provider; `None` when it has none.
+    pub base_url: Option<String>,
 }
 pub struct Provider {
     pub id: String,
@@ -294,16 +384,16 @@ pub struct Provider {
     pub auth: ProviderAuth,
     pub get_models: Arc<dyn Fn() -> ProviderResult<Vec<ProviderModel>> + Send + Sync>,
     pub filter_models: Option<ProviderFilterFn>,
+    /// Lists the models of every type; without it `get_models` does. Pi `Provider.getAllModels`.
+    pub get_all_models: Option<Arc<dyn Fn() -> ProviderResult<Vec<ProviderModel>> + Send + Sync>>,
+    /// Filters the models of every type by credential; without it `filter_models` filters the chat models. Pi `Provider.filterAllModels`.
+    pub filter_all_models: Option<ProviderFilterFn>,
     pub refresh_models:
         Option<Arc<dyn Fn(RefreshModelsContext) -> ProviderResult<()> + Send + Sync>>,
     pub stream: ProviderStreamFn,
     pub stream_simple: ProviderStreamFn,
     pub fetch_deferred: Option<ProviderStreamFn>,
-    pub cancel_deferred: Option<
-        Arc<
-            dyn Fn(ProviderModel, Value, ProviderStreamOptions) -> ProviderResult<()> + Send + Sync,
-        >,
-    >,
+    pub cancel_deferred: Option<CancelDeferredFn>,
     /// The provider's image generation and classification, declared like its other methods.
     pub generate_images: Option<ProviderOperationFn>,
     pub classify: Option<ProviderOperationFn>,
@@ -314,7 +404,7 @@ pub(crate) struct ProviderObjects {
     native: Mutex<HashMap<String, Arc<Provider>>>,
     proxies: Mutex<HashMap<String, (String, Weak<Provider>)>>,
     callbacks: Mutex<HashMap<String, Callbacks>>,
-    updates: Mutex<HashMap<String, Arc<dyn Fn() -> ProviderResult<()> + Send + Sync>>>,
+    updates: Mutex<HashMap<String, UpdateFn>>,
     pub(crate) streams: crate::context::ModelStreams,
     pub(crate) workers: Arc<RequestThreads>,
 }
@@ -347,7 +437,9 @@ impl ProviderObjects {
         let key = self.key();
         let mut methods = vec!["getModels", "stream", "streamSimple"];
         for (method, present) in [
+            ("getAllModels", provider.get_all_models.is_some()),
             ("filterModels", provider.filter_models.is_some()),
+            ("filterAllModels", provider.filter_all_models.is_some()),
             ("refreshModels", provider.refresh_models.is_some()),
             ("fetchDeferred", provider.fetch_deferred.is_some()),
             ("cancelDeferred", provider.cancel_deferred.is_some()),
@@ -385,7 +477,11 @@ impl ProviderObjects {
                 "auth.oauth.toAuth",
             ]);
         }
-        let models = (provider.get_models)().unwrap_or_default();
+        let models = match &provider.get_all_models {
+            Some(all) => all(),
+            None => (provider.get_models)(),
+        }
+        .unwrap_or_default();
         let mut native = json!({"id":provider.id,"key":key,"name":provider.name,"auth":auth,"models":models.iter().map(|m|m.as_ref()).collect::<Vec<_>>(),"methods":methods});
         if let Some(value) = &provider.base_url {
             native["baseUrl"] = json!(value)
@@ -447,7 +543,7 @@ impl ProviderObjects {
             .get(key)
             .cloned()
             .ok_or("Provider object is no longer registered")?;
-        let callback: Arc<dyn Fn(&str, Value) -> ProviderResult<Value> + Send + Sync> = {
+        let callback: MethodCallback = {
             let conn = conn.clone();
             let parent = id.to_owned();
             let key = key.to_owned();
@@ -504,7 +600,16 @@ impl ProviderObjects {
                     .map(|m| m.as_ref())
                     .collect::<Vec<_>>()
             )),
-            "filterModels" => {
+            "getAllModels" => Ok(json!(
+                provider
+                    .get_all_models
+                    .as_ref()
+                    .ok_or("getAllModels absent")?()?
+                .iter()
+                .map(|m| m.as_ref())
+                .collect::<Vec<_>>()
+            )),
+            "filterModels" | "filterAllModels" => {
                 let models = params["models"]
                     .as_array()
                     .ok_or("models must be an array")?
@@ -512,11 +617,14 @@ impl ProviderObjects {
                     .cloned()
                     .map(Arc::new)
                     .collect::<Vec<_>>();
-                let result = provider
-                    .filter_models
-                    .as_ref()
-                    .ok_or("filterModels absent")?(
-                    &models, optional(&params["credential"])
+                let filter = if method == "filterAllModels" {
+                    &provider.filter_all_models
+                } else {
+                    &provider.filter_models
+                };
+                let result = filter.as_ref().ok_or("filter absent")?(
+                    &models,
+                    optional(&params["credential"]),
                 )?;
                 let indices = result
                     .iter()
@@ -559,7 +667,20 @@ impl ProviderObjects {
                 .as_ref()
                 .ok_or("login absent")?(interaction),
             "auth.oauth.login" => {
-                (provider.auth.oauth.as_ref().ok_or("oauth absent")?.login)(interaction)
+                // The host lists the LoginOptions the app supplies; get_device_id stays a call back to it.
+                let wire = &params["options"];
+                let options = LoginOptions {
+                    get_device_id: (wire["getDeviceId"] == json!(true)).then(|| {
+                        let callback = callback.clone();
+                        Arc::new(move || {
+                            serde_json::from_value(callback("getDeviceId", json!({}))?)
+                                .map_err(|e| e.to_string())
+                        })
+                            as Arc<dyn Fn() -> ProviderResult<String> + Send + Sync>
+                    }),
+                    agent_name: wire["agentName"].as_str().map(str::to_owned),
+                };
+                (provider.auth.oauth.as_ref().ok_or("oauth absent")?.login)(interaction, options)
             }
             "auth.oauth.refresh" => (provider.auth.oauth.as_ref().ok_or("oauth absent")?.refresh)(
                 params["credential"].clone(),
@@ -592,6 +713,7 @@ impl ProviderObjects {
                     stored: optional(&params["stored"]),
                     allow_network: params["allowNetwork"].as_bool().unwrap_or(false),
                     force: params["force"].as_bool(),
+                    base_url: params["baseUrl"].as_str().map(str::to_owned),
                     signal,
                     publish,
                 })?;
@@ -620,10 +742,14 @@ impl ProviderObjects {
                         Ok(())
                     }))
                 }
-                if flags.contains(&json!("transformHeaders")) {
+                if flags.contains(&json!("onProviderStreamEvent")) {
                     let callback = callback.clone();
-                    options.transform_headers = Some(Arc::new(move |value| {
-                        callback("transformHeaders", json!({"value":value}))
+                    options.on_provider_stream_event = Some(Arc::new(move |value, model| {
+                        callback(
+                            "onProviderStreamEvent",
+                            json!({"value":value,"model":model.as_ref()}),
+                        )?;
+                        Ok(())
                     }))
                 }
                 let model = Arc::new(params["model"].clone());
@@ -665,12 +791,19 @@ impl ProviderObjects {
                 Ok(Value::Null)
             }
             "generateImages" | "classify" => {
-                let implementation = if method == "generateImages" { provider.generate_images.as_ref() } else { provider.classify.as_ref() }
-                    .ok_or_else(|| format!("Provider has no {method}"))?;
+                let implementation = if method == "generateImages" {
+                    provider.generate_images.as_ref()
+                } else {
+                    provider.classify.as_ref()
+                }
+                .ok_or_else(|| format!("Provider has no {method}"))?;
                 implementation(
                     Arc::new(params["model"].clone()),
                     params["context"].clone(),
-                    ProviderOperationOptions { signal, values: params["options"].clone() },
+                    ProviderOperationOptions {
+                        signal,
+                        values: params["options"].clone(),
+                    },
                 )
             }
             _ => Err(format!("Unknown Provider method {method}")),

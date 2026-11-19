@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/MichaelKinsy/PiG/chord"
+	chordctx "github.com/MichaelKinsy/PiG/chord/context"
 	"github.com/MichaelKinsy/PiG/chord/delta"
 	"github.com/MichaelKinsy/PiG/durable"
+	"github.com/MichaelKinsy/PiG/durable/internal/strictjson"
+	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
 // Ports packages/durable/src/session/transaction.ts
@@ -34,8 +38,9 @@ type submissionChange struct {
 }
 
 // applySubmissionChange returns the complete record after one change.
-// Placement turns a queued input placed and a queued write done; only a
-// placed input can be answered. A settled record stays.
+// Placement turns a queued input placed and a queued write done; a continue is
+// never queued, so never placed. Only a placed input or continue can be
+// answered. A settled record stays.
 func applySubmissionChange(current durable.SubmissionRecord, change submissionChange) (durable.SubmissionRecord, bool, error) {
 	if current.Status == durable.SubmissionDone || current.Status == durable.SubmissionUnanswered {
 		return current, false, nil
@@ -55,7 +60,7 @@ func applySubmissionChange(current durable.SubmissionRecord, change submissionCh
 	}
 	settlement := change.settlement
 	if settlement.Status == durable.SubmissionDone && current.Status != durable.SubmissionPlaced {
-		return current, false, fmt.Errorf("Submission %d is not a placed input", current.Id)
+		return current, false, fmt.Errorf("Submission %d is not a placed input or continue", current.Id)
 	}
 	// Queued and placed records carry no answer, reason, or detail; an unanswered input keeps its entry.
 	next := current
@@ -106,6 +111,8 @@ func (loaded *LoadedDocument) deltaCount() int {
 // holds the mutation line.
 type transactionHost struct {
 	storage durable.Storage
+	// now is the wall clock in milliseconds for task lifecycle times.
+	now func() float64
 	// cached returns the cached current incarnation without loading.
 	cached func(addressId string) *LoadedDocument
 	// load returns the cached current incarnation, cold-loading and migrating it when necessary.
@@ -116,6 +123,14 @@ type transactionHost struct {
 	evict func(addressId string, recordId durable.DocumentId)
 	// conversationCreated stages writes that belong to every newly created or forked conversation.
 	conversationCreated func(tx *Transaction, record durable.ConversationRecord) error
+	// touch waits while key has an unpublished writer (Session.AwaitTouch).
+	touch func(ctx context.Context, key string) error
+	// taskDocuments is the current documents of a live task when the Session knows all of them (it created the task).
+	taskDocuments func(taskId durable.TaskId) ([]durable.DocumentRecord, bool)
+	// latestEntryId is the newest entry ID visible from a conversation, known from the Session's commits.
+	latestEntryId func(ctx context.Context, conversationId durable.ConversationId) (*durable.EntryId, error)
+	// latestHeadMarker is the newest visible head marker of a conversation, known from the Session's commits.
+	latestHeadMarker func(ctx context.Context, conversationId durable.ConversationId) (*durable.EntryRecord, error)
 }
 
 // future is a memoized operation result shared by concurrent callers, like a
@@ -134,7 +149,7 @@ func (result *future[T]) resolve(value T, err error) {
 }
 
 func (result *future[T]) wait() (T, error) {
-	<-result.done
+	await(result.done)
 	return result.value, result.err
 }
 
@@ -244,6 +259,8 @@ type documentPlan struct {
 	// change is the prepared change of a tracked incarnation; nil for fork copies and retirement-only entries.
 	change         *planChange
 	conversationId *durable.ConversationId
+	// held is set when this commit also stores held changes of the incarnation (takeHeld).
+	held *heldPlan
 }
 
 // Transaction is the transaction of one Session commit callback.
@@ -277,9 +294,37 @@ type Transaction struct {
 	plans                   []*documentPlan
 	documents               []*documentEntry
 	latestDocumentByAddress map[string]*documentEntry
+	// assembled are the writes settlement assembled, whose table records writeKeys keys.
+	assembled []durable.StorageWrite
 }
 
 var _ durable.Tx = (*Transaction)(nil)
+
+// Context is internal: the context of the commit this transaction belongs to (transaction.ts `get context`). It is
+// released once the transaction settles.
+func (tx *Transaction) Context() context.Context {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	return tx.ctx
+}
+
+// HasTableWrite is internal: whether a table write was staged, after which table reads throw ReadAfterWrite
+// (transaction.ts `get hasTableWrite`).
+func (tx *Transaction) HasTableWrite() bool {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	return tx.hasTableWrite
+}
+
+// transactionOwnedBy is internal: whether tx is a transaction of a commit of the Session behind host (transaction.ts
+// `Transaction.ownedBy`). A brand check, so a wrapper of a transaction is not one.
+func transactionOwnedBy(tx durable.Tx, host *transactionHost) (*Transaction, bool) {
+	owned, ok := tx.(*Transaction)
+	if !ok || owned == nil || owned.host != host {
+		return nil, false
+	}
+	return owned, true
+}
 
 func newTransaction(host *transactionHost, ctx context.Context, scope TransactionScope) *Transaction {
 	tx := &Transaction{
@@ -339,7 +384,7 @@ func read[T any](tx *Transaction, method string, run func() (T, error)) (T, erro
 	}
 	if tx.hasTableWrite {
 		tx.mu.Unlock()
-		return zero, durable.NewReadAfterWrite(method)
+		return zero, durable.NewReadAfterWrite("Tx." + method + "()")
 	}
 	tx.beginLocked()
 	tx.mu.Unlock()
@@ -401,10 +446,18 @@ func (tx *Transaction) ScanEntries(query durable.EntryQuery, limit int, cursor d
 	})
 }
 
-// LatestHeadMarker returns the newest visible entry of the conversation that carries a head.
+// LatestHeadMarker returns the newest visible entry of the conversation that carries a head, known from the Session's commits.
 func (tx *Transaction) LatestHeadMarker(conversationId durable.ConversationId) (*durable.EntryRecord, error) {
 	return read(tx, "latestHeadMarker", func() (*durable.EntryRecord, error) {
-		return tx.host.storage.FindLatestHeadMarker(tx.ctx, conversationId, nil)
+		return tx.host.latestHeadMarker(tx.ctx, conversationId)
+	})
+}
+
+// LatestEntryId returns the ID of the newest entry visible from the conversation, known from the Session's commits; nil when it
+// has none.
+func (tx *Transaction) LatestEntryId(conversationId durable.ConversationId) (*durable.EntryId, error) {
+	return read(tx, "latestEntryId", func() (*durable.EntryId, error) {
+		return tx.host.latestEntryId(tx.ctx, conversationId)
 	})
 }
 
@@ -582,9 +635,11 @@ func copyEntryRecord(record durable.EntryRecord) (durable.EntryRecord, error) {
 	if record.Model == nil && record.Edits == nil {
 		return record, nil
 	}
+	// upstream's copyJson of the assembled record rejects a value strict JSON cannot carry with chord's text, which a
+	// faulted run reports as its detail.
 	encoded, err := json.Marshal(record)
 	if err != nil {
-		return durable.EntryRecord{}, err
+		return durable.EntryRecord{}, strictjson.Error(err)
 	}
 	var copied durable.EntryRecord
 	if err := json.Unmarshal(encoded, &copied); err != nil {
@@ -596,7 +651,48 @@ func copyEntryRecord(record durable.EntryRecord) (durable.EntryRecord, error) {
 
 // CreateTaskErased creates a task of an erased definition.
 func (tx *Transaction) CreateTaskErased(task durable.AnyTask, input durable.JsonValue, options durable.TaskOptions) (durable.TaskId, error) {
+	return tx.createTask(task, input, options, nil)
+}
+
+// CreateTaskFromSubmissions is CreateTaskErased with transaction.ts's internal TaskCreationOptions.submissionIds: run
+// creation resolves the carriers of the submissions it starts for against staged records before reading storage. The first
+// submission's carrier becomes the task's trace ("root" when it has none) and the carriers of the others its links.
+func (tx *Transaction) CreateTaskFromSubmissions(task durable.AnyTask, input durable.JsonValue, options durable.TaskOptions, submissionIds []durable.SubmissionId) (durable.TaskId, error) {
+	return tx.createTask(task, input, options, submissionIds)
+}
+
+// createTask is Tx.createTask; submissionIds is TaskCreationOptions.submissionIds, where nil is undefined.
+func (tx *Transaction) createTask(task durable.AnyTask, input durable.JsonValue, options durable.TaskOptions, submissionIds []durable.SubmissionId) (durable.TaskId, error) {
 	return write(tx, func() (durable.TaskId, error) {
+		if submissionIds != nil {
+			var trace *durable.TaskTrace
+			var links []telemetry.TelemetryCarrier
+			for index, id := range submissionIds {
+				tx.mu.Lock()
+				staged, ok := tx.submissions[id]
+				tx.mu.Unlock()
+				var found *durable.SubmissionRecord
+				if ok {
+					found = &staged
+				} else {
+					stored, err := tx.host.storage.Submission(tx.ctx, id)
+					if err != nil {
+						return 0, err
+					}
+					found = stored
+				}
+				switch {
+				case index == 0:
+					trace = &durable.TaskTrace{Root: true}
+					if found != nil && found.Trace != nil {
+						trace = &durable.TaskTrace{Carrier: found.Trace}
+					}
+				case found != nil && found.Trace != nil:
+					links = append(links, found.Trace)
+				}
+			}
+			options.Trace, options.Links = trace, links
+		}
 		ownership := options.Ownership
 		// transaction.ts:387-389 dereferences options.ownership.kind, so a missing ownership throws before any work.
 		if ownership.Kind != durable.TaskOwnedByConversation && ownership.Kind != durable.TaskOwnedByTask {
@@ -664,14 +760,27 @@ func (tx *Transaction) CreateTaskErased(task durable.AnyTask, input durable.Json
 			return 0, err
 		}
 		id := durable.TaskId(minted)
+		var trace telemetry.TelemetryCarrier
+		switch {
+		case options.Trace == nil:
+			span := chordctx.Telemetry(tx.ctx)
+			if propagation := span.Propagation(); propagation != nil {
+				trace = propagation.Inject(span)
+			}
+		case !options.Trace.Root:
+			trace = options.Trace.Carrier
+		}
 		record := &AnyTaskRecord{
-			Id:             id,
-			ConversationId: conversationId,
-			Kind:           definition.Name,
-			Version:        definition.Version,
-			Input:          ownedInput,
-			Background:     options.Background,
-			State:          durable.TaskState[durable.JsonValue, durable.JsonValue]{Status: durable.TaskPending, Checkpoint: &checkpoint},
+			Trace:            trace,
+			Links:            options.Links,
+			Id:               id,
+			ConversationId:   conversationId,
+			Kind:             definition.Name,
+			Version:          definition.Version,
+			Input:            ownedInput,
+			Background:       options.Background,
+			AbandonOnRestart: options.AbandonOnRestart != nil && *options.AbandonOnRestart,
+			State:            durable.TaskState[durable.JsonValue, durable.JsonValue]{Status: durable.TaskPending, Checkpoint: &checkpoint},
 		}
 		if owner != nil {
 			ownerId := owner.Id
@@ -721,18 +830,21 @@ func (tx *Transaction) setSubmissionLocked(record durable.SubmissionRecord) {
 
 // SettleSubmission stages a settlement, resolved during assembly against the
 // transaction's latest candidate record, falling back to committed state.
+//
+// Upstream order: the open check, then the table-write mark, then the JSON copy of the settlement, so a settlement that
+// is not strict JSON still ends the transaction's table reads.
 func (tx *Transaction) SettleSubmission(id durable.SubmissionId, settlement durable.SubmissionSettlement) error {
-	detail, err := chord.CopyJSON(settlement.Detail)
-	if err != nil {
-		return err
-	}
-	settlement.Detail = detail
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
 	if err := tx.assertOpenLocked(); err != nil {
 		return err
 	}
 	tx.hasTableWrite = true
+	detail, err := chord.CopyJSON(settlement.Detail)
+	if err != nil {
+		return err
+	}
+	settlement.Detail = detail
 	tx.submissionChanges = append(tx.submissionChanges, struct {
 		id     durable.SubmissionId
 		change submissionChange
@@ -771,7 +883,7 @@ func (tx *Transaction) SetTask(value AnyTaskRecord) error {
 	if candidate != nil && candidate.ConversationId != value.ConversationId {
 		return fmt.Errorf("Task %d cannot change conversations", value.Id)
 	}
-	owned, err := copyTaskRecord(value)
+	owned, err := copyTaskRecord(tx.stampTimes(value, candidate))
 	if err != nil {
 		return err
 	}
@@ -782,14 +894,35 @@ func (tx *Transaction) SetTask(value AnyTaskRecord) error {
 	return nil
 }
 
-// copyTaskRecord takes ownership of a task record's JSON.
-func copyTaskRecord(record AnyTaskRecord) (AnyTaskRecord, error) {
-	encoded, err := json.Marshal(record)
-	if err != nil {
-		return AnyTaskRecord{}, err
+// stampTimes sets the lifecycle times: StartedAt on the first change to running, EndedAt on the change to terminal. Once
+// set, they carry over from the replaced candidate; records written before they existed lack them.
+func (tx *Transaction) stampTimes(value AnyTaskRecord, candidate *AnyTaskRecord) AnyTaskRecord {
+	stamp := func(current, carried *float64, stamps bool) *float64 {
+		switch {
+		case carried != nil:
+			return carried
+		case current != nil:
+			return current
+		case stamps:
+			now := tx.host.now()
+			return &now
+		}
+		return nil
 	}
-	var copied AnyTaskRecord
-	if err := json.Unmarshal(encoded, &copied); err != nil {
+	var candidateStarted, candidateEnded *float64
+	if candidate != nil {
+		candidateStarted, candidateEnded = candidate.StartedAt, candidate.EndedAt
+	}
+	value.StartedAt = stamp(value.StartedAt, candidateStarted, value.State.Status == durable.TaskRunning)
+	value.EndedAt = stamp(value.EndedAt, candidateEnded, value.State.Status == durable.TaskTerminal)
+	return value
+}
+
+// copyTaskRecord takes ownership of a task record's JSON. Its JSON members keep their member order, as copyJson keeps a
+// JavaScript object's.
+func copyTaskRecord(record AnyTaskRecord) (AnyTaskRecord, error) {
+	copied, err := durable.FromJsonValue[AnyTaskRecord](record)
+	if err != nil {
 		return AnyTaskRecord{}, err
 	}
 	if _, err := chord.CopyJSON(copied.Input); err != nil {
@@ -822,6 +955,39 @@ func (tx *Transaction) StagedConversations() []durable.ConversationRecord {
 		}
 	}
 	return records
+}
+
+// CreatedTaskIds is internal: the IDs of the tasks this transaction creates (transaction.ts createdTaskIds).
+func (tx *Transaction) CreatedTaskIds() []durable.TaskId {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	var ids []durable.TaskId
+	for _, id := range tx.taskOrder {
+		if task := tx.tasksById[id]; task.write != nil && task.writeKind == taskCreate {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// WriteKeys is internal: the keys this commit writes, once settled (and after takeHeld), for the Session's unpublished write
+// set: its table records, and the address and incarnation of every document it creates, changes, or retires, with the scope of
+// every incarnation it creates or retires (transaction.ts writeKeys).
+func (tx *Transaction) WriteKeys() []string {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	var keys []string
+	TableKeys(tx.assembled, &keys)
+	for _, plan := range tx.plans {
+		if plan.content == nil && !plan.retire {
+			continue
+		}
+		keys = append(keys, DocumentKey(plan.addressId), IncarnationKey(plan.record.id()))
+		if plan.retire || plan.record.committed == nil {
+			keys = append(keys, ScopeKey(plan.record.scope()))
+		}
+	}
+	return keys
 }
 
 // ─── Documents ─────────────────────────────────────────────────────────────
@@ -869,9 +1035,9 @@ func (tx *Transaction) doc(token durable.AnyDocToken, args []any) (*delta.Object
 	var seed durable.JsonValue
 	if definition.Family {
 		// A missing seed is upstream's undefined argument, which copyJson rejects (transaction.ts doc, json.ts copy);
-		// an explicit nil is JSON null.
+		// an explicit nil is JSON null. A typed Go seed is stored through its JSON encoding, as Snapshot and CreateTask do.
 		if resolved.NextArgument < len(args) {
-			seed, err = chord.CopyJSON(args[resolved.NextArgument])
+			seed, err = durable.ToJsonValue(args[resolved.NextArgument])
 		} else {
 			err = errUndefinedSeed
 		}
@@ -1077,6 +1243,9 @@ func sameKey(left, right *string) bool {
 }
 
 func (tx *Transaction) findRetirement(entry *documentEntry) error {
+	if err := tx.host.touch(tx.ctx, DocumentKey(entry.addressId)); err != nil {
+		return err
+	}
 	var record *durable.DocumentRecord
 	if cached := tx.host.cached(entry.addressId); cached != nil {
 		committed := cached.Record
@@ -1112,12 +1281,24 @@ func (tx *Transaction) settleFailure() {
 	tx.sealed = true
 	tx.abortChangesLocked()
 	tx.drainLocked()
+	tx.releaseContextLocked()
 	tx.mu.Unlock()
 }
+
+// releaseContextLocked drops the caller's context, which carries its telemetry span, once the transaction can no longer
+// read: a transaction or draft that outlives its commit must not keep the span and what it references reachable
+// (transaction.ts `this.#context = BACKGROUND_CONTEXT`). Called with no pending operation left.
+func (tx *Transaction) releaseContextLocked() { tx.ctx = unscoped }
 
 // settleSuccess seals after callback success, prepares every open change, and assembles the atomic batch. Any
 // failure aborts every change before Storage admission.
 func (tx *Transaction) settleSuccess() ([]durable.StorageWrite, error) {
+	// The context is released however settlement ends, once assembly has finished reading with it.
+	defer func() {
+		tx.mu.Lock()
+		tx.releaseContextLocked()
+		tx.mu.Unlock()
+	}()
 	tx.mu.Lock()
 	tx.sealed = true
 	if tx.pendingOps > 0 {
@@ -1147,6 +1328,9 @@ func (tx *Transaction) settleSuccess() ([]durable.StorageWrite, error) {
 		tx.mu.Unlock()
 		return nil, err
 	}
+	tx.mu.Lock()
+	tx.assembled = writes
+	tx.mu.Unlock()
 	return writes, nil
 }
 
@@ -1157,9 +1341,22 @@ func (tx *Transaction) discard() {
 	tx.mu.Unlock()
 }
 
+// adoptedDocuments is what adoption publishes: to the Session's own observers, and the stored changes to ObserveCommits.
+type adoptedDocuments struct {
+	// observed is this commit's own changes, as memory adopted them.
+	observed []durable.DocumentCommitChange
+	// stored is what Storage got: observed, unless the commit also stored held changes, which precede its own.
+	stored []durable.DocumentCommitChange
+	// split is set when stored differs from observed.
+	split bool
+}
+
 // adopt adopts every prepared change by pointer swap after Storage success and describes the publication.
-func (tx *Transaction) adopt(seq durable.Seq) ([]durable.DocumentCommitChange, error) {
+func (tx *Transaction) adopt(seq durable.Seq) (adoptedDocuments, error) {
 	var publications []durable.DocumentCommitChange
+	// stored is set only when the commit stored held changes: then what Storage got differs from what memory adopted.
+	var stored []durable.DocumentCommitChange
+	split := false
 	for _, plan := range tx.plans {
 		committed := plan.record.committed != nil
 		var record durable.DocumentRecord
@@ -1183,7 +1380,7 @@ func (tx *Transaction) adopt(seq durable.Seq) ([]durable.DocumentCommitChange, e
 			}
 			if adoptIt {
 				if err := change.tracker.Adopt(change.prepared); err != nil {
-					return nil, err
+					return adoptedDocuments{}, err
 				}
 			} else {
 				change.prepared.Abort()
@@ -1211,33 +1408,226 @@ func (tx *Transaction) adopt(seq durable.Seq) ([]durable.DocumentCommitChange, e
 				})
 			}
 		}
-		conversationId := plan.conversationId
-		_, isCopy := plan.content.(durable.DocumentCopyWrite)
-		switch {
-		case plan.retire:
-			if committed {
-				tx.host.evict(plan.addressId, record.Id)
+		if plan.retire && committed {
+			tx.host.evict(plan.addressId, record.Id)
+		}
+		publication := describe(plan, record)
+		if publication == nil {
+			continue
+		}
+		held := plan.held
+		if held == nil {
+			publications = append(publications, publication)
+			if split {
+				stored = append(stored, publication)
 			}
-			publications = append(publications, durable.DocumentChange{Record: record, ConversationId: conversationId, Ops: []durable.Op{}})
-		case isCopy:
-			copyWrite := plan.content.(durable.DocumentCopyWrite)
-			publications = append(publications, durable.DocumentCopyChange{Record: record, ConversationId: *conversationId, Source: copyWrite.Source})
-		case change != nil && publishes(plan):
-			ops := change.prepared.Ops()
-			if change.loaded == nil {
-				ops = []durable.Op{}
-			}
-			version := change.version
-			publications = append(publications, durable.DocumentChange{
-				Record:         record,
-				ConversationId: conversationId,
-				Version:        &version,
-				Value:          change.prepared.Value(),
-				Ops:            ops,
-			})
+			continue
+		}
+		if !split {
+			stored = append([]durable.DocumentCommitChange(nil), publications...)
+			split = true
+		}
+		if held.observed {
+			publications = append(publications, publication)
+		}
+		// Only a document change of a loaded incarnation carries held operations.
+		if document, ok := publication.(durable.DocumentChange); ok {
+			document.Ops = held.ops
+			publication = document
+		}
+		stored = append(stored, publication)
+	}
+	if !split {
+		stored = publications
+	}
+	return adoptedDocuments{observed: publications, stored: stored, split: split}, nil
+}
+
+// describe is the publication of one adopted plan, if it publishes (publishes), with record as committed.
+func describe(plan *documentPlan, record durable.DocumentRecord) durable.DocumentCommitChange {
+	conversationId := plan.conversationId
+	if plan.retire {
+		return durable.DocumentRetireChange{Record: record, ConversationId: conversationId}
+	}
+	if copyWrite, ok := plan.content.(durable.DocumentCopyWrite); ok {
+		return durable.DocumentCopyChange{Record: record, ConversationId: *conversationId, Source: copyWrite.Source}
+	}
+	change := plan.change
+	if change == nil || !publishes(plan) {
+		return nil
+	}
+	ops := change.prepared.Ops()
+	if change.loaded == nil {
+		ops = []durable.Op{}
+	}
+	version := change.version
+	return durable.DocumentChange{Record: record, ConversationId: conversationId, Version: version, Value: change.prepared.Value(), Ops: ops}
+}
+
+// heldDocument holds the changes of a cached incarnation that deferred commits adopted in memory and the Session has not
+// stored yet (durable.CommitPersistence), folded. The Session owns it; a commit that stores them takes them.
+type heldDocument struct {
+	loaded  *LoadedDocument
+	pending delta.PendingOps
+	// base is set when a held commit selected a base (CheckpointWhen): their store writes the whole value.
+	base bool
+	// deadline is when the earliest of the held commits must be stored, on the Session clock.
+	deadline float64
+	// unpin releases the pin that keeps the incarnation in the cache until it is stored.
+	unpin func()
+}
+
+// heldPlan is set on a plan whose commit also stores held changes of its incarnation (takeHeld): the operations its
+// stored change publishes, held first, and whether it has a change of its own to show the Session's observers.
+type heldPlan struct {
+	ops      []durable.Op
+	observed bool
+}
+
+// heldChange is what a deferred commit holds in memory instead of storing, for one changed incarnation.
+type heldChange struct {
+	loaded *LoadedDocument
+	ops    []durable.Op
+	// base is set when the operations selected a base.
+	base bool
+}
+
+// holdable is what a deferred commit holds in memory instead of storing (durable.CommitPersistence), each changed
+// incarnation with its operations and whether they selected a base; ok is false when the commit must be stored. It may be
+// held only when every write changes an existing latest, initial-fork conversation document at its stored version.
+func (tx *Transaction) holdable(writes []durable.StorageWrite) (held []heldChange, ok bool) {
+	for _, write := range writes {
+		if _, isChange := write.(durable.DocumentChangeWrite); !isChange {
+			return nil, false
 		}
 	}
+	for _, plan := range tx.plans {
+		if plan.content == nil && !plan.retire {
+			continue
+		}
+		content, isChange := plan.content.(durable.DocumentChangeWrite)
+		change := plan.change
+		if plan.retire || change == nil || change.loaded == nil || !isChange {
+			return nil, false
+		}
+		loaded := change.loaded
+		record := loaded.Record
+		if record.Scope.Kind != durable.ScopeConversation || record.History != durable.HistoryLatest || record.Fork != durable.ForkInitial {
+			return nil, false
+		}
+		// A migration stores a base at once.
+		if loaded.StoredVersion() != change.version {
+			return nil, false
+		}
+		held = append(held, heldChange{loaded: loaded, ops: change.prepared.Ops(), base: content.Content.Kind == durable.ContentBase})
+	}
+	return held, true
+}
+
+// adoptHeld adopts a held commit (holdable) in memory only. Trackers advance by pointer swap; stored versions and delta
+// counts stay, as nothing was stored. It returns the publication for the Session's own observers.
+func (tx *Transaction) adoptHeld() ([]durable.DocumentCommitChange, error) {
+	var publications []durable.DocumentCommitChange
+	for _, plan := range tx.plans {
+		change := plan.change
+		// Every plan of a held commit changes or reads a loaded incarnation (holdable).
+		if change == nil {
+			continue
+		}
+		if len(change.prepared.Ops()) == 0 {
+			change.prepared.Abort()
+			continue
+		}
+		if err := change.tracker.Adopt(change.prepared); err != nil {
+			return nil, err
+		}
+		version := change.version
+		publications = append(publications, durable.DocumentChange{
+			Record:         change.loaded.Record,
+			ConversationId: plan.conversationId,
+			Version:        version,
+			Value:          change.prepared.Value(),
+			Ops:            change.prepared.Ops(),
+		})
+	}
 	return publications, nil
+}
+
+// takeHeld stores the held changes of every incarnation this commit reads or writes in front of its own, so a stored
+// document never misses an operation its later ones build on. It returns writes with them and the holds it took. Called
+// right before Storage admission, after every fallible step, because it empties the holds: a failure earlier keeps them.
+func (tx *Transaction) takeHeld(writes []durable.StorageWrite, held func(id durable.DocumentId) *heldDocument) ([]durable.StorageWrite, []*heldDocument) {
+	var taken []*heldDocument
+	for _, plan := range tx.plans {
+		// A new incarnation holds nothing yet.
+		if plan.record.committed == nil {
+			continue
+		}
+		id := plan.record.committed.Id
+		hold := held(id)
+		if hold == nil {
+			continue
+		}
+		taken = append(taken, hold)
+		own, hasOwn := plan.content.(durable.DocumentChangeWrite)
+		change := plan.change
+		var ops []durable.Op
+		value := hold.loaded.Tracker.Value()
+		if change != nil {
+			ops, value = change.prepared.Ops(), change.prepared.Value()
+		}
+		content, storedOps := storeHeld(hold, ops, value, hold.loaded.ValueVersion)
+		// A base this commit selected or must write covers what was held.
+		if hasOwn && own.Content.Kind == durable.ContentBase {
+			content = own.Content
+		}
+		write := durable.DocumentChangeWrite{Id: id, Content: content}
+		writes = putContentWrite(writes, id, hasOwn, write)
+		if !plan.retire {
+			plan.held = &heldPlan{ops: storedOps, observed: hasOwn}
+		}
+		plan.content = write
+		// Held documents are conversation documents; one this commit only read has no owner resolved yet.
+		if scope := plan.record.committed.Scope; scope.Kind == durable.ScopeConversation {
+			conversationId := scope.ConversationId
+			plan.conversationId = &conversationId
+		}
+	}
+	return writes, taken
+}
+
+// putContentWrite stages a content write for an incarnation: in place of its own when it has one, otherwise before its
+// retirement when it retires.
+func putContentWrite(writes []durable.StorageWrite, id durable.DocumentId, replace bool, write durable.DocumentChangeWrite) []durable.StorageWrite {
+	if replace {
+		for index, candidate := range writes {
+			if own, ok := candidate.(durable.DocumentChangeWrite); ok && own.Id == id {
+				writes[index] = write
+				return writes
+			}
+		}
+	}
+	for index, candidate := range writes {
+		if retire, ok := candidate.(durable.DocumentRetireWrite); ok && retire.Id == id {
+			return slices.Insert(writes, index, durable.StorageWrite(write))
+		}
+	}
+	return append(writes, write)
+}
+
+// storeHeld takes a hold's changes after ops, a commit's own on top of them, as one stored content for an incarnation now
+// at value, and the operations a reader of the stored state applies to reach it: the folded ones, or a root replacement
+// after the queue overflowed, which stores a base, as does a hold whose commits selected one.
+func storeHeld(hold *heldDocument, ops []durable.Op, value durable.JsonObject, version int) (durable.DocumentContent, []durable.Op) {
+	hold.pending.Push(ops)
+	taken := hold.pending.Take()
+	if taken.Replace {
+		return durable.DocumentContent{Version: version, Kind: durable.ContentBase, Value: value}, []durable.Op{{"r", value}}
+	}
+	if hold.base {
+		return durable.DocumentContent{Version: version, Kind: durable.ContentBase, Value: value}, taken.Ops
+	}
+	return durable.DocumentContent{Version: version, Kind: durable.ContentDelta, Ops: taken.Ops}, taken.Ops
 }
 
 func (tx *Transaction) assemble() ([]durable.StorageWrite, error) {
@@ -1292,8 +1682,30 @@ func (tx *Transaction) assemble() ([]durable.StorageWrite, error) {
 			plan.retire = true
 			retiring[plan.record.id()] = true
 		}
+		retire := func(record durable.DocumentRecord) {
+			if retiring[record.Id] {
+				return
+			}
+			committed := record
+			tx.plans = append(tx.plans, &documentPlan{
+				addressId: durable.AddressId(durable.DocumentAddress{Kind: record.Kind, Scope: record.Scope, Key: record.Key}),
+				record:    planRecord{committed: &committed},
+				retire:    true,
+			})
+			retiring[record.Id] = true
+		}
 		for _, taskId := range terminalTaskIds {
 			if tx.tasksById[taskId].writeKind == taskCreate {
+				continue
+			}
+			// The Session knows the documents of the tasks it created; any other task's are scanned.
+			if err := tx.host.touch(tx.ctx, ScopeKey(durable.DocumentRecordScope{Kind: durable.ScopeTask, TaskId: taskId})); err != nil {
+				return nil, err
+			}
+			if known, ok := tx.host.taskDocuments(taskId); ok {
+				for _, record := range known {
+					retire(record)
+				}
 				continue
 			}
 			var cursor durable.Cursor
@@ -1303,16 +1715,7 @@ func (tx *Transaction) assemble() ([]durable.StorageWrite, error) {
 					return nil, err
 				}
 				for _, record := range page.Items {
-					if retiring[record.Id] {
-						continue
-					}
-					committed := record
-					tx.plans = append(tx.plans, &documentPlan{
-						addressId: durable.AddressId(durable.DocumentAddress{Kind: record.Kind, Scope: record.Scope, Key: record.Key}),
-						record:    planRecord{committed: &committed},
-						retire:    true,
-					})
-					retiring[record.Id] = true
+					retire(record)
 				}
 				if page.Next == nil {
 					break
@@ -1385,19 +1788,17 @@ func (tx *Transaction) assemble() ([]durable.StorageWrite, error) {
 		change := plan.change
 		// Checkpoint predicates run last, after every validation.
 		if content, ok := plan.content.(durable.DocumentChangeWrite); ok && content.Content.Kind == durable.ContentDelta && change != nil && change.loaded != nil {
-			if change.definition != nil && change.definition.CheckpointWhen != nil {
-				info := durable.CheckpointInfo{DeltasSinceBase: change.loaded.deltaCount()}
-				var base bool
-				err := callDefinition(func() (err error) {
-					base, err = change.definition.CheckpointWhen(change.prepared.Value(), change.prepared.Ops(), info)
-					return err
-				})
-				if err != nil {
-					return nil, err
-				}
-				if base {
-					plan.content = durable.DocumentChangeWrite{Id: content.Id, Content: durable.DocumentContent{Version: change.version, Kind: durable.ContentBase, Value: change.prepared.Value()}}
-				}
+			info := durable.CheckpointInfo{DeltasSinceBase: change.loaded.deltaCount()}
+			var base bool
+			err := callDefinition(func() (err error) {
+				base, err = change.definition.CheckpointWhen(change.prepared.Value(), change.prepared.Ops(), info)
+				return err
+			})
+			if err != nil {
+				return nil, err
+			}
+			if base {
+				plan.content = durable.DocumentChangeWrite{Id: content.Id, Content: durable.DocumentContent{Version: change.version, Kind: durable.ContentBase, Value: change.prepared.Value()}}
 			}
 		}
 		if plan.content != nil {

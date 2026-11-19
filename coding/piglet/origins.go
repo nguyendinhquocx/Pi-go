@@ -1,8 +1,10 @@
 package piglet
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
@@ -30,6 +32,46 @@ type ResolvedPackage struct {
 // SourcePath returns the parsed Piglet source path when available.
 func (p *Piglet) SourcePath() string {
 	return p.sourcePath
+}
+
+// HasFrontend reports whether the Piglet fills the frontend slot.
+// pig additive (D91): a Piglet frontend member draws the interactive mode.
+func (p *Piglet) HasFrontend() bool {
+	return p.Slots != nil && p.Slots.Frontend != nil
+}
+
+// FrontendDir returns the absolute directory of the frontend slot's member,
+// or "" when the Piglet has no frontend member. An inherited member resolves
+// against the Piglet file that names it; the directory must exist inside
+// that file's directory.
+// pig additive (D91): a Piglet frontend member draws the interactive mode.
+func (p *Piglet) FrontendDir() (string, error) {
+	if !p.HasFrontend() {
+		return "", nil
+	}
+	member := p.Slots.Frontend.Member
+	dir := p.Slots.Frontend.dir
+	if dir == "" {
+		if p.sourceDir == "" {
+			return "", fmt.Errorf("slots.frontend.member %q needs a Piglet file to resolve against", member)
+		}
+		dir = filepath.Join(p.sourceDir, member)
+		if !isWithin(p.sourceDir, canonicalPath(dir)) {
+			return "", fmt.Errorf("slots.frontend.member %q leaves the Piglet directory", member)
+		}
+	}
+	dir = canonicalPath(dir)
+	info, err := os.Stat(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("slots.frontend.member %q does not exist", member)
+	}
+	if err != nil {
+		return "", fmt.Errorf("slots.frontend.member %q: %w", member, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("slots.frontend.member %q is not a directory", member)
+	}
+	return dir, nil
 }
 
 // ResolvePackages materializes every declared Package without mutating Package
@@ -110,7 +152,7 @@ func ResolveExtensions(p *Piglet) ([]ResolvedExtension, []error) {
 	for _, ext := range p.Extensions {
 		// Scoping-only entry: name + tools but no origin. The extension is
 		// loaded elsewhere (e.g. agent-server's -e flags) and this entry only
-		// scopes its tools by name in ScopeTools, which never reads origin.
+		// scopes its tools by name in CompileToolScope, which never reads origin.
 		// Skip it here rather than reporting it as an unresolvable load.
 		if len(ext.Origins) == 0 {
 			continue
@@ -180,7 +222,8 @@ func (p *Piglet) materialize(source string, bare sourceref.BarePolicy) (string, 
 		}
 		source = expandOriginPath(canonicalPath(baseDir), ref.Locator)
 	}
-	return installresolver.Materialize(cwd, source, scope, io.Discard, io.Discard)
+	// pig additive (D194): Piglet resolution installs Packages without running lifecycle scripts unless the user opts in.
+	return installresolver.Materialize(cwd, source, scope, installresolver.MaterializeOptions{AllowInstallScripts: p.installScripts}, io.Discard, io.Discard)
 }
 
 func (p *Piglet) materializationContext() (string, string) {

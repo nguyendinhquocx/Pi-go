@@ -12,7 +12,13 @@ import (
 
 type providerCallbacks map[string]func(json.RawMessage) (any, error)
 
+// providerStreamCallbackNames are the request callbacks a Provider stream's options carry, in wire order. Pi's Models strips transformHeaders before Provider.stream (model-runtime.ts:671), so it is not one of them.
+var providerStreamCallbackNames = []string{"onPayload", "onResponse", "onProviderStreamEvent"}
+
 func (r ModelRegistry) GetRegisteredNativeProvider(id string) (*Provider, error) {
+	if r.runtime != nil {
+		return r.runtime.GetRegisteredNativeProvider(id)
+	}
 	state, err := r.state()
 	if err != nil {
 		return nil, err
@@ -21,30 +27,38 @@ func (r ModelRegistry) GetRegisteredNativeProvider(id string) (*Provider, error)
 		if entry.Name != id || entry.Native == nil {
 			continue
 		}
-		e := r.context.ext
-		e.providerMu.Lock()
-		defer e.providerMu.Unlock()
-		if local := e.nativeProviders[entry.Native.Key]; local != nil {
-			return local, nil
-		}
-		if cached := e.providerObjectCache[entry.Native.ID]; cached != nil && cached.handle == entry.Native.Handle {
-			return cached, nil
-		}
-		provider, err := newProviderProxy(r.context, *entry.Native)
-		if err != nil {
-			return nil, err
-		}
-		if e.providerObjectCache == nil {
-			e.providerObjectCache = map[string]*Provider{}
-		}
-		e.providerObjectCache[entry.Native.ID] = provider
-		return provider, nil
+		return providerFromDeclaration(r.context, *entry.Native)
 	}
 	return nil, nil
 }
 
+// providerFromDeclaration is the Provider object a declaration of the host names: the extension's own object when it registered it, else a proxy that calls the extension that did, cached by the host's handle.
+func providerFromDeclaration(c Context, decl providerObjectDeclaration) (*Provider, error) {
+	e := c.ext
+	e.providerMu.Lock()
+	defer e.providerMu.Unlock()
+	if local := e.nativeProviders[decl.Key]; local != nil {
+		return local, nil
+	}
+	if cached := e.providerObjectCache[decl.ID]; cached != nil && cached.handle == decl.Handle {
+		return cached, nil
+	}
+	provider, err := newProviderProxy(c, decl)
+	if err != nil {
+		return nil, err
+	}
+	if e.providerObjectCache == nil {
+		e.providerObjectCache = map[string]*Provider{}
+	}
+	e.providerObjectCache[decl.ID] = provider
+	return provider, nil
+}
+
 // pig divergence (D78): builtin/composed Provider object methods still need a native SDK carrier.
 func (r ModelRegistry) GetProvider(id string) (*Provider, error) {
+	if r.runtime != nil {
+		return r.runtime.GetProvider(id)
+	}
 	provider, err := r.GetRegisteredNativeProvider(id)
 	if provider != nil || err != nil {
 		return provider, err
@@ -61,6 +75,9 @@ func (r ModelRegistry) GetProvider(id string) (*Provider, error) {
 
 // RegisterNativeProvider applies the native overload to the live registry and waits for publication.
 func (r ModelRegistry) RegisterNativeProvider(provider *Provider) error {
+	if r.runtime != nil {
+		return r.runtime.RegisterNativeProvider(provider)
+	}
 	decl, err := providerDeclaration(provider, rand.Text())
 	if err != nil {
 		return err
@@ -201,12 +218,17 @@ func newProviderProxy(ctx Context, decl providerObjectDeclaration) (*Provider, e
 	}
 	for _, method := range decl.Methods {
 		switch method {
-		case "getModels":
-			p.GetModels = func() ([]map[string]any, error) {
+		case "getModels", "getAllModels":
+			get := func() ([]map[string]any, error) {
 				return providerInvoke[[]map[string]any](ctx, decl, method, map[string]any{}, nil, nil)
 			}
-		case "filterModels":
-			p.FilterModels = func(models []map[string]any, credential map[string]any) ([]map[string]any, error) {
+			if method == "getAllModels" {
+				p.GetAllModels = get
+			} else {
+				p.GetModels = get
+			}
+		case "filterModels", "filterAllModels":
+			filter := func(models []map[string]any, credential *Credential) ([]map[string]any, error) {
 				value, err := providerInvoke[struct {
 					Models  []map[string]any `json:"models"`
 					Indices []int            `json:"indices"`
@@ -223,6 +245,11 @@ func newProviderProxy(ctx Context, decl providerObjectDeclaration) (*Provider, e
 				}
 				return value.Models, nil
 			}
+			if method == "filterAllModels" {
+				p.FilterAllModels = filter
+			} else {
+				p.FilterModels = filter
+			}
 		case "auth.apiKey.check":
 			p.Auth.APIKey.Check = func(input APIKeyAuthInput) (*AuthCheck, error) {
 				return providerInvoke[*AuthCheck](ctx, decl, method, map[string]any{"credential": input.Credential}, authInputCallbacks(input), input.Signal)
@@ -232,19 +259,28 @@ func newProviderProxy(ctx Context, decl providerObjectDeclaration) (*Provider, e
 				return providerInvoke[*AuthResult](ctx, decl, method, map[string]any{"credential": input.Credential}, authInputCallbacks(input), input.Signal)
 			}
 		case "auth.apiKey.login":
-			p.Auth.APIKey.Login = func(input AuthInteraction) (map[string]any, error) {
-				return providerInvoke[map[string]any](ctx, decl, method, map[string]any{}, interactionCallbacks(input), input.Signal)
+			p.Auth.APIKey.Login = func(input AuthInteraction) (*Credential, error) {
+				return providerInvoke[*Credential](ctx, decl, method, map[string]any{}, interactionCallbacks(input), input.Signal)
 			}
 		case "auth.oauth.login":
-			p.Auth.OAuth.Login = func(input AuthInteraction) (map[string]any, error) {
-				return providerInvoke[map[string]any](ctx, decl, method, map[string]any{}, interactionCallbacks(input), input.Signal)
+			p.Auth.OAuth.Login = func(input AuthInteraction, options LoginOptions) (*Credential, error) {
+				wire := map[string]any{}
+				callbacks := interactionCallbacks(input)
+				if options.GetDeviceID != nil {
+					wire["getDeviceId"] = true
+					callbacks["getDeviceId"] = func(json.RawMessage) (any, error) { return options.GetDeviceID() }
+				}
+				if options.AgentName != nil {
+					wire["agentName"] = *options.AgentName
+				}
+				return providerInvoke[*Credential](ctx, decl, method, map[string]any{"options": wire}, callbacks, input.Signal)
 			}
 		case "auth.oauth.refresh":
-			p.Auth.OAuth.Refresh = func(credential map[string]any, signal context.Context) (map[string]any, error) {
-				return providerInvoke[map[string]any](ctx, decl, method, map[string]any{"credential": credential}, nil, signal)
+			p.Auth.OAuth.Refresh = func(credential *Credential, signal context.Context) (*Credential, error) {
+				return providerInvoke[*Credential](ctx, decl, method, map[string]any{"credential": credential}, nil, signal)
 			}
 		case "auth.oauth.toAuth":
-			p.Auth.OAuth.ToAuth = func(credential map[string]any) (map[string]any, error) {
+			p.Auth.OAuth.ToAuth = func(credential *Credential) (map[string]any, error) {
 				return providerInvoke[map[string]any](ctx, decl, method, map[string]any{"credential": credential}, nil, nil)
 			}
 		case "refreshModels":
@@ -264,7 +300,7 @@ func newProviderProxy(ctx Context, decl providerObjectDeclaration) (*Provider, e
 					}
 					return input.Publish(publication)
 				})}
-				_, err := providerInvoke[any](ctx, decl, method, map[string]any{"credential": input.Credential, "stored": input.Stored, "allowNetwork": input.AllowNetwork, "force": input.Force}, callbacks, input.Signal)
+				_, err := providerInvoke[any](ctx, decl, method, refreshModelsParams(input), callbacks, input.Signal)
 				return err
 			}
 		case "generateImages":
@@ -318,15 +354,15 @@ func (c Context) providerStream(decl providerObjectDeclaration, method string, m
 			return nil, options.OnResponse(args.Value, model)
 		})
 	}
-	if options.TransformHeaders != nil {
-		callbacks["transformHeaders"] = decodedProviderCallback(func(args struct {
-			Value map[string]string `json:"value"`
+	if options.OnProviderStreamEvent != nil {
+		callbacks["onProviderStreamEvent"] = decodedProviderCallback(func(args struct {
+			Value any `json:"value"`
 		}) (any, error) {
-			return options.TransformHeaders(args.Value)
+			return nil, options.OnProviderStreamEvent(args.Value, model)
 		})
 	}
 	names := []string{}
-	for _, name := range []string{"onPayload", "onResponse", "transformHeaders"} {
+	for _, name := range providerStreamCallbackNames {
 		if callbacks[name] != nil {
 			names = append(names, name)
 		}
@@ -365,4 +401,13 @@ func (c Context) providerStream(decl providerObjectDeclaration, method string, m
 		return nil, err
 	}
 	return stream, nil
+}
+
+// refreshModelsParams is the refreshModels call's argument; baseUrl is absent when the context has none.
+func refreshModelsParams(input RefreshModelsContext) map[string]any {
+	params := map[string]any{"credential": input.Credential, "stored": input.Stored, "allowNetwork": input.AllowNetwork, "force": input.Force}
+	if input.BaseURL != "" {
+		params["baseUrl"] = input.BaseURL
+	}
+	return params
 }

@@ -1,9 +1,12 @@
-// Ports packages/durable/test/tools-read-differential.test.ts.
+// Ports packages/durable/test/tools-read-differential.test.ts (Pi 1.2.0).
 
 package tools
 
+// pi: packages/durable/src/tools/read.ts
+
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"math"
 	"os"
@@ -13,9 +16,10 @@ import (
 	"testing"
 
 	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/chord/delta"
+	"github.com/MichaelKinsy/PiG/chord/output"
 	"github.com/MichaelKinsy/PiG/durable"
 	envnode "github.com/MichaelKinsy/PiG/durable/env/node"
-	"github.com/MichaelKinsy/PiG/durable/harness"
 	"github.com/MichaelKinsy/PiG/internal/jsnumber"
 )
 
@@ -37,21 +41,18 @@ func jsSliceLines(lines []string, start, end float64) []string {
 	return lines[from:to]
 }
 
+// Pi main 04414839 (#11015): the reference also returns the structured output, a text file's text or an image's block.
 // referenceRead is the read tool before bounded reads, kept as the reference: it decodes the whole file, splits it into
 // lines, and truncates the selection. The tool must give the same result while reading only a bounded part of the file.
 func referenceRead(data []byte, path string, offset, limit *float64) (durable.ToolExecutionResult, error) {
 	input := ReadToolInput{Path: path, Offset: offset, Limit: limit}
 	if mimeType := detectSupportedImageMimeType(data); mimeType != "" {
-		// Image content is not supported yet.
-		isError := true
+		encoded := base64.StdEncoding.EncodeToString(data)
 		return durable.ToolExecutionResult{
-			Content: []ai.ToolResultMessageContent{},
-			IsError: &isError,
-			Diagnostics: []durable.ToolDiagnostic{{
-				Severity: durable.SeverityError,
-				Code:     "unsupported_image",
-				Message:  fmt.Sprintf("%s is an image (%s); reading images is not supported", input.Path, mimeType),
-			}},
+			Output:              []ai.ToolResultMessageContent{ai.ImageContent{Data: encoded, MimeType: mimeType}},
+			StructuredOutput:    delta.JsonObjectOf("type", "image", "data", encoded, "mimeType", mimeType),
+			HasStructuredOutput: true,
+			Diagnostics:         []durable.ToolDiagnostic{{Severity: durable.SeverityInfo, Code: "image", Message: fmt.Sprintf("Read image file [%s].", mimeType)}},
 		}, nil
 	}
 
@@ -95,7 +96,7 @@ func referenceRead(data []byte, path string, offset, limit *float64) (durable.To
 		if startLine == math.Trunc(startLine) {
 			lineBytes = []byte(allLines[int(startLine)])
 		}
-		end := harness.CharacterEnd(lineBytes, durable.DEFAULT_MAX_BYTES)
+		end := output.CharacterEnd(lineBytes, durable.DEFAULT_MAX_BYTES)
 		outputText = decodeText(lineBytes[:min(end, len(lineBytes))])
 		diagnostics = append(diagnostics, durable.ToolDiagnostic{
 			Severity: durable.SeverityWarn,
@@ -129,9 +130,9 @@ func referenceRead(data []byte, path string, offset, limit *float64) (durable.To
 		})
 	}
 
-	result := durable.ToolExecutionResult{Content: []ai.ToolResultMessageContent{}, Diagnostics: diagnostics}
+	result := durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}, StructuredOutput: outputText, HasStructuredOutput: true, Diagnostics: diagnostics}
 	if outputText != "" {
-		result.Content = []ai.ToolResultMessageContent{ai.TextContent{Text: outputText}}
+		result.Output = []ai.ToolResultMessageContent{ai.TextContent{Text: outputText}}
 	}
 	if details != nil {
 		encoded, err := durable.ToJsonValue(details)
@@ -208,10 +209,15 @@ func outcomeOf(result durable.ToolExecutionResult, err error) readOutcome {
 	return readOutcome{result: result}
 }
 
+// Pi 1.2.0 packages/durable/test/tools-read-differential.test.ts:150 "returns exactly what reading the whole file returned"
+//
+// The offsets and limits include NaN, which a JSON tool input cannot carry, so the input goes straight to the tool's read
+// path after its argument decoding; the model comes from the api as in Pi's apiFor (an agent without one).
 func TestReadToolReturnsExactlyWhatReadingTheWholeFileReturned(t *testing.T) {
-	// upstream: packages/durable/test/tools-read-differential.test.ts:156
 	cwd := t.TempDir()
 	executionEnv := envnode.NewNodeExecutionEnv(envnode.NodeExecutionEnvOptions{Cwd: cwd})
+	api := &fakeAPI{env: executionEnv}
+	modelOf := func() (imageModel, error) { return imageModelOf(context.Background(), api) }
 	for seed := uint32(1); seed <= 400; seed++ {
 		next := mulberry32(seed)
 		file := randomReadFile(next)
@@ -221,7 +227,7 @@ func TestReadToolReturnsExactlyWhatReadingTheWholeFileReturned(t *testing.T) {
 		for range 4 {
 			offset := readOffsets[int(next()*float64(len(readOffsets)))]
 			limit := readLimits[int(next()*float64(len(readLimits)))]
-			actual := outcomeOf(readFile(context.Background(), executionEnv, ReadToolInput{Path: "f.txt", Offset: offset, Limit: limit}))
+			actual := outcomeOf(readFile(context.Background(), executionEnv, ReadToolInput{Path: "f.txt", Offset: offset, Limit: limit}, nil, modelOf))
 			expected := outcomeOf(referenceRead(file, "f.txt", offset, limit))
 			if !reflect.DeepEqual(actual, expected) {
 				t.Fatalf("seed %d offset %s limit %s:\nactual   %+v\nexpected %+v", seed, describeNumber(offset), describeNumber(limit), actual, expected)
@@ -230,8 +236,8 @@ func TestReadToolReturnsExactlyWhatReadingTheWholeFileReturned(t *testing.T) {
 	}
 }
 
+// Pi 1.2.0 packages/durable/test/tools-read-differential.test.ts:174 "detects animated PNGs whose acTL chunk lies far beyond the header"
 func TestReadToolDetectsAnimatedPNGsWhoseAcTLChunkLiesFarBeyondTheHeader(t *testing.T) {
-	// upstream: packages/durable/test/tools-read-differential.test.ts:180
 	cwd := t.TempDir()
 	chunk := func(kind string, length int) []byte {
 		out := []byte{byte(length >> 24), byte(length >> 16), byte(length >> 8), byte(length)}
@@ -246,13 +252,10 @@ func TestReadToolDetectsAnimatedPNGsWhoseAcTLChunkLiesFarBeyondTheHeader(t *test
 		t.Fatal(err)
 	}
 	executionEnv := envnode.NewNodeExecutionEnv(envnode.NodeExecutionEnvOptions{Cwd: cwd})
-	actual := outcomeOf(readFile(context.Background(), executionEnv, ReadToolInput{Path: "a.png"}))
+	result, err := run(CreateReadTool(nil), map[string]any{"path": "a.png"}, executionEnv, context.Background())
+	actual := outcomeOf(result.ToolExecutionResult, err)
 	expected := outcomeOf(referenceRead(png, "a.png", nil, nil))
 	if !reflect.DeepEqual(actual, expected) {
 		t.Fatalf("actual %+v, expected %+v", actual, expected)
-	}
-	// An animated PNG is not a still image, so it reads as text rather than as an unsupported image.
-	if actual.result.IsError != nil {
-		t.Fatalf("an animated PNG was refused as an image: %+v", actual.result)
 	}
 }

@@ -30,8 +30,9 @@ const MAX_CACHED_OFFSCREEN_KITTY_DECODED_BYTES = 64 * 1024 * 1024;
 const DOUBLE_CLICK_INTERVAL_MS = 500;
 const COPY_ERROR_FLASH_DURATION_MS = 5000;
 // Regular mode delegates double-click selection to the terminal emulator. Fullscreen owns mouse selection,
-// so mirror common terminal word-selection behavior by keeping paths and kebab-case tokens whole.
-const TERMINAL_WORD_SELECTION_JOINERS = new Set(["/", "-"]);
+// so it uses iTerm2's default "characters considered part of a word" set:
+// https://github.com/gnachman/iTerm2/blob/7f4ff739721f95d0b93003d8701c4523a7edf261/sources/Settings/iTermPreferences.m#L743
+const TERMINAL_WORD_SELECTION_JOINERS = new Set(["/", "-", "+", "\\", "~", "_", "."]);
 import { wordSegmenter } from "../../pi-tui-segmenters.mjs";
 /** Alternate-screen TUI with a scrollable, application-owned viewport. */
 export class TuiAltScreen extends TuiBase {
@@ -130,6 +131,11 @@ export class TuiAltScreen extends TuiBase {
             return false;
         return this.copyTextToClipboard(text);
     }
+    /** Drop the text selection and multi-click history, e.g. before the host replaces the transcript. */
+    resetTextSelection() {
+        this.clearTextSelection();
+        this.lastClick = undefined;
+    }
     /** The lines of the last rendered frame, one per terminal row, as written to the terminal. */
     getScreenLines() {
         return [...this.previousScreen];
@@ -210,7 +216,7 @@ export class TuiAltScreen extends TuiBase {
         }
         else {
             const width = Math.max(1, this.terminal.columns);
-            const documentLines = this.render(width).map((line) => line.replace(OSC133_ZONE_PREFIX, ""));
+            const documentLines = this.resolveFakeCursors(this.render(width)).map((line) => line.replace(OSC133_ZONE_PREFIX, ""));
             this.lastDocument = this.applyLineResets(documentLines.map((line) => line.replaceAll(CURSOR_MARKER, ""))).map((line) => (isImageLine(line) || visibleWidth(line) <= width ? line : sliceByColumn(line, 0, width, true)));
             let buffer = `${BEGIN_SYNCHRONIZED_OUTPUT}${EXIT_ALT_SCREEN}${DISABLE_AUTOWRAP}`;
             for (let row = 0; row < this.lastDocument.length; row++) {
@@ -225,6 +231,16 @@ export class TuiAltScreen extends TuiBase {
             setCapabilities(this.savedCapabilities);
             this.savedCapabilities = undefined;
         }
+    }
+    getExitRestorePrefix() {
+        const prefix = super.getExitRestorePrefix();
+        if (!this.altScreenActive)
+            return prefix;
+        return `${END_SYNCHRONIZED_OUTPUT}${this.mouseEnabled ? DISABLE_MOUSE : ""}${ENABLE_AUTOWRAP}${prefix}`;
+    }
+    getExitRestoreSuffix() {
+        // Kitty keyboard flags are per screen, so the terminal pops them before the alternate screen is left.
+        return `${super.getExitRestoreSuffix()}${this.altScreenActive ? `${EXIT_ALT_SCREEN}\x1b[?25h` : ""}`;
     }
     deleteKittyImages() {
         return this.imageProtocol === "kitty" ? deleteAllKittyImages() : "";
@@ -458,7 +474,10 @@ export class TuiAltScreen extends TuiBase {
     flash(message, durationMs) {
         this.flashes.flash(message, durationMs);
     }
-    shouldDeferViewportInputToOverlay() {
+    /** Focused overlays and components that capture viewport input receive viewport keys instead of the transcript. */
+    shouldDeferViewportInput() {
+        if (this.getFocusedComponent()?.capturesViewportInput)
+            return true;
         return this.isOverlayFocused() && this.activeSearch?.overlay?.isFocused() !== true;
     }
     clearComponentMouseGesture() {
@@ -507,8 +526,6 @@ export class TuiAltScreen extends TuiBase {
                     this.requestRender();
                 return { consume: true };
             }
-            if (this.shouldDeferViewportInputToOverlay())
-                return undefined;
             this.routeWheel(wheelEvent, wheelDelta);
             return { consume: true };
         }
@@ -543,7 +560,7 @@ export class TuiAltScreen extends TuiBase {
                 return { consume: true };
             }
         }
-        if (this.shouldDeferViewportInputToOverlay())
+        if (this.shouldDeferViewportInput())
             return undefined;
         if (keybindings.matches(data, "tui.altScreen.pageUp")) {
             if (!isRelease) {
@@ -1443,7 +1460,8 @@ export class TuiAltScreen extends TuiBase {
         if (this.refreshSearch(nextLayout)) {
             nextLayout = renderLayoutFrame(root, width, height, () => this.requestRender());
         }
-        let screen = nextLayout.lines.map((line) => line.replace(OSC133_ZONE_PREFIX, ""));
+        // Resolve fake cursors before highlighting and compositing, which only track SGR codes
+        let screen = this.resolveFakeCursors(nextLayout.lines.map((line) => line.replace(OSC133_ZONE_PREFIX, "")));
         screen = this.applySearchHighlights(screen, nextLayout);
         screen = this.compositeScrollToEndIndicator(screen, nextLayout, width);
         screen = this.compositeOverlays(screen, width, height);

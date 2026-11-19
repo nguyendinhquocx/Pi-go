@@ -1,14 +1,15 @@
-// SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
 // SPDX-License-Identifier: MIT
 
 package ciimages
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -26,12 +27,15 @@ type verificationJob struct {
 	Timeout  int `yaml:"timeout-minutes"`
 	Strategy struct {
 		FailFast *bool `yaml:"fail-fast"`
-		Matrix   struct{ Shard []string }
+		// Include is the expression that expands to the job's matrix; planFor derives the shards it holds.
+		Matrix struct{ Include any }
 	}
 	Steps []struct {
-		If  string
-		Run string
-		Env map[string]string
+		If   string
+		Uses string
+		With map[string]string
+		Run  string
+		Env  map[string]string
 	}
 }
 
@@ -48,26 +52,10 @@ func verificationJobs(t *testing.T) map[string]verificationJob {
 	return workflow.Jobs
 }
 
-func TestLinuxShardsRetainEveryCheck(t *testing.T) {
-	jobs := verificationJobs(t)
-	linux := jobs["linux"]
-	if len(linux.Strategy.Matrix.Shard) < 2 {
-		t.Fatal("Linux verification is not sharded")
-	}
-	if linux.Timeout > 60 || linux.Timeout <= 0 || linux.Strategy.FailFast == nil || *linux.Strategy.FailFast {
-		t.Fatal("Linux shards must retain the timeout ceiling and run every shard on failure")
-	}
-	invokesShard := false
-	for _, step := range linux.Steps {
-		if step.Env["SHARD"] == "${{ matrix.shard }}" && strings.Contains(step.Run, `make "ci-$SHARD"`) {
-			invokesShard = true
-		}
-	}
-	if !invokesShard {
-		t.Fatal("matrix does not invoke the checked Make targets")
-	}
-
-	// The independent denominator is make check, not a snapshot count of jobs.
+// gateLeaves expands a make target into the leaf gates it runs. The independent denominator is make check, not a snapshot
+// count of jobs: every ci-* target expands through its prerequisites, and the targets CI runs in halves expand to their halves.
+func gateLeaves(t *testing.T) func(string) []string {
+	t.Helper()
 	rules := map[string][]string{}
 	for line := range strings.SplitSeq(readMakeSources(t, repoRoot(t)), "\n") {
 		if strings.HasPrefix(line, "\t") {
@@ -84,7 +72,18 @@ func TestLinuxShardsRetainEveryCheck(t *testing.T) {
 		switch name {
 		case "check", "check-core", "check-contracts-fast":
 		case "test":
-			return []string{"test-fast", "test-cli", "test-subprocess", "test-conformance"}
+			// CI runs test-fast and test-cli in halves (fast-parallel and fast-sharded; two cmd/pig shard ranges; two conformance shard ranges), which together are make test.
+			return []string{"test-fast-parallel", "test-fast-sharded", "test-cli-1", "test-cli-2", "test-subprocess", "test-conformance-1", "test-conformance-2"}
+		case "portmap-check":
+			// CI runs the PORT_MAP evidence check as PORTMAP_SHARDS shards (PORTMAP_SHARD=N/M), which together are portmap-check.
+			var halves []string
+			for n := 1; n <= portmapShards(t); n++ {
+				halves = append(halves, fmt.Sprintf("portmap-check-%d", n))
+			}
+			return halves
+		case "parity-fast":
+			// CI runs the hermetic parity scenarios as two hash shards (PARITY_SHARD), which together are parity-fast.
+			return []string{"parity-fast-1", "parity-fast-2"}
 		default:
 			if !strings.HasPrefix(name, "ci-") {
 				return []string{name}
@@ -100,15 +99,152 @@ func TestLinuxShardsRetainEveryCheck(t *testing.T) {
 		}
 		return result
 	}
+	return leaves
+}
+
+func TestLinuxShardsRetainEveryCheck(t *testing.T) {
+	jobs := verificationJobs(t)
+	linux := jobs["linux"]
+	// The full run is every event that can land a change; its matrix is the denominator of the partition below.
+	full := planFor(t, "merge_group", "")
+	if len(full.Matrix["linux"]) < 2 {
+		t.Fatal("Linux verification is not sharded")
+	}
+	if linux.Timeout > 60 || linux.Timeout <= 0 || linux.Strategy.FailFast == nil || *linux.Strategy.FailFast {
+		t.Fatal("Linux shards must retain the timeout ceiling and run every shard on failure")
+	}
+	if linux.Strategy.Matrix.Include != "${{ fromJSON(needs.changes.outputs.linux) }}" {
+		t.Fatalf("the Linux matrix is %v, want the changes job's plan", linux.Strategy.Matrix.Include)
+	}
+	invokesShard := false
+	for _, step := range linux.Steps {
+		if step.Env["SHARD"] == "${{ matrix.shard }}" && step.Env["TARGET"] == "${{ matrix.target }}" && strings.Contains(step.Run, `make "$TARGET"`) {
+			invokesShard = true
+		}
+	}
+	if !invokesShard {
+		t.Fatal("matrix does not invoke the checked Make targets")
+	}
+
+	leaves := gateLeaves(t)
 	want := leaves("check")
 	var got []string
-	for _, shard := range linux.Strategy.Matrix.Shard {
-		got = append(got, leaves("ci-"+shard)...)
+	for _, entry := range full.Matrix["linux"] {
+		if entry.Target != "ci-"+entry.Shard {
+			t.Errorf("the full run's shard %s runs %s, want ci-%s", entry.Shard, entry.Target, entry.Shard)
+		}
+		got = append(got, leaves(entry.Target)...)
+	}
+	// The preflight job runs the compile gates the Windows, macOS and Node loader jobs wait for; they count once, there.
+	preflight, ok := jobs["preflight"]
+	if !ok {
+		t.Fatal("ci.yml has no preflight job")
+	}
+	runsPreflight := false
+	for _, step := range preflight.Steps {
+		if strings.TrimSpace(step.Run) == "make ci-preflight" {
+			runsPreflight = true
+		}
+	}
+	if !runsPreflight {
+		t.Fatal("the preflight job does not run make ci-preflight")
+	}
+	got = append(got, leaves("ci-preflight")...)
+	// The bookkeeping job runs the fail-fast gates every spending job waits for; they count once, there.
+	bookkeeping, ok := jobs["bookkeeping"]
+	if !ok {
+		t.Fatal("ci.yml has no bookkeeping job")
+	}
+	runsBookkeeping := false
+	for _, step := range bookkeeping.Steps {
+		if strings.Contains(step.Run, "ci-bookkeeping") {
+			runsBookkeeping = true
+		}
+	}
+	if !runsBookkeeping {
+		t.Fatal("the bookkeeping job does not run make ci-bookkeeping")
+	}
+	got = append(got, leaves("ci-bookkeeping")...)
+	for _, waiting := range []string{"preflight", "linux", "node-runtime", "durable-cf-host", "durable-contract", "android"} {
+		if !slices.Contains(jobs[waiting].Needs, "bookkeeping") {
+			t.Errorf("%s does not wait for the bookkeeping job, so a bookkeeping failure would not stop it", waiting)
+		}
+	}
+	for _, gated := range []string{"windows", "macos", "node-loader"} {
+		if !slices.Contains(jobs[gated].Needs, "preflight") {
+			t.Errorf("%s does not wait for the preflight job", gated)
+		}
 	}
 	slices.Sort(want)
 	slices.Sort(got)
 	if !slices.Equal(got, want) {
 		t.Fatalf("shards must partition all make check gates exactly once\ngot  %v\nwant %v", got, want)
+	}
+	// The two test-cli halves run the cmd/pig shard ranges that together are every shard, each once.
+	shards, _ := cliShards(t)
+	runs := make([]int, shards+1)
+	cliRange := regexp.MustCompile(`(?m)^(test-cli-[12]):[^\n]*\n\t@\./automation/ci/test-grouped\.sh cli ([0-9]+) ([0-9]+)$`)
+	halves := cliRange.FindAllStringSubmatch(readMakeSources(t, repoRoot(t)), -1)
+	if len(halves) != 2 {
+		t.Fatalf("found %d test-cli halves with a shard range, want test-cli-1 and test-cli-2", len(halves))
+	}
+	for _, half := range halves {
+		first, _ := strconv.Atoi(half[2])
+		last, _ := strconv.Atoi(half[3])
+		for shard := first; shard <= last; shard++ {
+			if shard < 1 || shard > shards {
+				t.Fatalf("%s runs cmd/pig shard %d of %d", half[1], shard, shards)
+			}
+			runs[shard]++
+		}
+	}
+	for shard := 1; shard <= shards; shard++ {
+		if runs[shard] != 1 {
+			t.Errorf("cmd/pig shard %d runs in %d test-cli halves, want exactly one", shard, runs[shard])
+		}
+	}
+}
+
+// portmapShards is the number of PORT_MAP evidence shards the Makefile plans for (PORTMAP_SHARDS).
+func portmapShards(t *testing.T) int {
+	t.Helper()
+	m := regexp.MustCompile(`(?m)^PORTMAP_SHARDS\s*:?=\s*([0-9]+)\s*$`).FindStringSubmatch(readMakeSources(t, repoRoot(t)))
+	if m == nil {
+		t.Fatal("the Makefile does not define PORTMAP_SHARDS")
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n
+}
+
+// TestPortmapShardsAreWiredEndToEnd: every shard the portmapcheck plan splits the rows into is a matrix job that runs its own
+// PORTMAP_SHARD=N/M slice, so no slice of the PORT_MAP rows goes unchecked and none is checked under another shard's number.
+func TestPortmapShardsAreWiredEndToEnd(t *testing.T) {
+	total := portmapShards(t)
+	if total < 2 {
+		t.Fatalf("PORTMAP_SHARDS = %d, want the evidence run split", total)
+	}
+	var matrix []string
+	for _, shard := range planFor(t, "merge_group", "").shards("linux") {
+		if strings.HasPrefix(shard, "portmap") {
+			matrix = append(matrix, shard)
+		}
+	}
+	var want []string
+	for n := 1; n <= total; n++ {
+		want = append(want, fmt.Sprintf("portmap-%d", n))
+	}
+	if !slices.Equal(matrix, want) {
+		t.Fatalf("matrix portmap shards %v, want %v (PORTMAP_SHARDS = %d)", matrix, want, total)
+	}
+	sources := readMakeSources(t, repoRoot(t))
+	for n := 1; n <= total; n++ {
+		recipe := fmt.Sprintf("portmap-check-%d:\n\t@$(MAKE) -s portmap-check PORTMAP_SHARD=%d/$(PORTMAP_SHARDS)\n", n, n)
+		if !strings.Contains(sources, recipe) {
+			t.Errorf("no recipe %q", recipe)
+		}
+		if !strings.Contains(sources, fmt.Sprintf("ci-portmap-%d: portmap-check-%d\n", n, n)) {
+			t.Errorf("ci-portmap-%d does not run portmap-check-%d", n, n)
+		}
 	}
 }
 
@@ -138,25 +274,34 @@ func TestLinuxAggregateRejectsUnsuccessfulShards(t *testing.T) {
 	}
 }
 
-// fakeTests are the top-level tests the fixture's fake go test -list prints for every package; it also prints a benchmark, which -run does not select.
+// fakeTests are the top-level tests the fixture's fake go test -list prints for every package; it also prints a benchmark, which -run does not select. There are enough of them (100) that no shard of the largest shard count in test-grouped.sh (14) hashes empty.
 var fakeTests = func() []string {
 	var names []string
-	for i := range 24 {
+	for i := range 100 {
 		names = append(names, fmt.Sprintf("TestFixture%02d", i))
 	}
 	return append(names, "ExampleFixture", "FuzzFixture")
 }()
 
-// groupedTestFixture copies test-grouped.sh and the scripts it runs into a fresh root whose fake go lists five packages, lists fakeTests for go test -list, and appends the packages each go test receives to $TEST_LOG and each -run pattern, after its package, to $RUN_LOG. LIST_FAIL fails the listing, LIST_EXTRA adds a name to it, and FAIL_TEST fails each go test whose -run pattern names that test. When LEAK_TMP is set, the fake go test leaves a file in the TMPDIR it runs under, as a leaking test package would. When WIPE_AGENT_AUTH is set it rewrites auth.json in the agent directory its environment names, as the 2026-10-06 lane wipe did, and RECORD_AGENT_ENV names a file that receives the agent environment each go test sees.
+// groupedTestFixture copies test-grouped.sh and the scripts it runs into a fresh root whose fake go lists five packages, lists fakeTests for go test -list, and appends the packages each go test receives to $TEST_LOG and each -run pattern, after its package, to $RUN_LOG. LIST_FAIL fails the listing, LIST_EXTRA adds a name to it, FAIL_TEST fails each go test whose -run pattern names that test, and FAIL_PACKAGE fails each go test that receives that package. When LEAK_TMP is set, the fake go test leaves a file in the TMPDIR it runs under, as a leaking test package would; when LEAK_PROCESS is set it leaves a sleep of that many seconds running, as a test that leaks a child process would. ARGS_LOG receives each go test command line, and FD_LOG the targets of the file descriptors each go test holds (Linux). When WIPE_AGENT_AUTH is set it rewrites auth.json in the agent directory its environment names, as the 2026-10-06 lane wipe did, and RECORD_AGENT_ENV names a file that receives the agent environment each go test sees.
 func groupedTestFixture(t *testing.T) string {
 	t.Helper()
+	// A CI shard exports these for the run it keeps events and a summary of; the fake go below must see the plain run.
+	for _, name := range []string{"PIG_TEST_JSON_DIR", "GITHUB_STEP_SUMMARY", "TEST_CHANGED_FOR"} {
+		t.Setenv(name, "")
+	}
 	root := t.TempDir()
 	copyCIFixture(t, root, "automation/ci/test-grouped.sh")
 	copyCIFixture(t, root, "automation/ci/test-shard-pattern.sh")
+	copyCIFixture(t, root, "automation/ci/check-shard-union.sh")
 	copyCIFixture(t, root, "automation/ci/assert-clean-tmp.sh")
 	copyCIFixture(t, root, "automation/ci/agent-dir-guard.sh")
+	copyCIFixture(t, root, "automation/ci/reap-test-processes.sh")
 	// test-grouped.sh enters the in-repo Porter extension module to warm its dependency-module build cache.
 	writeCIFixture(t, root, "piglets/porter/extensions/pig-porter/.keep", "")
+	// The core-fault group runs exactly the tests that the pigfault-tagged test files of durable/core/driver declare; an untagged file's tests belong to the normal run.
+	writeCIFixture(t, root, "durable/core/driver/fault_core_test.go", "//go:build pigfault\n\npackage driver\n\nfunc TestCoreFaultHeld(t *testing.T) {}\n\nfunc TestCoreFaultReleased(t *testing.T) {}\n")
+	writeCIFixture(t, root, "durable/core/driver/core_test.go", "package driver\n\nfunc TestCoreUntagged(t *testing.T) {}\n")
 	writeCIFixture(t, root, "automation/ci/test-fixtures.sh", "#!/bin/sh\nprintf 'export CI_TEST_FIXTURES=ready\\n'\n")
 	writeCIFixture(t, root, "bin/go", `#!/usr/bin/env bash
 set -euo pipefail
@@ -164,7 +309,7 @@ case "$1" in
   list)
     shift
     if [[ "$*" == ./... ]]; then
-      printf '%s\n' ./alpha ./beta ./cmd/pig ./coding/extension/host/subprocess ./test/extension-conformance
+      printf '%s\n' ./alpha ./beta ./coding/cli ./coding/extension/host/subprocess ./test/extension-conformance
     else
       printf '%s\n' "$@"
     fi
@@ -178,6 +323,7 @@ case "$1" in
       exit 0
     fi
     test "$CI_TEST_FIXTURES" = ready
+    saved_args="$*"
     shift 3
     packages=() run=
     while (($#)); do
@@ -188,9 +334,13 @@ case "$1" in
       esac
     done
     printf '%s\n' "${packages[@]}" >> "$TEST_LOG"
-    if [[ -n "$run" ]]; then printf '%s %s\n' "${packages[*]}" "$run" >> "$RUN_LOG"; fi
+    if [[ -n "${ARGS_LOG:-}" ]]; then printf '%s\n' "$saved_args" >> "$ARGS_LOG"; fi
+    if [[ -n "${FD_LOG:-}" ]]; then for fd in /proc/$$/fd/*; do readlink "$fd" || true; done >> "$FD_LOG"; fi
+    if [[ -n "$run" ]]; then printf '%s %s\n' "${packages[*]}" "$run" >> "${RUN_LOG:-/dev/null}"; fi
     if [[ -n "${FAIL_TEST:-}" && "$run" == *"$FAIL_TEST"* ]]; then exit 1; fi
+    if [[ -n "${FAIL_PACKAGE:-}" ]]; then for package in "${packages[@]}"; do if [[ "$package" == "$FAIL_PACKAGE" ]]; then exit 1; fi; done; fi
     if [[ -n "${LEAK_TMP:-}" ]]; then : > "$TMPDIR/pig-leak"; fi
+    if [[ -n "${LEAK_PROCESS:-}" ]]; then sleep "$LEAK_PROCESS" </dev/null >/dev/null 2>&1 & fi
     if [[ -n "${WIPE_AGENT_AUTH:-}" ]]; then printf '{}' > "$PIG_CODING_AGENT_DIR/auth.json"; fi
     # Under Git Bash this script sees POSIX paths (/tmp/... for the Windows temporary directory) where the Go test, and a real go.exe, see Windows paths. Record each directory in the host's own form: pwd -W prints it there, and is rejected on every other bash.
     native() { (cd "$1" 2>/dev/null && { pwd -W 2>/dev/null || pwd; }) || printf '%s\n' "$1"; }
@@ -390,6 +540,131 @@ func TestGroupedTestsFailOnTemporaryLeakAndRemoveScratch(t *testing.T) {
 	requireScratchRemoved()
 }
 
+// A process a test started and left running fails its group and is killed when go test returns, so leaked tmux servers, Node oracles and helper processes cannot outlive the run. Linux only: this end-to-end run reads environments from /proc; TestReapTestProcessesReadsTheEnvironmentFromPsWithoutProc covers the `ps -E` path that hosts without /proc use.
+func TestGroupedTestsFailOnLeakedProcessAndKillIt(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("reap-test-processes.sh reads /proc")
+	}
+	root := groupedTestFixture(t)
+	t.Setenv("TEST_LOG", filepath.Join(root, "packages"))
+	// A distinctive duration names the leaked sleep among every process on the host.
+	duration := strconv.Itoa(86400 + os.Getpid()%10000)
+	t.Setenv("LEAK_PROCESS", duration)
+	cmd := exec.CommandContext(t.Context(), testenv.Bash(t), filepath.Join(root, "automation/ci/test-grouped.sh"), "fast")
+	output, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "[reap-test-processes]") || !strings.Contains(string(output), "sleep "+duration) {
+		t.Fatalf("leaking run: err=%v, want the leaked process reported\n%s", err, output)
+	}
+	survivors, _ := exec.CommandContext(t.Context(), "pgrep", "-f", "^sleep "+duration+"$").Output()
+	if len(strings.TrimSpace(string(survivors))) != 0 {
+		t.Fatalf("leaked process still running: %s", survivors)
+	}
+}
+
+// CI restores test results from earlier commits with the build cache, and the cache key misses what child processes read, so under CI every go test runs with -count=1; elsewhere unchanged packages replay their cached results, and stress keeps its own count.
+func TestGroupedTestsRunEveryTestUnderCI(t *testing.T) {
+	root := groupedTestFixture(t)
+	t.Setenv("TEST_LOG", filepath.Join(root, "packages"))
+	t.Setenv("RUN_LOG", filepath.Join(root, "runs"))
+	argsLog := filepath.Join(root, "args")
+	t.Setenv("ARGS_LOG", argsLog)
+	for _, tc := range []struct {
+		mode, ci string
+		want     []string
+		reject   string
+	}{
+		{"fast", "true", []string{"-count=1"}, ""},
+		{"cli", "1", []string{"-count=1"}, ""},
+		{"fast", "", nil, "-count"},
+		{"stress", "true", []string{"-count=3"}, "-count=1"},
+	} {
+		writeCIFixture(t, root, "args", "")
+		t.Setenv("CI", tc.ci)
+		cmd := exec.CommandContext(t.Context(), testenv.Bash(t), filepath.Join(root, "automation/ci/test-grouped.sh"), tc.mode)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("mode %s CI=%q: %v\n%s", tc.mode, tc.ci, err, output)
+		}
+		data, err := os.ReadFile(argsLog)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		if len(lines) == 0 || lines[0] == "" {
+			t.Fatalf("mode %s CI=%q ran no go test", tc.mode, tc.ci)
+		}
+		for _, line := range lines {
+			args := strings.Fields(line)
+			for _, want := range tc.want {
+				if !slices.Contains(args, want) {
+					t.Errorf("mode %s CI=%q: go %s lacks %s", tc.mode, tc.ci, line, want)
+				}
+			}
+			if tc.reject != "" && strings.Contains(line, tc.reject) {
+				t.Errorf("mode %s CI=%q: go %s has %s", tc.mode, tc.ci, line, tc.reject)
+			}
+		}
+	}
+}
+
+// The checkout lock is held by test-grouped.sh alone. A go test that inherited it would pass it to every process a test starts, and one such process left running would block every later run in the checkout.
+func TestGroupedTestsKeepTheCheckoutLockFromTests(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the fake go test reads its descriptors from /proc")
+	}
+	root := groupedTestFixture(t)
+	t.Setenv("TEST_LOG", filepath.Join(root, "packages"))
+	fdLog := filepath.Join(root, "fds")
+	t.Setenv("FD_LOG", fdLog)
+	cmd := exec.CommandContext(t.Context(), testenv.Bash(t), filepath.Join(root, "automation/ci/test-grouped.sh"), "fast")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("fast: %v\n%s", err, output)
+	}
+	data, err := os.ReadFile(fdLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "/dev/") && !strings.Contains(string(data), "pipe:") {
+		t.Fatalf("descriptor log holds no standard streams; the probe did not run:\n%s", data)
+	}
+	if strings.Contains(string(data), "test-grouped.lock") {
+		t.Fatalf("go test holds the checkout lock:\n%s", data)
+	}
+}
+
+// The fast run keeps going after a failed group, so one run reports every failing group: test/perfgate runs in the serial-exclusive group after the parallel one, and a failure in the parallel group must not hide its own. The serial group runs with its own arguments, not the fault group's -tags and -run that ran before it. The run is in the fixture's root, not the checkout: test-grouped.sh holds the lock of its checkout for the whole run, and CI runs this test under test-grouped.sh in that checkout, so a script run in the checkout waits for the run that started it, forever.
+func TestGroupedFastRunReportsTheSerialGroupAfterAFailedParallelGroup(t *testing.T) {
+	root := groupedTestFixture(t)
+	t.Setenv("TEST_LOG", filepath.Join(root, "packages"))
+	argsLog := filepath.Join(root, "args")
+	t.Setenv("ARGS_LOG", argsLog)
+	t.Setenv("FAIL_PACKAGE", "./alpha")
+	// CI sets TEST_FAST_PARALLEL for its 4-CPU runners; this test is about the script's own default.
+	t.Setenv("TEST_FAST_PARALLEL", "")
+	cmd := exec.CommandContext(t.Context(), testenv.Bash(t), filepath.Join(root, "automation/ci/test-grouped.sh"), "fast-parallel")
+	output, err := cmd.CombinedOutput()
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); !ok || exitErr.ExitCode() != 1 {
+		t.Fatalf("fast-parallel with a failing parallel group: %v, want exit status 1\n%s", err, output)
+	}
+	data, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatalf("no go test ran: %v\n%s", err, output)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("go test ran %d times, want the parallel, fault and serial groups:\n%s", len(lines), data)
+	}
+	parallel, fault, serial := lines[0], lines[1], lines[2]
+	if !strings.Contains(parallel, "-p 12 ") || !strings.HasSuffix(parallel, " ./alpha ./beta") {
+		t.Errorf("first group = %q, want the 12-way pool of the fast packages alone", parallel)
+	}
+	if !strings.Contains(fault, "-tags pigfault") || !strings.HasSuffix(fault, " ./durable/core/driver") {
+		t.Errorf("second group = %q, want the pigfault group of ./durable/core/driver", fault)
+	}
+	if !strings.Contains(serial, "-p 1 ") || !strings.HasSuffix(serial, " ./test/perfgate") || strings.Contains(serial, "-tags") || strings.Contains(serial, "-run") {
+		t.Errorf("third group = %q, want ./test/perfgate alone at -p 1 without the fault group's -tags and -run", serial)
+	}
+}
+
 // isUnderDir reports whether path is dir or lies beneath it. It compares file identity, not spelling: Git Bash names the Windows temporary directory /tmp/... while Go names it C:\\..., and a path may use forward slashes or 8.3 short names, so no string prefix test holds on every host.
 func isUnderDir(t testing.TB, path, dir string) bool {
 	t.Helper()
@@ -541,7 +816,7 @@ func TestHostedJobsInstallPinnedNpmBeforeOracle(t *testing.T) {
 				if strings.Contains(line, `test "$(npm --version)" = "$NPM_VERSION"`) {
 					verified = installed
 				}
-				if strings.Contains(line, "make upstream-mirror") || strings.Contains(line, "npm ci --prefix extensions/sdk-ts") {
+				if strings.Contains(line, "make upstream-mirror") || strings.Contains(line, "automation/pin/pin.py install-oracle") {
 					oracle = true
 					if !verified {
 						t.Errorf("%s prepares dependencies before installing and checking pinned npm", name)
@@ -552,5 +827,48 @@ func TestHostedJobsInstallPinnedNpmBeforeOracle(t *testing.T) {
 		if !oracle {
 			t.Errorf("%s has no pinned oracle preparation", name)
 		}
+	}
+}
+
+// The Pi tests that need ControlledStorage run only in the pigfault build of durable/core/driver, which the normal run of
+// the package skips. Every mode that runs the fast packages must therefore run that group once, with the tag and the
+// pattern that names exactly the tagged files' tests, or those tests run nowhere (or the untagged ones run twice).
+func TestFastAndDefaultModesRunTheFaultGroupWithItsTag(t *testing.T) {
+	for _, mode := range []string{"fast", "default"} {
+		t.Run(mode, func(t *testing.T) {
+			root := groupedTestFixture(t)
+			args, runs := filepath.Join(root, "args"), filepath.Join(root, "runs")
+			t.Setenv("TEST_LOG", filepath.Join(root, "packages"))
+			t.Setenv("ARGS_LOG", args)
+			t.Setenv("RUN_LOG", runs)
+			writeCIFixture(t, root, "runs", "")
+			cmd := exec.CommandContext(t.Context(), testenv.Bash(t), filepath.Join(root, "automation/ci/test-grouped.sh"), mode)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("%v\n%s", err, output)
+			}
+			runData, err := os.ReadFile(runs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Count(string(runData), "./durable/core/driver ^(TestCoreFaultHeld|TestCoreFaultReleased)$\n"); got != 1 {
+				t.Fatalf("%s ran the fault group %d times, want once:\n%s", mode, got, runData)
+			}
+			argData, err := os.ReadFile(args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tagged := 0
+			for line := range strings.Lines(string(argData)) {
+				if strings.Contains(line, "-tags pigfault") {
+					tagged++
+					if !strings.Contains(line, "-run ^(TestCoreFaultHeld|TestCoreFaultReleased)$ ") || !strings.Contains(line, "./durable/core/driver") {
+						t.Errorf("a pigfault run is not the fault group: %s", line)
+					}
+				}
+			}
+			if tagged != 1 {
+				t.Fatalf("%s ran %d pigfault processes, want 1:\n%s", mode, tagged, argData)
+			}
+		})
 	}
 }

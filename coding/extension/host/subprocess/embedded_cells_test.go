@@ -214,7 +214,7 @@ func buildRustEmbeddedOwnerCell(t *testing.T) embeddedOwnerCellFixture {
 	ownerRoot := writePackedRustFactoryCrate(t, "owner_rust", owner, "owner-tool")
 	unrelatedRoot := writePackedRustFactoryCrate(t, "unrelated_rust", unrelated, "unrelated-tool")
 	addRustUnrelatedSentinel(t, filepath.Join(unrelatedRoot, "src", "lib.rs"))
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Minute)
+	ctx, cancel := buildContext(t)
 	defer cancel()
 	cell, err := runtimecell.BuildRustPackedCell(ctx, t.TempDir(), "owner-rust-cell", []runtimecell.RustExtension{
 		{Name: owner, Root: ownerRoot, Package: "owner_rust", Factory: "new_extension", Hash: "owner"},
@@ -348,7 +348,13 @@ func TestPackedMemberFactoryFailureEndsTheLoad(t *testing.T) {
 				failed := false
 				for _, err := range errs {
 					var loadErr *LoadError
-					failed = failed || (errors.As(err, &loadErr) && loadErr.Extension == fixture.unrelated)
+					if errors.As(err, &loadErr) && loadErr.Extension == fixture.unrelated {
+						failed = true
+						// The runner writes the cause to stderr before it closes the member's socket while the process serves the owner, so the load error the close produces leads with it at once.
+						if !strings.Contains(loadErr.Error(), "unrelated factory failure") {
+							t.Errorf("%s load error = %v, want the cause the runner wrote to stderr first", fixture.buildLabel, loadErr)
+						}
+					}
 				}
 				if !failed {
 					t.Fatalf("%s load errors = %v, want a load error for %s", fixture.buildLabel, errs, fixture.unrelated)

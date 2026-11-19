@@ -1,0 +1,3910 @@
+# SPDX-License-Identifier: MIT
+#
+# Allocation ratchet (automation/ci/allocbase, `make alloc-baseline`): allocs/op of each benchmark at -benchtime=5x, GOMAXPROCS=1.
+# A fix lowers its entry in the same change; never raise one to pass. Regenerate with `go run ./automation/ci/allocbase -update` (`-packages ./ai` for one package).
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkAgentLifecycleTextRun"
+allocs = 117
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkAgentMessageClone"
+allocs = 6
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkAgentMessageMarshalJSON"
+allocs = 160
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkAgentMessageUnmarshalJSON"
+allocs = 155
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkAgentToolLoadoutPrompt"
+allocs = 173
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkDeclareToolChangesSteadyState"
+allocs = 16
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkLegacyWireMessageMarshalJSON"
+allocs = 71
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkLegacyWireMessageUnmarshalJSON"
+allocs = 66
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkNormalizeAndConvertScaling/turns=50"
+allocs = 776
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkNormalizeAndConvertScaling/turns=500"
+allocs = 7535
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkNormalizeAndConvertScaling/turns=5000"
+allocs = 75151
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkParallelToolBatch/settled"
+allocs = 603
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkParallelToolBatch/unsettled"
+allocs = 625
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkSystemPromptRead/1"
+allocs = 4
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkSystemPromptRead/4096"
+allocs = 4
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkToolResultMessageEmptyText"
+allocs = 39
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkUserContentUnion/0"
+allocs = 34
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkUserContentUnion/64"
+allocs = 25
+
+[[benchmark]]
+package = "./agent"
+benchmark = "BenchmarkUserContentUnion/65536"
+allocs = 30
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAnthropicNativeOAuthLogin"
+allocs = 630
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAnthropicRequest200Turns/messages-cached"
+allocs = 1226
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAnthropicRequest200Turns/uncached"
+allocs = 2642
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAnthropicSSEInitialBlocks"
+allocs = 2128
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAnthropicSetupFailureWithHistory"
+allocs = 728
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAnthropicToolResultContent/image_only"
+allocs = 15
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAnthropicToolResultContent/mixed"
+allocs = 70
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAnthropicToolResultContent/text_only"
+allocs = 7
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageDecode"
+allocs = 95
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageEncode"
+allocs = 36
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/empty/marshal-shallow"
+allocs = 76
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/empty/observe-full"
+allocs = 1
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/empty/observe-shallow"
+allocs = 1
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/empty/project-full"
+allocs = 0
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/empty/project-shallow"
+allocs = 0
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/empty/publish"
+allocs = 0
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/mixed/marshal-shallow"
+allocs = 329
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/mixed/observe-full"
+allocs = 42
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/mixed/observe-shallow"
+allocs = 42
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/mixed/project-full"
+allocs = 0
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/mixed/project-shallow"
+allocs = 0
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/mixed/publish"
+allocs = 1
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/text/marshal-shallow"
+allocs = 36
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/text/observe-full"
+allocs = 2
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/text/observe-shallow"
+allocs = 2
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/text/project-full"
+allocs = 0
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/text/project-shallow"
+allocs = 0
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantMessageObservation/text/publish"
+allocs = 1
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAssistantStreamBuilderLongStream"
+allocs = 356443
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAuthStorageGetProviderEnv"
+allocs = 3
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAuthStorageReadHit"
+allocs = 50
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkAuthStorageReadUnchanged"
+allocs = 4
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkBuiltinToolArgumentValidation/bash/coerced"
+allocs = 18
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkBuiltinToolArgumentValidation/bash/coerced/via-tool"
+allocs = 33
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkBuiltinToolArgumentValidation/bash/valid"
+allocs = 33
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkBuiltinToolArgumentValidation/bash/valid/via-tool"
+allocs = 25
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkBuiltinToolArgumentValidation/edit/coerced"
+allocs = 26
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkBuiltinToolArgumentValidation/edit/coerced/via-tool"
+allocs = 52
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkBuiltinToolArgumentValidation/edit/valid"
+allocs = 65
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkBuiltinToolArgumentValidation/edit/valid/via-tool"
+allocs = 48
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkBuiltinToolArgumentValidation/read/coerced"
+allocs = 21
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkBuiltinToolArgumentValidation/read/coerced/via-tool"
+allocs = 39
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkBuiltinToolArgumentValidation/read/valid"
+allocs = 42
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkBuiltinToolArgumentValidation/read/valid/via-tool"
+allocs = 32
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkBuiltinToolArgumentValidation/write/coerced"
+allocs = 14
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkBuiltinToolArgumentValidation/write/coerced/via-tool"
+allocs = 29
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkBuiltinToolArgumentValidation/write/valid"
+allocs = 36
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkBuiltinToolArgumentValidation/write/valid/via-tool"
+allocs = 27
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCloneAssistantContent/deep-copy"
+allocs = 71
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCloneAssistantContent/from-earlier-snapshot"
+allocs = 1
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCloneCatalogCompat"
+allocs = 5034
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCodexCredentialMetadata"
+allocs = 18
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCodexSSERequest"
+allocs = 655
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCodexWebSocketContinuation"
+allocs = 2124
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCompletionsRequest200Turns/messages-cached"
+allocs = 656
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCompletionsRequest200Turns/uncached"
+allocs = 636
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCompletionsRequestLongSession"
+allocs = 3146
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCompletionsThinkingBudgetPayload"
+allocs = 33
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCompressCodexRequestBody/prose-400"
+allocs = 2
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCompressCodexRequestBody/prose-4000"
+allocs = 3
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkContinuationHandOff"
+allocs = 13
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCredentialKeyOrderRoundTrip"
+allocs = 854
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCredentialOptionalProjection/0"
+allocs = 602
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCredentialOptionalProjection/128"
+allocs = 7900
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCredentialOptionalProjection/8"
+allocs = 1092
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkCredentialProviderKeyRewrite"
+allocs = 509
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkDirectSimpleAnthropicPayload"
+allocs = 77
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkFauxEmptyErrorResponse"
+allocs = 78
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkFauxToolCallMultibyteArguments/180KB"
+allocs = 180259
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkFauxToolCallMultibyteArguments/18KB"
+allocs = 18232
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkFauxToolCallMultibyteArguments/45KB"
+allocs = 45429
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkFauxToolCallMultibyteArguments/90KB"
+allocs = 90409
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkFileModelsStoreCachedCatalog/0"
+allocs = 19
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkFileModelsStoreCachedCatalog/4096"
+allocs = 643208
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkFileModelsStoreCachedCatalog/8"
+allocs = 1286
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkGeneratedToModelCatalog"
+allocs = 18435
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkGetEnvAPIKey"
+allocs = 2
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkGoogleMappedThinkingRequest"
+allocs = 70
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkGoogleStream10kDeltas"
+allocs = 691767
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkGoogleVertexADCTokenResolution"
+allocs = 150
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkInMemoryAuthStorageCredentialMetadata/models=1"
+allocs = 22
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkInMemoryAuthStorageCredentialMetadata/models=256"
+allocs = 22
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkInMemoryAuthStorageRequestAuth"
+allocs = 45
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkJSAsyncGeneratorYield"
+allocs = 30
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkListModelsByProvider"
+allocs = 42
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkListOpenRouterModels"
+allocs = 2
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkLookupOpenRouterVariant"
+allocs = 0
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkMetadataModelEqualityDuringCycle"
+allocs = 0
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkMistralEventData/BOM"
+allocs = 0
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkMistralEventData/multiline"
+allocs = 2
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkMistralEventData/ordinary"
+allocs = 0
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkMistralReplayTransform"
+allocs = 1925
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkMistralRequestURL"
+allocs = 68
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkMistralWirePayload"
+allocs = 305
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkModelsGenerateImagesAuthDispatch"
+allocs = 22
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkModelsRuntimeAuthDispatch"
+allocs = 59
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkModelsRuntimeRefresh"
+allocs = 35
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkModelsStreamNoTelemetry"
+allocs = 132
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkModelsStreamWithTelemetry"
+allocs = 232
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkMutableModelsFauxDeferred"
+allocs = 393
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkMutableModelsFauxDispatch"
+allocs = 142
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkOAuthRefreshSignalLifetime"
+allocs = 14
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkObservationAwaitExternal/queued"
+allocs = 8
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkObservationAwaitExternal/waiting"
+allocs = 17
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkObservationAwaitTick/queued"
+allocs = 5
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkObservationAwaitTick/waiting"
+allocs = 14
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkObservationYield/queued"
+allocs = 4
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkObservationYield/waiting"
+allocs = 13
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkObservedBodyReadiness/buffered"
+allocs = 2
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkObservedBodyReadiness/pending"
+allocs = 1
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkOpenAIChunkDecode/fast"
+allocs = 4
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkOpenAIChunkDecode/json"
+allocs = 7
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkOpenAICompletionsAffinityRequest"
+allocs = 325
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkOpenAICompletionsMetadataStream"
+allocs = 9356
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkOpenAIStreamDecoder/buffered"
+allocs = 264
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkOpenAIStreamDecoder/long-line"
+allocs = 23
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkOpenAIStreamDecoderToolDeltas"
+allocs = 520
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkOpenAIStreamRecords/text-1"
+allocs = 1033
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkOpenAIStreamRecords/text-64"
+allocs = 1033
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkOpenAIStreamRecords/tool-1"
+allocs = 2060
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkOpenAIStreamRecords/tool-64"
+allocs = 2060
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkOpenRouterOAuthManualLogin"
+allocs = 123
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkOpenRouterVariant"
+allocs = 3
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkOrderedToolSchemaRoundTrip"
+allocs = 348
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkPAOpenAIReasoningDetails/encrypted/n=10"
+allocs = 718
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkPAOpenAIReasoningDetails/encrypted/n=100"
+allocs = 6352
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkPAOpenAIReasoningDetails/encrypted/n=1000"
+allocs = 63171
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkPAOpenAIReasoningDetails/encrypted/n=10000"
+allocs = 630743
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkPAOpenAIReasoningDetails/mergedtext/n=10"
+allocs = 511
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkPAOpenAIReasoningDetails/mergedtext/n=100"
+allocs = 4118
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkPAOpenAIReasoningDetails/mergedtext/n=1000"
+allocs = 40156
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkPAOpenAIReasoningDetails/mergedtext/n=10000"
+allocs = 400467
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkParsePiMessagesFrame"
+allocs = 3
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkPiMessagesConverterLongStream"
+allocs = 171943
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderRequestLongHistory/anthropic-text"
+allocs = 3364
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderRequestLongHistory/google-text"
+allocs = 10684
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderRequestLongHistory/mistral-text"
+allocs = 3335
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderRequestLongHistory/openai-codex-responses-text"
+allocs = 2792
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderRequestLongHistory/openai-completions-text"
+allocs = 1946
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderRequestLongHistory/openai-responses-text"
+allocs = 2734
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderRequestShape/anthropic-environment-cache"
+allocs = 1081
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderRequestShape/completions-cache"
+allocs = 667
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderRequestShape/google"
+allocs = 395
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderRequestShape/responses"
+allocs = 1450
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderResponseObserver"
+allocs = 6
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderScratchPublication/openai-completions"
+allocs = 1539
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderScratchPublication/openai-responses"
+allocs = 1243
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderStreamFrames/anthropic-text"
+allocs = 96035
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderStreamFrames/anthropic-toolcall"
+allocs = 146303
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderStreamFrames/google-text"
+allocs = 346125
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderStreamFrames/mistral-text"
+allocs = 201454
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderStreamFrames/openai-codex-responses-text"
+allocs = 166168
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderStreamFrames/openai-completions-text"
+allocs = 61076
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderStreamFrames/openai-completions-toolcall"
+allocs = 111378
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkProviderStreamFrames/openai-responses-text"
+allocs = 65875
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkRequestLargeWriteFollowUp/completions"
+allocs = 82
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkRequestLargeWriteFollowUp/responses"
+allocs = 37
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkResponsesDeltaDecode/fast"
+allocs = 0
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkResponsesDeltaDecode/unmarshal"
+allocs = 3
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkResponsesToolChoicePayload"
+allocs = 1202
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkRuntimeCredentialEnumeration/256"
+allocs = 8233
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkRuntimeCredentialEnumeration/3"
+allocs = 111
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkSSEIdleTrackerScan"
+allocs = 2
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkSSELongLine/reads-4KB"
+allocs = 19
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkSSELongLine/reads-64KB"
+allocs = 19
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkSafeJsonStringifyTranscript"
+allocs = 886
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkSanitizeSurrogates/empty"
+allocs = 0
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkSanitizeSurrogates/ordinary"
+allocs = 0
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkSanitizeSurrogates/unpaired"
+allocs = 1
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkScanModelExactMiss"
+allocs = 0
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkSpliceWalk"
+allocs = 31
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkStreamToolCallArguments/anthropic/250KB"
+allocs = 289074
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkStreamToolCallArguments/anthropic/25KB"
+allocs = 29900
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkStreamToolCallArguments/openai-completions/250KB"
+allocs = 280187
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkStreamToolCallArguments/openai-completions/25KB"
+allocs = 28952
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkStreamToolCallArguments/openai-responses/250KB"
+allocs = 237667
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkStreamToolCallArguments/openai-responses/25KB"
+allocs = 24642
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkStreamingHTTPSConnectionReuse"
+allocs = 277
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkStreamingToolJSONRepair"
+allocs = 825
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkSystemTextTranscript"
+allocs = 31
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkThinkingSignatureJSON/#00"
+allocs = 37
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkThinkingSignatureJSON/,\"thinkingSignature\":\"\""
+allocs = 15
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkThinkingSignatureJSON/,\"thinkingSignature\":\"signed\""
+allocs = 16
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkToolArgumentValidation/edits-1"
+allocs = 63
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkToolArgumentValidation/edits-1000"
+allocs = 14022
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkToolArgumentValidation/read"
+allocs = 45
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkToolCallPartialArguments/4KiB"
+allocs = 353
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkToolCallPartialArguments/64KiB"
+allocs = 3499
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkToolResultMessageDecode"
+allocs = 64
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkToolResultMessageEncode"
+allocs = 50
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkTransformMessagesHistory"
+allocs = 4098
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkTslibAsyncStack"
+allocs = 81029
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkTurnHandOff/baton"
+allocs = 0
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkTurnHandOff/coroutine"
+allocs = 1
+
+[[benchmark]]
+package = "./ai"
+benchmark = "BenchmarkValidateReadDetails50KB"
+allocs = 6
+
+[[benchmark]]
+package = "./ai/providers/bedrock"
+benchmark = "BenchmarkBedrockRedacted64KiB"
+allocs = 119
+
+[[benchmark]]
+package = "./ai/providers/bedrock"
+benchmark = "BenchmarkBedrockReplayDocument"
+allocs = 3528
+
+[[benchmark]]
+package = "./ai/providers/bedrock"
+benchmark = "BenchmarkBedrockStream10kDeltas"
+allocs = 422458
+
+[[benchmark]]
+package = "./ai/providers/bedrock"
+benchmark = "BenchmarkBedrockThinkingFields"
+allocs = 24
+
+[[benchmark]]
+package = "./ai/providers/bedrock"
+benchmark = "BenchmarkBedrockToolChoice/auto"
+allocs = 20
+
+[[benchmark]]
+package = "./ai/providers/bedrock"
+benchmark = "BenchmarkBedrockToolChoice/named"
+allocs = 18
+
+[[benchmark]]
+package = "./ai/providers/bedrock"
+benchmark = "BenchmarkBedrockToolChoice/none"
+allocs = 0
+
+[[benchmark]]
+package = "./ai/providers/bedrock"
+benchmark = "BenchmarkBedrockWhitespaceConversion"
+allocs = 26
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkCatalogModelAuth"
+allocs = 460
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkCheckCompactionDecision"
+allocs = 2
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkExtensionAppendEntry/event"
+allocs = 35
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkExtensionAppendEntry/log-only"
+allocs = 59
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkGetBranchSelection"
+allocs = 12
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkGraphMcpTransportSend"
+allocs = 103
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkIndependentAPIRequest"
+allocs = 707
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkInjectedCredentialAvailability"
+allocs = 314
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkModelAvailabilitySnapshot/1"
+allocs = 497
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkModelAvailabilitySnapshot/1000"
+allocs = 10231
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkModelRegistryMetadata"
+allocs = 24324
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkModelRuntimeObservation/openai-completions"
+allocs = 3408
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkModelRuntimeObservation/openai-responses"
+allocs = 2902
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkModelRuntimeSimpleReplyBudget"
+allocs = 197
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkNativeModelLookup"
+allocs = 4
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkPrintPipelineDeltas/extension/deltas=1000"
+allocs = 60291
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkPrintPipelineDeltas/extension/deltas=10000"
+allocs = 573673
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkPrintPipelineDeltas/openai-text/deltas=1000"
+allocs = 44598
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkPrintPipelineDeltas/openai-text/deltas=10000"
+allocs = 406703
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkPrintPipelineDeltas/text/deltas=1000"
+allocs = 50008
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkPrintPipelineDeltas/text/deltas=10000"
+allocs = 453614
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkProviderRegistration"
+allocs = 298
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkRegistryNamespaceSwitch/1"
+allocs = 377
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkRegistryNamespaceSwitch/128"
+allocs = 18852
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkRuntimeNewSession"
+allocs = 3367
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSameContextMessagesPerRequest/exchanges=50"
+allocs = 3850
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSameContextMessagesPerRequest/exchanges=500"
+allocs = 38504
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSameContextMessagesPerRequest/exchanges=5000"
+allocs = 385016
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionBashLifecycle/bytes=0"
+allocs = 893
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionBashLifecycle/bytes=16384"
+allocs = 862
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionBashLifecycle/bytes=4096"
+allocs = 862
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionBashLifecycle/bytes=64"
+allocs = 861
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionBeforeSettleBoundary/bytes=0"
+allocs = 3042
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionBeforeSettleBoundary/bytes=64"
+allocs = 2929
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionBeforeSettleBoundary/bytes=65536"
+allocs = 2955
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionDynamicTools/1024"
+allocs = 8579
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionDynamicTools/128"
+allocs = 1307
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionDynamicTools/8"
+allocs = 233
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionNameNotifications"
+allocs = 2299
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionPromptOptionsCommand"
+allocs = 11
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionQueueReentrantPublication/empty"
+allocs = 7
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionQueueReentrantPublication/ordinary"
+allocs = 19
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionQueueReentrantPublication/overflow"
+allocs = 1064
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionRegistryMetadataRefresh"
+allocs = 968
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionReplaceInnerCacheWarming/empty"
+allocs = 15
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionReplaceInnerCacheWarming/history"
+allocs = 2876
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionScopedModelsGetter/0"
+allocs = 0
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionScopedModelsGetter/1024"
+allocs = 0
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionScopedModelsGetter/64"
+allocs = 0
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionSendLongTurnEvents/discarded"
+allocs = 38159
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionSendLongTurnEvents/drained"
+allocs = 120846
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionSendLongTurnEvents/unread"
+allocs = 38160
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionSendWithSubscriber"
+allocs = 1177
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionStartupWithoutTranscript"
+allocs = 1097
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionToolRegistry/0"
+allocs = 1340
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionToolRegistry/1024"
+allocs = 59951
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionToolRegistry/64"
+allocs = 5102
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSessionWaitForIdleSuspension"
+allocs = 15
+
+[[benchmark]]
+package = "./coding"
+benchmark = "BenchmarkSummarizationRequestAuth"
+allocs = 14
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkCollectAncestorSkillInputs/0"
+allocs = 42
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkCollectAncestorSkillInputs/128"
+allocs = 11519
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkCollectAncestorSkillInputs/16"
+allocs = 1539
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkConfiguredPackageResources"
+allocs = 7252
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkExtensionScopedModelsEmpty"
+allocs = 0
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkInstalledNpmVersionMatches"
+allocs = 579
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkJSONModeObservation/0"
+allocs = 1863
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkJSONModeObservation/1024"
+allocs = 1902
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkJSONModeObservation/65536"
+allocs = 8003
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkNpmMetadataLookup"
+allocs = 92
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPackageAutoloadResolution/1"
+allocs = 1904
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPackageAutoloadResolution/1000"
+allocs = 182523
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPackageCommandTrustResolution"
+allocs = 39
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPackageInheritedOutput"
+allocs = 62
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPackageLocalInstallProgress"
+allocs = 5
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPackageManagerName"
+allocs = 0
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPackageSourceBoundaries/bare-name"
+allocs = 4
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPackageSourceBoundaries/bare-scp"
+allocs = 4
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPackageSourceBoundaries/empty"
+allocs = 2
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPackageSourceBoundaries/git"
+allocs = 118
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPackageSourceBoundaries/long-local"
+allocs = 4
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPackageSourceBoundaries/npm"
+allocs = 6
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkParseFlagsEndOfOptions"
+allocs = 3
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPrepareInitialImageWithoutPrematureResize"
+allocs = 18
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPrintPipelineDeltas/print/json+extension/deltas=1000"
+allocs = 78193
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPrintPipelineDeltas/print/json+extension/deltas=10000"
+allocs = 726362
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPrintPipelineDeltas/print/json/deltas=1000"
+allocs = 66135
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPrintPipelineDeltas/print/json/deltas=10000"
+allocs = 606294
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPrintPipelineDeltas/print/text/deltas=1000"
+allocs = 23042
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPrintPipelineDeltas/print/text/deltas=10000"
+allocs = 180042
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPrintPipelineDeltas/rpc/deltas=1000"
+allocs = 62055
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPrintPipelineDeltas/rpc/deltas=10000"
+allocs = 584214
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkPrintTextOpenAIDeltas"
+allocs = 164865
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkProjectPackageOverridePersistence"
+allocs = 6139
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkRPCCorrelationRoundTrip/empty"
+allocs = 18
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkRPCCorrelationRoundTrip/nonempty"
+allocs = 17
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkRPCCorrelationRoundTrip/omitted"
+allocs = 15
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkRPCEventMessageEnd"
+allocs = 36
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkRPCEventToolExecutionEnd"
+allocs = 17
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkRPCEventTurnEnd"
+allocs = 41
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkRPCJSONLToolResult"
+allocs = 1
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkRPCMessageUpdateProjection/0"
+allocs = 19
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkRPCMessageUpdateProjection/1"
+allocs = 12
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkRPCMessageUpdateProjection/1024"
+allocs = 12
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkRPCPromptAdmission"
+allocs = 1847
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkRPCRequestEnvelope/large"
+allocs = 20
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkRPCRequestEnvelope/object"
+allocs = 69
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkRPCRequestEnvelope/string"
+allocs = 20
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkRPCResponseTurn"
+allocs = 17
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkReadSessionCWDDoesNotScaleWithTranscript"
+allocs = 26
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkResolveCustomModelThinking"
+allocs = 66
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkResolveExactSessionID/msgs10"
+allocs = 708
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkResolveExactSessionID/msgs100"
+allocs = 708
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkResolveExactSessionID/msgs1000"
+allocs = 708
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkResolveExactSessionID/msgs10000"
+allocs = 708
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkResourceLoaderExtensionDiscovery/0"
+allocs = 103
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkResourceLoaderExtensionDiscovery/128"
+allocs = 8739
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkResourceLoaderExtensionDiscovery/32"
+allocs = 2294
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkSessionReplacementCycle/1ext"
+allocs = 12064
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkSessionReplacementCycle/4ext"
+allocs = 17975
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkSessionReplacementPhases/1ext"
+allocs = 20173
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkSessionReplacementPhases/4ext"
+allocs = 23707
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkSkillResourceMetadata/1"
+allocs = 588
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkSkillResourceMetadata/1000"
+allocs = 221520
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkStartupSDKStageWarm"
+allocs = 65
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkStartupTraceDisabledExtensionHook"
+allocs = 0
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkTemporaryNpmOfflineCacheMiss"
+allocs = 31
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkUniqueExtensionPaths/0"
+allocs = 0
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkUniqueExtensionPaths/128"
+allocs = 1796
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkUniqueExtensionPaths/8"
+allocs = 116
+
+[[benchmark]]
+package = "./coding/cli"
+benchmark = "BenchmarkVerifyEmptyNodePackage"
+allocs = 0
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkBeforeAgentStartSelectedTools/0"
+allocs = 28
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkBeforeAgentStartSelectedTools/1024"
+allocs = 30
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkBeforeAgentStartSelectedTools/128"
+allocs = 30
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkBeforeAgentStartSelectedTools/8"
+allocs = 31
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkEmitContextPerRequest/exchanges=50"
+allocs = 2163
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkEmitContextPerRequest/exchanges=500"
+allocs = 21513
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkEmitContextPerRequest/exchanges=5000"
+allocs = 215013
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkEmitProjectTrustFirstDecisive"
+allocs = 149
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkExtensionHandlerSnapshots"
+allocs = 133
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkRunnerContextBinding"
+allocs = 133
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkRunnerMarkdownTransformerCollection/0"
+allocs = 0
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkRunnerMarkdownTransformerCollection/1"
+allocs = 1
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkRunnerMarkdownTransformerCollection/1024"
+allocs = 11
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkRunnerMarkdownTransformerCollection/64"
+allocs = 6
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkUserBashValidation/output-0"
+allocs = 229
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkUserBashValidation/output-1024"
+allocs = 222
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkUserBashValidation/output-1048576"
+allocs = 226
+
+[[benchmark]]
+package = "./coding/extension/host/inproc"
+benchmark = "BenchmarkUserBashValidation/output-65536"
+allocs = 222
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkAutocompleteReferenceLifecycle"
+allocs = 1
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkCallLanesEightLanes"
+allocs = 5
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkCallLanesPush"
+allocs = 2
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkChildSessionForward/deltas=16"
+allocs = 324
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkChildSessionForward/deltas=256"
+allocs = 1139
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkChildSessionForward/deltas=4096"
+allocs = 13942
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkConnNotify"
+allocs = 4
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkConnRequestRoundTrip/1KiB"
+allocs = 16
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkConnRequestRoundTrip/64KiB"
+allocs = 20
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkConnRequestRoundTrip/empty"
+allocs = 17
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkCopyBuiltBinary"
+allocs = 198
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkDialogStateSnapshot"
+allocs = 133
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkDuplicateGoFolderStartup"
+allocs = 36910
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkEditorStateSnapshot"
+allocs = 95
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkFactoryCacheThroughNodeHost/cross-cwd"
+allocs = 717
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkFactoryCacheThroughNodeHost/direct"
+allocs = 716
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkFactoryCacheThroughNodeHost/reload"
+allocs = 716
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkFactoryCacheThroughNodeHost/same-cwd"
+allocs = 716
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkFailedFactoryAPIThroughNodeCell"
+allocs = 845
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkFusedDispatch"
+allocs = 8941
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkHostShutdownProviderCatalog/0"
+allocs = 2
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkHostShutdownProviderCatalog/1"
+allocs = 30
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkHostShutdownProviderCatalog/20"
+allocs = 1250
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkHostStateChanged"
+allocs = 0
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkLoadInProcessProviders/providers=1"
+allocs = 453
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkLoadInProcessProviders/providers=64"
+allocs = 5210
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkLoadInProcessProviders/providers=8"
+allocs = 910
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkMessageUpdateExtensions/extensions=1/shared=false"
+allocs = 48639
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkMessageUpdateExtensions/extensions=1/shared=true"
+allocs = 48519
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkMessageUpdateExtensions/extensions=10/shared=false"
+allocs = 485139
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkMessageUpdateExtensions/extensions=10/shared=true"
+allocs = 53237
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkMessageUpdateExtensions/extensions=3/shared=false"
+allocs = 145547
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkMessageUpdateExtensions/extensions=3/shared=true"
+allocs = 49567
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkModelCatalogFrame"
+allocs = 20052
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkNativeProviderStream"
+allocs = 535
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkNoUIBridgeSnapshot"
+allocs = 2
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkNodeAdmissionStartup/node-go-node"
+allocs = 5863
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkNodeAdmissionStartup/one-node"
+allocs = 654
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkNodeAdmissionStartup/three-node"
+allocs = 1105
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkNodeAutocompleteRoundTrip"
+allocs = 192
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkNodeEventLoopTurn"
+allocs = 41
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkNodeRuntimeMaterialization"
+allocs = 36566
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkNodeToolCallEvent"
+allocs = 51
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkNodeViewWalk"
+allocs = 11
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkOAuthSubscriptionMetadata"
+allocs = 0
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkPlanCells_Isolated"
+allocs = 129
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkPromptHandlerFIFOThroughFusedSDK"
+allocs = 170
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkReadFramePayload/fresh-200B"
+allocs = 7
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkReadFramePayload/fresh-262144B"
+allocs = 5
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkReadFramePayload/fresh-8192B"
+allocs = 5
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkReadFramePayload/pooled-200B"
+allocs = 5
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkReadFramePayload/pooled-262144B"
+allocs = 5
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkReadFramePayload/pooled-8192B"
+allocs = 5
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkRegisteredFlagSnapshot"
+allocs = 12
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkReload_PackedCellWarmCache"
+allocs = 5416
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkRenderProxyCached"
+allocs = 1
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkStagedSDKKeyMemoized"
+allocs = 2134
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkStagedSDKWalkHash"
+allocs = 3475
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkToolParameterSchemaValidation/0"
+allocs = 11
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkToolParameterSchemaValidation/1024"
+allocs = 11
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkToolParameterSchemaValidation/65536"
+allocs = 11
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkWidgetPushLinesFrame"
+allocs = 8
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkXrefEventBusEmit/one-realm"
+allocs = 71
+
+[[benchmark]]
+package = "./coding/extension/host/subprocess"
+benchmark = "BenchmarkXrefEventBusEmit/two-realms"
+allocs = 65833
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkAboveEditorWidgetLayout"
+allocs = 9
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkActiveKeyDiagnostics"
+allocs = 323
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkAppendLargeMessageEntry/1024KiB"
+allocs = 52
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkAppendLargeMessageEntry/1KiB"
+allocs = 58
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkAppendLargeMessageEntry/64KiB"
+allocs = 52
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkAppendTurnMessages"
+allocs = 261
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkAppendTypedReadToolResult/1024KiB"
+allocs = 26
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkAppendTypedReadToolResult/1KiB"
+allocs = 57
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkAppendTypedReadToolResult/64KiB"
+allocs = 26
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkArminFrameRender"
+allocs = 223
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkAutocompleteCommandOrder/0"
+allocs = 85
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkAutocompleteCommandOrder/512"
+allocs = 4580
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkAutocompleteCommandOrder/8"
+allocs = 171
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkAutomaticThemeChildPicker"
+allocs = 33
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkBashExecutionMessageWire/0"
+allocs = 34
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkBashExecutionMessageWire/256"
+allocs = 6
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkBashExecutionMessageWire/51200"
+allocs = 6
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkBranch"
+allocs = 1
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkBuildContext"
+allocs = 9008
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkBuildContextWarm"
+allocs = 9008
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkBuildSessionContext"
+allocs = 3023
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkBuiltInHeaderRender/compact"
+allocs = 146
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkBuiltInHeaderRender/expanded"
+allocs = 161
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkChangelogCommandRender"
+allocs = 8038
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkClipboardBMPNormalization"
+allocs = 46
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkClipboardCopyUTF8/ascii_limit"
+allocs = 26
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkClipboardCopyUTF8/ordinary"
+allocs = 5
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkClipboardCopyUTF8/paired_surrogate_limit"
+allocs = 21
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkClipboardImageCommand"
+allocs = 82
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkCloneCatalogInput"
+allocs = 27412
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkCloneLabeledSession"
+allocs = 26211
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkCompactionBillingRows"
+allocs = 46
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkCompactionSettingsModelOverrides"
+allocs = 10
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkCompleteRowRedraw/codemode"
+allocs = 3069
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkCompleteRowRedraw/write"
+allocs = 41
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkConfiguredNpmProbeFailure"
+allocs = 207
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkContextResourceReload/ancestors-0"
+allocs = 46
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkContextResourceReload/ancestors-128"
+allocs = 1977
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkContextResourceReload/ancestors-8"
+allocs = 166
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkCopilotAccountAvailability"
+allocs = 908
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkCustomOverlayCachedRender"
+allocs = 1
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkCustomOverlayIdenticalFrame"
+allocs = 0
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkCustomOverlayLinesFrame"
+allocs = 9
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkDownloadBinaryToFile"
+allocs = 111
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkEarendilAnnouncementRender"
+allocs = 1
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkExtensionCatalogEncoding/cached"
+allocs = 50335
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkExtensionCatalogEncoding/uncached"
+allocs = 98837
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkExtensionEditorSnapshot/0"
+allocs = 2
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkExtensionEditorSnapshot/1024"
+allocs = 2
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkExtensionEditorSnapshot/65536"
+allocs = 2
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkExtensionHeaderContainer"
+allocs = 3
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkExtensionResourcePaths/0"
+allocs = 1
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkExtensionResourcePaths/1024"
+allocs = 3085
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkExtensionResourcePaths/32"
+allocs = 103
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkExtensionSessionProjection"
+allocs = 101042
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkFooterWatchLifetime"
+allocs = 33
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkHotkeysCommandRender"
+allocs = 2718
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkInteractiveInputLifecycle"
+allocs = 36
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkInteractiveLongAnswerStream"
+allocs = 1234131
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkInteractiveOverlayInput/large"
+allocs = 0
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkInteractiveOverlayInput/short"
+allocs = 14
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkInteractiveSessionReload/0"
+allocs = 956
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkInteractiveSessionReload/1000"
+allocs = 21895
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkInteractiveTerminalInputBurst"
+allocs = 910
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkInteractiveThinkingStateBinding"
+allocs = 0
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkKeystrokeToPaint"
+allocs = 128
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkLoadedResourcesOriginalMixedLayouts/false"
+allocs = 304
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkLoadedResourcesOriginalMixedLayouts/true"
+allocs = 311
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkLoginArgumentCompletions"
+allocs = 926
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkManagedToolStartup"
+allocs = 69
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkMermaidBlockScope/1"
+allocs = 49
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkMermaidBlockScope/1000"
+allocs = 10033
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkMermaidOversizedTransform"
+allocs = 3150
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkMermaidTransformFencedBlocks"
+allocs = 6717
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkModelCommandCachedMatch/1"
+allocs = 651
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkModelCommandCachedMatch/1000"
+allocs = 3787
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkModelPickerScopedReopen"
+allocs = 6472
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkModelPickerSnapshotAndRender"
+allocs = 2046
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkModelThinkingSubmenu"
+allocs = 1901
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkNativeCredentialCycle"
+allocs = 97
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkNativeSelfUpdateOwnership"
+allocs = 204
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkPostLoginModel"
+allocs = 1
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkPostLoginModelSelection"
+allocs = 4
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkProjectTrustWarning"
+allocs = 96
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkPromptTemplateExpansion/many_arguments"
+allocs = 276
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkPromptTemplateExpansion/ordinary"
+allocs = 36
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkPromptTemplateExpansion/unicode"
+allocs = 18
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkRegisterExtensionProviderAndRead"
+allocs = 698
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkRemoteCustomFocusLifecycle/10"
+allocs = 78
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkRemoteCustomFocusLifecycle/1000"
+allocs = 74
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkRequestAuthProviderProjection"
+allocs = 736
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkRunKeybindingsMigration/all_surrogate_names"
+allocs = 60999
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkRunKeybindingsMigration/ordinary"
+allocs = 97
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkRuntimeInteractiveRebind/0"
+allocs = 4994
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkRuntimeInteractiveRebind/1000"
+allocs = 49083
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkRuntimeModelsSelection"
+allocs = 694
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkScopedModelsSelection"
+allocs = 108
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionClone"
+allocs = 25710
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionOpen"
+allocs = 35469
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionSelectorCurrentSession/10"
+allocs = 25
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionSelectorCurrentSession/1000"
+allocs = 1583
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionSelectorDeleteRefresh/1"
+allocs = 70
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionSelectorDeleteRefresh/1000"
+allocs = 18106
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionSelectorRename/bytes-0"
+allocs = 174
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionSelectorRename/bytes-64"
+allocs = 175
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionSelectorRename/bytes-65536"
+allocs = 181
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionSelectorScopeLoading/10"
+allocs = 2464
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionSelectorScopeLoading/1000"
+allocs = 1138359
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionSelectorSearch/10"
+allocs = 22
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionSelectorSearch/1000"
+allocs = 1217
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionSelectorStatusLifecycle"
+allocs = 41
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionStatsSnapshot/entries=100"
+allocs = 0
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionStatsSnapshot/entries=10000"
+allocs = 0
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionTreeLatestActivity/10"
+allocs = 273
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionTreeLatestActivity/1000"
+allocs = 26425
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSessionTreeLatestActivity/10000"
+allocs = 264064
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSettingsEditorAndPadding/configured"
+allocs = 0
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSettingsEditorAndPadding/environment"
+allocs = 0
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSettingsEditorAndPadding/platform"
+allocs = 0
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSettingsMemoryReload/0"
+allocs = 16
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSettingsMemoryReload/1000"
+allocs = 19
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSettingsMemoryReload/10000"
+allocs = 19
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSettingsThemeAndEditorGetters"
+allocs = 0
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSkillInvocation/0"
+allocs = 17
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSkillInvocation/1048576"
+allocs = 21
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSkillInvocation/64"
+allocs = 21
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSkillInvocation/65536"
+allocs = 21
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSkillPathDiscovery"
+allocs = 8495
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkStartupInputHandoff"
+allocs = 77
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkStartupSessionSelectorRender"
+allocs = 91
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkStatusLifecycle/fullscreen/editor=default"
+allocs = 431
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkStatusLifecycle/fullscreen/editor=embedded"
+allocs = 331
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkStatusLifecycle/fullscreen/editor=standalone"
+allocs = 394
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkStatusLifecycle/regular/editor=default"
+allocs = 163
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkStatusLifecycle/regular/editor=embedded"
+allocs = 60
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkStatusLifecycle/regular/editor=standalone"
+allocs = 130
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkSuspendLifecycle"
+allocs = 14
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkTerminalInputBurst/none/1024"
+allocs = 7302
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkTerminalInputBurst/none/4096"
+allocs = 29058
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkTerminalInputBurst/pending/1024"
+allocs = 17547
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkTerminalInputBurst/pending/4096"
+allocs = 70023
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkTerminalInputBurst/responsive/1024"
+allocs = 17548
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkTerminalInputBurst/responsive/4096"
+allocs = 70023
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkTerminalInputEditorSnapshotRead/0"
+allocs = 0
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkTerminalInputEditorSnapshotRead/1000"
+allocs = 0
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkTerminalInputEditorSnapshotRead/1048576"
+allocs = 0
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkTerminalInputEditorSnapshotRead/65536"
+allocs = 0
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkThinkingDropNoticeUnchanged"
+allocs = 0
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkToolsExpansionMountedTranscript/1"
+allocs = 186
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkToolsExpansionMountedTranscript/1000"
+allocs = 126107
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkTrustSelector"
+allocs = 87
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkUserBashOwnerRoundTrip/0"
+allocs = 113
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkUserBashOwnerRoundTrip/1024"
+allocs = 110
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkUserBashOwnerRoundTrip/1048576"
+allocs = 110
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkUserBashOwnerRoundTrip/65536"
+allocs = 110
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkWireModelCatalogBinding/encoded"
+allocs = 142940
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkWireModelCatalogBinding/legacy"
+allocs = 156479
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkWriteRenderCallLargeArguments/200-lines"
+allocs = 82
+
+[[benchmark]]
+package = "./internal/codingagent"
+benchmark = "BenchmarkWriteRenderCallLargeArguments/4000-lines"
+allocs = 80
+
+[[benchmark]]
+package = "./internal/sessionentry"
+benchmark = "BenchmarkDecodeFileEntryPiFixture"
+allocs = 260920
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkAltScreenDoRender"
+allocs = 14
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkAltScreenFrameWhileTheTranscriptGrows/draw-every-row"
+allocs = 65
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkAltScreenFrameWhileTheTranscriptGrows/scroll-rows"
+allocs = 65
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkAltScreenPageUpScroll/messages-1000"
+allocs = 550
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkAltScreenPageUpScroll/messages-270"
+allocs = 551
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkAltScreenStreamingFrame"
+allocs = 47
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkApplyLineResetsCached_TypingFrame"
+allocs = 1
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkApplyLineResets_Pure"
+allocs = 8001
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkApplyQuotedPathCompletion"
+allocs = 2
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkAssistantMessageStreaming"
+allocs = 955
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkAssistantThinkingClick"
+allocs = 9
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkAsyncMarkdownCached"
+allocs = 0
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkAutoLinkLexUnbroken/closing-parens"
+allocs = 458807
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkAutoLinkLexUnbroken/invalid-email"
+allocs = 83
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkAutoLinkLexUnbroken/multiple-at"
+allocs = 4
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkAutoLinkLexUnbroken/plain"
+allocs = 4
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkAutoLinkLexUnbroken/url-prefixes"
+allocs = 4
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkAutoLinkProbeTail/long"
+allocs = 0
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkAutoLinkProbeTail/short"
+allocs = 0
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkBashLongCommandHeader"
+allocs = 43
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkCollapsibleMessageClick/1"
+allocs = 59
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkCollapsibleMessageClick/10000"
+allocs = 12082
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkContainerRender"
+allocs = 1
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkContainerRenderPlusResets"
+allocs = 8002
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkDockFrameLongTranscript/keystroke/main-screen/msgs=2000"
+allocs = 12
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkDockFrameLongTranscript/keystroke/surface/msgs=2000"
+allocs = 17
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkDockFrameLongTranscript/status/main-screen/msgs=2000"
+allocs = 31
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkDockFrameLongTranscript/status/surface/msgs=2000"
+allocs = 16
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorAutocompleteMouseClick"
+allocs = 101
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorEditUndo/chars-0"
+allocs = 132
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorEditUndo/chars-1024"
+allocs = 1171
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorEditUndo/chars-32"
+allocs = 126
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorHistorySubmissionWhitespace"
+allocs = 10
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorOwnedArgumentCompletion"
+allocs = 53
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorPrintableKeystroke"
+allocs = 6
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorRemoteCachedFrame"
+allocs = 1
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorRenderPaste/bufferlines=1"
+allocs = 4
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorRenderPaste/bufferlines=200"
+allocs = 3
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorRenderPaste/bufferlines=2000"
+allocs = 3
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorStatusBorder"
+allocs = 29
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorWordAndMarkerInput/CJK"
+allocs = 72
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorWordAndMarkerInput/mixed_large"
+allocs = 597
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorWordAndMarkerInput/ordinary"
+allocs = 99
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorWrappingUpstream/large_mixed"
+allocs = 2965
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorWrappingUpstream/ordinary"
+allocs = 115
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkEditorWrappingUpstream/scroll"
+allocs = 152
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkExtensionDialogRemapping"
+allocs = 201
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkImageFallbackRender"
+allocs = 13
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkInputWordEditing/ASCII"
+allocs = 30
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkInputWordEditing/CJK"
+allocs = 992
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkKeystrokeBindingMatch/ctrl-arrow-csi"
+allocs = 3
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkKeystrokeBindingMatch/enter"
+allocs = 0
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkKeystrokeBindingMatch/kitty-csi-u"
+allocs = 5
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkKeystrokeBindingMatch/printable"
+allocs = 6
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkLongAnswerStream/20000"
+allocs = 170995
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkLongAnswerStream/5000"
+allocs = 46278
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkLongAnswerStream/60000"
+allocs = 482547
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkLongStreamingAssistantMessage/default"
+allocs = 122545
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkLongStreamingAssistantMessage/foreign"
+allocs = 4814365
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMainScreenLargeFrames/differential"
+allocs = 9
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMainScreenLargeFrames/full"
+allocs = 8
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownAdversarialDelimiters/alternating"
+allocs = 37493
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownAdversarialDelimiters/nested-brackets"
+allocs = 4031
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownAdversarialDelimiters/star-run"
+allocs = 22066
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownAdversarialDelimiters/unclosed-brackets"
+allocs = 19992
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownAdversarialDelimiters/unclosed-em-underscore"
+allocs = 4177
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownAdversarialDelimiters/unclosed-strong"
+allocs = 4225
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownAdversarialDelimiters/unclosed-tags"
+allocs = 4643
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownAdversarialDelimiters/underscore-run"
+allocs = 22066
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownAssistantStreaming/tokens=100"
+allocs = 575
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownAssistantStreaming/tokens=10000"
+allocs = 3449865
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownAssistantStreaming/tokens=2000"
+allocs = 142952
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownParseFinal"
+allocs = 2841
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownStreaming"
+allocs = 1391197
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownStreamingCached"
+allocs = 202412
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownTransformGeneration/0"
+allocs = 8
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownTransformGeneration/1024"
+allocs = 234
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownTransformGeneration/65536"
+allocs = 13000
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownTransformQueue/0"
+allocs = 8
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownTransformQueue/1024"
+allocs = 8
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownTransformQueue/65536"
+allocs = 8
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownUnbroken/131072"
+allocs = 129562
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownUnbroken/16384"
+allocs = 16267
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownUnbroken/32768"
+allocs = 32447
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMarkdownUnbroken/65536"
+allocs = 64828
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMessageFrameLongTranscript/main-screen/msgs=10000"
+allocs = 23
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMessageFrameLongTranscript/main-screen/msgs=2000"
+allocs = 22
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMessageFrameLongTranscript/surface/msgs=10000"
+allocs = 7
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkMessageFrameLongTranscript/surface/msgs=2000"
+allocs = 7
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkModalColoredClipping"
+allocs = 2726
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkModelSelectorCatalogRefresh/100"
+allocs = 697
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkModelSelectorCatalogRefresh/10000"
+allocs = 50231
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkNativeModelSelectorFilter"
+allocs = 8184
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlayCompositor/240x80/1-overlays/ansi-wide"
+allocs = 88
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlayCompositor/240x80/1-overlays/ascii"
+allocs = 76
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlayCompositor/240x80/8-overlays/ansi-wide"
+allocs = 973
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlayCompositor/240x80/8-overlays/ascii"
+allocs = 787
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlayCompositor/80x24/1-overlays/ansi-wide"
+allocs = 70
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlayCompositor/80x24/1-overlays/ascii"
+allocs = 52
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlayCompositor/80x24/8-overlays/ansi-wide"
+allocs = 817
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlayCompositor/80x24/8-overlays/ascii"
+allocs = 583
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlayReplaceAndCompose/240x80/1-overlays/ansi-wide"
+allocs = 89
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlayReplaceAndCompose/240x80/1-overlays/ascii"
+allocs = 77
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlayReplaceAndCompose/240x80/8-overlays/ansi-wide"
+allocs = 981
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlayReplaceAndCompose/240x80/8-overlays/ascii"
+allocs = 795
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlayReplaceAndCompose/80x24/1-overlays/ansi-wide"
+allocs = 71
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlayReplaceAndCompose/80x24/1-overlays/ascii"
+allocs = 53
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlayReplaceAndCompose/80x24/8-overlays/ansi-wide"
+allocs = 825
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlayReplaceAndCompose/80x24/8-overlays/ascii"
+allocs = 591
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkOverlaySnapshotReplacement256KiB"
+allocs = 1
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkRefreshActiveThemeColorModeRoundTrip"
+allocs = 340
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkRenderLayoutFrame"
+allocs = 198
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkRenderScrollOffChange/turns=50"
+allocs = 34
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkRenderScrollOffChange/turns=500"
+allocs = 44
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkRenderScrollOffChange/turns=5000"
+allocs = 303
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkRenderSteadyState/turns=50"
+allocs = 12
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkRenderSteadyState/turns=500"
+allocs = 12
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkRenderSteadyState/turns=5000"
+allocs = 12
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSoutheastAsianWordNavigation/Burmese/1"
+allocs = 6
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSoutheastAsianWordNavigation/Burmese/128"
+allocs = 7
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSoutheastAsianWordNavigation/Burmese/4096"
+allocs = 7
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSoutheastAsianWordNavigation/Khmer/1"
+allocs = 6
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSoutheastAsianWordNavigation/Khmer/128"
+allocs = 7
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSoutheastAsianWordNavigation/Khmer/4096"
+allocs = 7
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSoutheastAsianWordNavigation/Lao/1"
+allocs = 6
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSoutheastAsianWordNavigation/Lao/128"
+allocs = 7
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSoutheastAsianWordNavigation/Lao/4096"
+allocs = 7
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSoutheastAsianWordNavigation/Mixed/1"
+allocs = 6
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSoutheastAsianWordNavigation/Mixed/128"
+allocs = 6
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSoutheastAsianWordNavigation/Mixed/4096"
+allocs = 6
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSoutheastAsianWordNavigation/Thai/1"
+allocs = 6
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSoutheastAsianWordNavigation/Thai/128"
+allocs = 7
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSoutheastAsianWordNavigation/Thai/4096"
+allocs = 7
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStdinSecondHalfFlow"
+allocs = 24
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamedFence/bash"
+allocs = 1893022
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamedFence/go"
+allocs = 1914518
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamedFence/json"
+allocs = 2644281
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamedFence/python"
+allocs = 2283934
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamedFence/typescript"
+allocs = 22404820
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamingFrameLongTranscript/markdown/main-screen/msgs=100"
+allocs = 19
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamingFrameLongTranscript/markdown/main-screen/msgs=10000"
+allocs = 20
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamingFrameLongTranscript/markdown/main-screen/msgs=2000"
+allocs = 19
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamingFrameLongTranscript/markdown/surface/msgs=100"
+allocs = 17
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamingFrameLongTranscript/markdown/surface/msgs=10000"
+allocs = 17
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamingFrameLongTranscript/markdown/surface/msgs=2000"
+allocs = 17
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamingFrameLongTranscript/session/main-screen/msgs=100"
+allocs = 31
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamingFrameLongTranscript/session/main-screen/msgs=10000"
+allocs = 31
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamingFrameLongTranscript/session/main-screen/msgs=2000"
+allocs = 30
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamingFrameLongTranscript/session/surface/msgs=100"
+allocs = 7
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamingFrameLongTranscript/session/surface/msgs=10000"
+allocs = 7
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStreamingFrameLongTranscript/session/surface/msgs=2000"
+allocs = 7
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStripControlEscapes/clean"
+allocs = 0
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkStripControlEscapes/sgr"
+allocs = 1
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSyntaxThemeScopes/diff"
+allocs = 9364
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSyntaxThemeScopes/html"
+allocs = 31083
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkSyntaxThemeScopes/python"
+allocs = 23984
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkThemeWatcherSelection"
+allocs = 229
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkToolCardArgumentUpdates/complete/write"
+allocs = 4043
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkToolCardArgumentUpdates/complete/write-definition"
+allocs = 4045
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkToolCardArgumentUpdates/whole/bash"
+allocs = 64047
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkToolCardArgumentUpdates/whole/mcp_unknown"
+allocs = 152040
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkToolCardArgumentUpdates/whole/write"
+allocs = 72053
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkToolCardDefinitionArgumentUpdates"
+allocs = 4046
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkToolDefinitionRender"
+allocs = 8
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkTreeActiveBranch"
+allocs = 388
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkTreeLabelEdit/100"
+allocs = 181
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkTreeLabelEdit/10000"
+allocs = 159
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkTreeRecompute"
+allocs = 11328
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkTreeSelectSearchAndClear"
+allocs = 282
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkTreeSelectorUpstreamPath/construct/100"
+allocs = 447
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkTreeSelectorUpstreamPath/construct/10000"
+allocs = 712
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkTreeSelectorUpstreamPath/navigate/100"
+allocs = 551
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkTreeSelectorUpstreamPath/navigate/10000"
+allocs = 557
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkTrueColorAnsi"
+allocs = 2
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkUserMessageRetention/messages=10"
+allocs = 12968
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkUserMessageRetention/messages=100"
+allocs = 128832
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkUserMessageRetention/messages=1000"
+allocs = 1288063
+
+[[benchmark]]
+package = "./tui"
+benchmark = "BenchmarkUserMessageRetention/messages=10000"
+allocs = 12817113
+
+[[benchmark]]
+package = "./tui/widthx"
+benchmark = "BenchmarkAnsiCodeTrackerProcess"
+allocs = 0
+
+[[benchmark]]
+package = "./tui/widthx"
+benchmark = "BenchmarkReviewTranscript/ASCII/VisibleWidth"
+allocs = 0
+
+[[benchmark]]
+package = "./tui/widthx"
+benchmark = "BenchmarkReviewTranscript/ASCII/Wrap"
+allocs = 37902
+
+[[benchmark]]
+package = "./tui/widthx"
+benchmark = "BenchmarkReviewTranscript/Styled/VisibleWidth"
+allocs = 0
+
+[[benchmark]]
+package = "./tui/widthx"
+benchmark = "BenchmarkReviewTranscript/Styled/Wrap"
+allocs = 28686
+
+[[benchmark]]
+package = "./tui/widthx"
+benchmark = "BenchmarkReviewTranscript/Unicode/VisibleWidth"
+allocs = 2
+
+[[benchmark]]
+package = "./tui/widthx"
+benchmark = "BenchmarkReviewTranscript/Unicode/Wrap"
+allocs = 37902
+
+[[benchmark]]
+package = "./tui/widthx"
+benchmark = "BenchmarkVisibleWidth_Plain"
+allocs = 0
+
+[[benchmark]]
+package = "./tui/widthx"
+benchmark = "BenchmarkVisibleWidth_Styled"
+allocs = 0
+

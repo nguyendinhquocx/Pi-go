@@ -54,10 +54,8 @@ func TestSessionSystemPromptOptionsCarryRegistryAndResources(t *testing.T) {
 		"read":  {"Use read to examine files instead of cat or sed."},
 		"write": {"Use write only for new files or complete rewrites."},
 		"edit": {
-			"Use edit for precise changes (edits[].oldText must match exactly)",
-			"When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
-			"Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
-			"Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
+			"Use edit for targeted changes. Batch changes to one file in a single call.",
+			"Each edits[].oldText must exactly and uniquely match the original file. Keep matches short and non-overlapping; merge nearby changes without including large unchanged regions.",
 		},
 	}
 	for name, want := range wantGuidelines {
@@ -114,7 +112,7 @@ export default function(pi){
 	resources := &SystemPromptResources{
 		AppendSystemPrompt: "APPENDED",
 		ContextFiles:       []extension.SystemPromptContextFile{{Path: "/work/AGENTS.md", Content: "project rules here\n"}},
-		Skills:             []extension.SystemPromptSkill{{Name: "review", Description: "Review code", FilePath: "/s/review/SKILL.md", BaseDir: "/s/review", SourceInfo: map[string]any{"scope": "project"}}},
+		Skills:             []extension.SystemPromptSkill{{Name: "review", Description: "Review code", FilePath: "/s/review/SKILL.md", BaseDir: "/s/review", SourceInfo: extension.SourceInfo{Scope: "project"}}},
 	}
 	h := newRecoveryHarness(t, harnessOptions{defaultTools: true, extension: ext, resources: resources}, fauxReply("ok", ai.StopReasonStop, 0))
 	context9789Prompt(t, h, "hello")
@@ -151,7 +149,8 @@ export default function(pi){
 	}
 	var guidelines map[string][]string
 	_ = json.Unmarshal(got.Event["toolGuidelines"], &guidelines)
-	if len(guidelines["edit"]) != 4 {
+	// Pi's editToolSystemPromptContribution (core/tools/edit.ts) has two guidelines since 705d047c.
+	if len(guidelines["edit"]) != 2 {
 		t.Errorf("toolGuidelines = %s", got.Event["toolGuidelines"])
 	}
 	if _, present := got.Event["customPrompt"]; present {

@@ -18,7 +18,13 @@ func TestLoginOpenAICodexAuthorizeURLNamesPiGAsOriginator(t *testing.T) {
 	stubCodexTokenEndpoint(t)
 	var authURL string
 	if _, err := LoginOpenAICodex(context.Background(), OAuthLoginCallbacks{
-		OnAuth:            func(info OAuthAuthInfo) { authURL = info.URL },
+		OnAuth: func(info OAuthAuthInfo) {
+			authURL = info.URL
+			// openai-codex.ts:376-379.
+			if want := "A browser window should open. Complete login to finish."; info.Instructions != want {
+				t.Errorf("instructions = %q, want %q", info.Instructions, want)
+			}
+		},
 		OnManualCodeInput: func() (string, error) { return "manual-code", nil },
 	}); err != nil {
 		t.Fatal(err)
@@ -35,7 +41,7 @@ func TestLoginOpenAICodexAuthorizeURLNamesPiGAsOriginator(t *testing.T) {
 // The Codex websocket handshake sets originator itself (openai-codex-responses.ts
 // buildBaseCodexHeaders), separately from the SSE path: both carry PiG's value.
 func TestCodexWebSocketHeadersNamePiGAsOriginator(t *testing.T) {
-	headers := codexWebSocketHeaders(nil, nil, "token", "acct", "request")
+	headers := codexWebSocketHeaders(ClientIdentityTarget{}, nil, nil, nil, "token", "acct", "request")
 	if got := headers.Get("originator"); got != pigidentity.CodexOriginator || got == "" || strings.EqualFold(got, "pi") {
 		t.Fatalf("websocket originator = %q, want PiG's %q", got, pigidentity.CodexOriginator)
 	}

@@ -15,16 +15,10 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/MichaelKinsy/PiG/coding"
+	"github.com/MichaelKinsy/PiG/test/parity/upstreampackages"
 )
 
-var trackedRoots = []string{
-	"packages/agent/src",
-	"packages/ai/src",
-	"packages/codemode/src",
-	"packages/coding-agent/src",
-	"packages/mcp/src",
-	"packages/tui/src",
-}
+var trackedRoots = upstreampackages.SourceRoots()
 
 type syncManifest struct {
 	From  string      `toml:"from"`
@@ -91,11 +85,20 @@ func main() {
 }
 
 func computeDelta(fromRoot, toRoot string) ([]sourceDelta, error) {
-	fromFiles, err := discoverSources(fromRoot)
+	// A missing from mirror is an error, never an empty tree: with no earlier release to compare against every file of the
+	// target would read as added and the audit would pass without comparing anything. Only a package root inside an existing
+	// earlier mirror may be absent (a package the earlier release did not ship).
+	if info, err := os.Stat(fromRoot); err != nil || !info.IsDir() {
+		return nil, fmt.Errorf("from mirror %s is missing: build the exact earlier pin's mirror (automation/gen/mirror-upstream.sh --version v<from>) before the audit", fromRoot)
+	}
+	fromFiles, err := discoverSources(fromRoot, true)
 	if err != nil {
 		return nil, err
 	}
-	toFiles, err := discoverSources(toRoot)
+	if len(fromFiles) == 0 {
+		return nil, fmt.Errorf("from mirror %s holds no tracked source file: it is not a mirror of an earlier pin", fromRoot)
+	}
+	toFiles, err := discoverSources(toRoot, false)
 	if err != nil {
 		return nil, err
 	}
@@ -127,11 +130,15 @@ func computeDelta(fromRoot, toRoot string) ([]sourceDelta, error) {
 	return deltas, nil
 }
 
-func discoverSources(root string) (map[string][]byte, error) {
+// discoverSources reads every tracked source file under root. A package the earlier release did not ship has no files there, so a missing root is allowed only when allowMissing is set.
+func discoverSources(root string, allowMissing bool) (map[string][]byte, error) {
 	files := make(map[string][]byte)
 	for _, trackedRoot := range trackedRoots {
 		base := filepath.Join(root, filepath.FromSlash(trackedRoot))
 		if _, err := os.Stat(base); err != nil {
+			if allowMissing && os.IsNotExist(err) {
+				continue
+			}
 			return nil, fmt.Errorf("tracked root %s: %w", base, err)
 		}
 		err := filepath.WalkDir(base, func(path string, entry os.DirEntry, walkErr error) error {
@@ -236,10 +243,16 @@ func validateAudit(audit fileAudit, repoRoot string) []string {
 			problems = append(problems, fmt.Sprintf("%s has invalid evidence %q", audit.Path, evidence))
 			continue
 		}
-		path, _, _ = strings.Cut(path, "#")
+		path, fragment, _ := strings.Cut(path, "#")
 		fullPath := filepath.Join(repoRoot, filepath.FromSlash(path))
-		if _, err := os.Stat(fullPath); err != nil {
+		body, err := os.ReadFile(fullPath)
+		if err != nil {
 			problems = append(problems, fmt.Sprintf("%s evidence %q: %v", audit.Path, evidence, err))
+			continue
+		}
+		// A Go test fragment (an identifier) must name something in the file; a title with spaces names a vitest case and is not checked.
+		if kind == "test" && fragment != "" && !strings.ContainsAny(fragment, " \t") && !strings.Contains(string(body), fragment) {
+			problems = append(problems, fmt.Sprintf("%s evidence %q: %s does not contain %q", audit.Path, evidence, path, fragment))
 			continue
 		}
 		if kind == "scenario" {
@@ -259,7 +272,7 @@ func validateAudit(audit fileAudit, repoRoot string) []string {
 func writePendingManifest(from, to string, deltas []sourceDelta) {
 	fmt.Printf("from = %q\nto = %q\n", from, to)
 	for _, delta := range deltas {
-		fmt.Printf("\n[[files]]\npath = %q\nchange = %q\ndisposition = %q\nevidence = []\nrationale = %q\n", delta.Path, delta.Change, "pending", "")
+		fmt.Printf("\n[[files]]\npath = %q\nchange = %q\ndisposition = \"pending\"\nevidence = []\nrationale = \"\"\n", delta.Path, delta.Change)
 	}
 }
 

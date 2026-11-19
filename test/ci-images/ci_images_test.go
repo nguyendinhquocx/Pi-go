@@ -22,11 +22,17 @@ func hostPython() string {
 
 func repoRoot(t *testing.T) string {
 	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("resolve test path")
+	return testenv.ModuleRoot(t)
+}
+
+// repoScript returns the path of a repository script the test runs in place. It reads the script first: the go test cache keys a result only on files the test process opens, and the child process that runs the script is invisible to it, so without the read an edited script would replay the earlier pass.
+func repoScript(t *testing.T, path string) string {
+	t.Helper()
+	script := filepath.Join(repoRoot(t), filepath.FromSlash(path))
+	if _, err := os.ReadFile(script); err != nil {
+		t.Fatal(err)
 	}
-	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	return script
 }
 
 func TestNpmRuntimeRemovesAdvisoryOverridesFromBundledNpm(t *testing.T) {
@@ -57,8 +63,8 @@ func TestNpmRuntimeRemovesAdvisoryOverridesFromBundledNpm(t *testing.T) {
 }
 
 // npm's tarball bundles its dependencies, and a lockfile cannot replace a bundled copy. The toolchain and the
-// parity image remove npm's bundled http-cache-semantics and postcss-selector-parser, so neither lock describes those
-// bundled copies, and each lock pins the patched copy npm then resolves.
+// parity image remove npm's bundled glob, http-cache-semantics, ip-address, minimatch, postcss-selector-parser and undici, so neither lock
+// describes those bundled copies, and each lock pins the patched copy npm then resolves.
 func TestNpmLocksPinPatchedCopiesInsteadOfBundledOnes(t *testing.T) {
 	root := repoRoot(t)
 	for _, dir := range []string{
@@ -82,7 +88,7 @@ func TestNpmLocksPinPatchedCopiesInsteadOfBundledOnes(t *testing.T) {
 				t.Fatalf("%s/%s: %v", dir, name, err)
 			}
 		}
-		for _, dependency := range []string{"http-cache-semantics", "postcss-selector-parser"} {
+		for _, dependency := range []string{"glob", "http-cache-semantics", "ip-address", "minimatch", "postcss-selector-parser", "undici"} {
 			want, ok := manifest.Dependencies[dependency]
 			if !ok {
 				t.Errorf("%s does not pin %s directly", dir, dependency)
@@ -231,7 +237,7 @@ func TestCIBaseSeederRejectsUnknownImage(t *testing.T) {
 	if err == nil {
 		t.Fatal("unknown image was accepted")
 	}
-	if !strings.Contains(string(output), "usage: automation/ci/seed-ci-image-bases.sh <go|parity>") {
+	if !strings.Contains(string(output), "usage: automation/ci/seed-ci-image-bases.sh <go|parity|sbom>") {
 		t.Fatalf("unexpected failure: %v\n%s", err, output)
 	}
 }

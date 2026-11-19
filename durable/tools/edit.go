@@ -10,11 +10,12 @@ import (
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/durable"
 	"github.com/MichaelKinsy/PiG/durable/env"
+	"github.com/MichaelKinsy/PiG/internal/jsdiff"
 )
 
 // Ports packages/durable/src/tools/edit.ts.
 
-const editParameters = `{"type":"object","required":["path","edits"],"properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","items":{"type":"object","required":["oldText","newText"],"properties":{"oldText":{"type":"string","description":"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."},"newText":{"type":"string","description":"Replacement text for this targeted edit."}}},"description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead."}}}`
+const editParameters = `{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","items":{"type":"object","properties":{"oldText":{"type":"string","description":"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."},"newText":{"type":"string","description":"Replacement text for this targeted edit."}},"required":["oldText","newText"]},"description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead."}},"required":["path","edits"]}`
 
 // EditToolInput is the arguments of the edit tool.
 type EditToolInput struct {
@@ -185,17 +186,19 @@ func editFile(ctx context.Context, executionEnv env.ExecutionEnv, absolutePath s
 		return failed(errOperationAborted)
 	}
 
-	diff, firstChangedLine := GenerateDiffString(applied.baseContent, applied.newContent)
+	// One line diff serves the display diff and the patch, which upstream computes separately over the same pair.
+	lineDiff := jsdiff.DiffLineRuns(applied.baseContent, applied.newContent)
+	diff, firstChangedLine := diffStringOf(lineDiff, applied.baseContent, applied.newContent, 4)
 	details, err := durable.ToJsonValue(EditToolDetails{
 		Diff:             diff,
-		Patch:            GenerateUnifiedPatch(input.Path, applied.baseContent, applied.newContent),
+		Patch:            unifiedPatchOf(input.Path, lineDiff, 4),
 		FirstChangedLine: firstChangedLine,
 	})
 	if err != nil {
 		return failed(err)
 	}
 	return durable.ToolExecutionResult{
-		Content:    []ai.ToolResultMessageContent{ai.TextContent{Text: fmt.Sprintf("Successfully replaced %d block(s) in %s.", len(input.Edits), input.Path)}},
+		Output:     []ai.ToolResultMessageContent{ai.TextContent{Text: fmt.Sprintf("Successfully replaced %d block(s) in %s.", len(input.Edits), input.Path)}},
 		Details:    details,
 		HasDetails: true,
 	}, nil

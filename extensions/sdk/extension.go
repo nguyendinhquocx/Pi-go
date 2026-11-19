@@ -9,13 +9,17 @@ import (
 	"maps"
 	"net"
 	"os"
+	"reflect"
 	"runtime/debug"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/MichaelKinsy/PiG/extensions/sdk/internal/jsloop"
+	"github.com/MichaelKinsy/PiG/extensions/sdk/internal/kitwire"
 	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
+	"github.com/MichaelKinsy/PiG/extensions/sdk/kit"
 )
 
 // Schema is a JSON Schema object for tool parameter definitions.
@@ -100,6 +104,10 @@ type MarkdownTransformContext struct {
 	MessageType    string `json:"messageType"`
 	IsStreaming    bool   `json:"isStreaming"`
 	AvailableWidth int    `json:"availableWidth"`
+	// MessageID is the persisted session-entry id, empty for a live message or live rendering.
+	MessageID string `json:"messageId,omitempty"`
+	// Timestamp is the persisted session-entry ISO timestamp, empty for a live message or live rendering.
+	Timestamp string `json:"timestamp,omitempty"`
 }
 
 // MarkdownTransformerFunc rewrites Markdown for display only, as Pi's
@@ -118,6 +126,12 @@ type Factory func() *Extension
 // Extension is the builder for a subprocess extension. Create with [New],
 // register tools/commands/events, then call [Extension.Run].
 type Extension struct {
+	// eventReplicas holds the payloads of the event streams this connection received (event_stream.go); the loop alone reads it.
+	eventReplicas map[string]*eventReplica
+
+	// stale holds the Host's invalidate message; the first one wins (runner.ts:725-727).
+	stale atomic.Pointer[string]
+
 	name     string
 	tools    []toolDef
 	commands []cmdDef
@@ -125,35 +139,59 @@ type Extension struct {
 
 	eventMu     sync.Mutex
 	eventNextID int
+	// loading is the connection the factory's first pi.events call opened before Run (loadingConnection), guarded by eventMu. Run adopts that connection and clears this.
+	loading *conn
+	// pump answers the host's dispatches on loading until Run takes the connection over; running is set from then until Run ends. Both are guarded by eventMu.
+	pump *factoryPump
+	// shutdownInFactory is set when the factory's pump read the host's shutdown, which Run acts on once it has registered.
+	shutdownInFactory atomic.Bool
+	running           bool
 
 	// run is the replicated signal of the run in progress (Context.Signal).
 	run runSignal
 
-	providerStreams         map[string]ProviderStreamSimpleFunc
-	providerOperations      map[string]providerOperations
-	toolMu                  sync.RWMutex
-	toolConn                *conn
-	toolFuncs               map[string]ToolFunc
-	toolPrepareFuncs        map[string]ToolPrepareArgumentsFunc
-	toolStarts              toolStartOrder
-	commandFuncs            map[string]CommandFunc
-	eventFuncs              map[int]EventFunc
-	shortcutFuncs           map[string]ShortcutFunc
-	rendererFuncs           map[string]RendererFunc
-	entryRendererFuncs      map[string]EntryRendererFunc
-	flagDefaults            map[string]any
-	shortcuts               []shortcutDef
-	flags                   []flagDef
-	providers               []providerDef
-	providerMu              sync.RWMutex
-	autocomplete            autocompleteRegistry
-	nativeProviders         map[string]*Provider
+	providerStreams    map[string]ProviderStreamSimpleFunc
+	providerOperations map[string]providerOperations
+	toolMu             sync.RWMutex
+	toolConn           *conn
+	// footer is the host's footer data (guarded by mu) and footerSubs the onBranchChange callbacks.
+	footer           footerSnapshot
+	footerSubs       footerSubscribers
+	toolFuncs        map[string]ToolFunc
+	toolPrepareFuncs map[string]ToolPrepareArgumentsFunc
+	toolBatches      toolBatchOrders
+	// requestStarts keeps the handlers of the requests that run extension code (startsInArrivalOrder) starting in the order the requests arrive: the tool_call requests of a parallel batch (agent-loop.ts:619-647, 820-837) and the event and command requests of concurrent emits (runner.ts:1096-1125).
+	requestStarts jsloop.Lane
+	// children are the child agent sessions this extension created and has not disposed (child_session.go).
+	children           childSessions
+	commandFuncs       map[string]CommandFunc
+	eventFuncs         map[int]EventFunc
+	shortcutFuncs      map[string]ShortcutFunc
+	rendererFuncs      map[string]RendererFunc
+	entryRendererFuncs map[string]EntryRendererFunc
+	// The kit forms of the message and entry renderers (D107); a customType
+	// has a line form or a view form.
+	messageViewRendererFuncs map[string]MessageViewRendererFunc
+	entryViewRendererFuncs   map[string]EntryViewRendererFunc
+	flagDefaults             map[string]any
+	shortcuts                []shortcutDef
+	flags                    []flagDef
+	providers                []providerDef
+	providerMu               sync.RWMutex
+	autocomplete             autocompleteRegistry
+	tuiAlt                   tuiAltRegistry
+	nativeProviders          map[string]*Provider
+	// bashOperations holds the BashOperations objects a user_bash reply named by handle until the host releases them.
+	bashOperationsMu        sync.Mutex
+	bashOperations          map[string]BashOperations
+	bashOperationsSeq       int
 	providerObjectCallbacks map[string]func(string, json.RawMessage) (any, error)
 	providerUpdates         map[string]func() error
 	providerObjectCache     map[string]*Provider
 	renderers               []rendererDef
 	entryRenderers          []rendererDef
 	markdownTransform       MarkdownTransformerFunc
+	ownsThinkingRuns        bool // guarded by toolMu
 
 	// toolRenderMu guards toolRenderers and toolRenderCards: render requests
 	// run on their own goroutines.
@@ -184,9 +222,11 @@ type Extension struct {
 	widthStopped    bool
 
 	// surfaceMu guards surfaces, the footer and header renderers keyed by the
-	// host method that installs them.
-	surfaceMu sync.Mutex
-	surfaces  map[string]*surfaceRenderer
+	// host method that installs them, and viewSurfaces, the latest widget,
+	// header and footer views (D107).
+	surfaceMu    sync.Mutex
+	surfaces     map[string]*surfaceRenderer
+	viewSurfaces map[string]*viewSurface
 
 	// oauthProviders holds the OAuth closures for providers registered with an
 	// "oauth" capability, keyed by provider name for oauth_* dispatch.
@@ -201,11 +241,14 @@ type Extension struct {
 	session sessionMirror
 
 	// session info from host (set after ready message).
-	mu            sync.RWMutex
-	sessionName   string
-	cwd           string
-	mode          string
-	hasUI         bool
+	mu          sync.RWMutex
+	sessionName string
+	cwd         string
+	mode        string
+	hasUI       bool
+	// frontend is set while a D91 frontend session draws (D107): views
+	// carry frontend-only annotations only then.
+	frontend      bool
 	width         int
 	height        int
 	model         string
@@ -214,23 +257,52 @@ type Extension struct {
 	// uiTheme is the host's theme palette from the state snapshot and
 	// theme_change notifies (upstream ctx.ui.theme).
 	uiTheme UITheme
+	// themeKnown reports that uiTheme holds a palette the host sent, so a later different palette is a change (themeFeed).
+	themeKnown bool
+	// toolsExpanded is the host's tool-expansion state from the state snapshot; expandedKnown reports that the host sent one (expandedFeed).
+	toolsExpanded bool
+	expandedKnown bool
+
+	// sourceInfo is the provenance the host stamped on this extension (ExtensionSourceInfo); sourceInfoKnown reports that the host sent one. Guarded by mu.
+	sourceInfo      SourceInfo
+	sourceInfoKnown bool
+
+	// loadedMu guards loadedFuncs, the OnLoaded handlers waiting for Run.
+	loadedMu    sync.Mutex
+	loadedFuncs []func(Context)
+	// loadedDone closes when the OnLoaded handlers returned; requests wait for it.
+	loadedDone <-chan struct{}
+
+	// themeFeed and expandedFeed deliver a change of the replicated theme and tool-expansion state to the handlers of OnThemeChange and OnToolsExpandedChange.
+	themeFeed    stateFeed[UITheme]
+	expandedFeed stateFeed[bool]
 
 	requestsMu sync.Mutex
-	requests   map[string]context.CancelFunc
+	requests   map[string]context.CancelCauseFunc
 	requestWG  sync.WaitGroup
 	runCtx     context.Context
 	runCancel  context.CancelFunc
 
 	// withSessions holds the withSession callbacks of replacement calls in flight.
 	withSessions withSessionRegistry
+	// setups holds the setup callbacks of NewSession calls in flight.
+	setups setupRegistry
+	// graphCallbacks holds the functions passed in options of session graph objects (DefaultResourceLoader's overrides).
+	graphCallbacks graphCallbackRegistry
 
 	modelStreamSeq atomic.Uint64
 	modelStreamsMu sync.RWMutex
 	modelStreams   map[string]*ModelEventStream
+	// modelStreamCallbacks holds the provider request callbacks of model streams in flight, by stream id (modelStreamsMu).
+	modelStreamCallbacks map[string]*modelStreamCallbacks
 
 	overlaySeq atomic.Uint64
 	overlaysMu sync.RWMutex
 	overlays   map[string]*remoteOverlay
+
+	editorSeq atomic.Uint64
+	editorMu  sync.Mutex
+	editor    *editorSession
 
 	// notifyMu guards notifyHandled and notifyChanged, which let a host-call
 	// goroutine wait for notifications that preceded the call result.
@@ -251,6 +323,7 @@ type Extension struct {
 	virtualModelUnregistrations []virtualModelRef
 	virtualModelRoutes          map[virtualModelKey]ModelRouteFunc
 	toolLoadoutFuncs            map[string]ToolPrepareLoadoutFunc
+	toolReachFuncs              map[string]ToolReachesToolsFunc
 
 	// The host's replicated state of the upstream 0.99.1 API, as raw JSON so each read decodes a copy the caller owns. It is guarded by mu.
 	settingsRaw   json.RawMessage
@@ -271,27 +344,70 @@ const (
 )
 
 type remoteOverlay struct {
-	mu         sync.Mutex
-	component  RemoteComponent
-	lastLines  []string
-	seq        uint64
-	closed     bool
-	lastRender time.Time
-	active     atomic.Bool
-	invalidate chan struct{}
-	input      chan string
-	stopCh     chan struct{}
-	stopped    chan struct{}
-	stopOnce   sync.Once
+	mu        sync.Mutex
+	component overlayComponent
+	// renderWidth maps a terminal width to a lines component's render width; nil renders at the terminal width.
+	renderWidth func(int) int
+	lastLines   []string
+	seq         uint64
+	closed      bool
+	lastRender  time.Time
+	active      atomic.Bool
+	invalidate  chan struct{}
+	input       chan overlayMessage
+	stopCh      chan struct{}
+	stopped     chan struct{}
+	stopOnce    sync.Once
+
+	// lastCaptures is the capturesViewportInput the last frame carried; a change alone sends a frame.
+	lastCaptures bool
+
+	// frontend reports whether a frontend draws; nil reports none.
+	frontend func() bool
+	// lastView and lastWidth are a view component's last frame, without its
+	// image bytes, and the width it went out for.
+	lastView  []byte
+	lastWidth int
+	// viewRefs are the images the last view frame references. refsMu guards
+	// it apart from mu, which a running handler holds.
+	refsMu   sync.Mutex
+	viewRefs []string
+	// forceView makes the next view frame go out even when it equals the
+	// last one, after the host evicted one of its images.
+	forceView atomic.Bool
+	// onHandle is ui.custom()'s onHandle option, called once when the host mounted the overlay; handleState is the host's last state of it
+	// (guarded by stateMu, apart from mu, which a running handler holds).
+	onHandle    OverlayHandleFunc
+	ext         *Extension
+	stateMu     sync.Mutex
+	handleState overlayHandleState
 }
 
-func newRemoteOverlay(component RemoteComponent) *remoteOverlay {
+// overlayComponent is a [RemoteComponent] or a [ViewComponent].
+type overlayComponent interface {
+	HandleInput(data string) (RemoteComponentResult, error)
+}
+
+// overlayMessage is one entry of an overlay's serial queue: terminal input,
+// a ui.view.event when event is set, or a ui.custom.mouse event when mouse
+// is set.
+type overlayMessage struct {
+	data  string
+	event *kit.Event
+	mouse *MouseEvent
+	// opened is the host's ui.custom.opened: the overlay is mounted and this is its state.
+	opened *overlayHandleState
+	// focus is the host's ui.custom.focus: the component lost (false) or regained (true) TUI focus.
+	focus *bool
+}
+
+func newRemoteOverlay(component overlayComponent) *remoteOverlay {
 	return &remoteOverlay{component: component}
 }
 
 func (o *remoteOverlay) start(conn *conn, key string, width func() int) (err error) {
 	o.invalidate = make(chan struct{}, 1)
-	o.input = make(chan string, 64)
+	o.input = make(chan overlayMessage, 64)
 	o.stopCh = make(chan struct{})
 	o.active.Store(true)
 	if invalidator, ok := o.component.(RemoteComponentInvalidator); ok {
@@ -313,11 +429,11 @@ func (o *remoteOverlay) start(conn *conn, key string, width func() int) (err err
 		defer close(o.stopped)
 		for o.active.Load() {
 			select {
-			case data := <-o.input:
+			case message := <-o.input:
 				if !o.active.Load() {
 					return
 				}
-				o.handleInput(conn, key, data, width())
+				o.handleMessage(conn, key, message, width())
 			case <-o.invalidate:
 				if !o.active.Load() {
 					return
@@ -363,12 +479,31 @@ func (o *remoteOverlay) requestRender() {
 	}
 }
 
-func (o *remoteOverlay) enqueueInput(conn *conn, key, data string) {
+// resendIfReferences renders a view component again, bypassing dedup, when
+// its last frame references an evicted image.
+func (o *remoteOverlay) resendIfReferences(evicted map[string]struct{}) {
+	o.refsMu.Lock()
+	hit := false
+	for _, ref := range o.viewRefs {
+		if _, ok := evicted[ref]; ok {
+			hit = true
+			break
+		}
+	}
+	o.refsMu.Unlock()
+	if hit {
+		o.forceView.Store(true)
+		o.requestRender()
+	}
+}
+
+// enqueue queues input or a view event behind every message before it.
+func (o *remoteOverlay) enqueue(conn *conn, key string, message overlayMessage) {
 	if !o.active.Load() {
 		return
 	}
 	select {
-	case o.input <- data:
+	case o.input <- message:
 	default:
 		o.closeWithError(conn, key, errors.New("focused input queue is full"))
 	}
@@ -378,7 +513,11 @@ func (o *remoteOverlay) stop() bool {
 	o.active.Store(false)
 	if invalidator, ok := o.component.(RemoteComponentInvalidator); ok {
 		func() {
-			defer func() { _ = recover() }()
+			defer func() {
+				if r := recover(); r != nil {
+					reportRecoveredPanic("a component's SetInvalidate(nil)", r)
+				}
+			}()
 			invalidator.SetInvalidate(nil)
 		}()
 	}
@@ -406,19 +545,58 @@ func (o *remoteOverlay) closeWithError(conn *conn, key string, err error) {
 	_ = conn.notify("ui.custom.close", map[string]any{"key": key, "error": err.Error()})
 }
 
-func (o *remoteOverlay) handleInput(conn *conn, key, data string, width int) {
+// handleMessage runs HandleInput for input, HandleViewEvent for a view
+// event or HandleMouse for a mouse event, and closes or renders as the
+// result says. A component without the handler ignores the message.
+func (o *remoteOverlay) handleMessage(conn *conn, key string, message overlayMessage, width int) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	what := "input"
+	switch {
+	case message.event != nil:
+		what = "view event"
+	case message.mouse != nil:
+		what = "mouse"
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil && !o.closed {
 			o.closed = true
-			_ = conn.notify("ui.custom.close", map[string]any{"key": key, "error": fmt.Sprintf("focused input panicked: %v", recovered)})
+			_ = conn.notify("ui.custom.close", map[string]any{"key": key, "error": fmt.Sprintf("focused %s panicked: %v", what, recovered)})
 		}
 	}()
 	if o.closed {
 		return
 	}
-	result, err := o.component.HandleInput(data)
+	if message.opened != nil {
+		o.applyHandleState(*message.opened)
+		if o.onHandle != nil {
+			o.onHandle(&OverlayHandle{ext: o.ext, key: key, overlay: o})
+		}
+		return
+	}
+	if message.focus != nil {
+		o.applyFocus(*message.focus)
+		_ = o.renderLocked(conn, key, width)
+		return
+	}
+	var result RemoteComponentResult
+	var err error
+	switch {
+	case message.event != nil:
+		handler, ok := o.component.(ViewEventHandler)
+		if !ok {
+			return
+		}
+		result, err = handler.HandleViewEvent(*message.event)
+	case message.mouse != nil:
+		handler, ok := o.component.(MouseHandler)
+		if !ok {
+			return
+		}
+		result, err = handler.HandleMouse(*message.mouse)
+	default:
+		result, err = o.component.HandleInput(message.data)
+	}
 	if err != nil {
 		o.closed = true
 		_ = conn.notify("ui.custom.close", map[string]any{"key": key, "error": err.Error()})
@@ -430,6 +608,11 @@ func (o *remoteOverlay) handleInput(conn *conn, key, data string, width int) {
 		if err := conn.notify("ui.custom.close", map[string]any{"key": key, "result": result.Value}); err != nil {
 			_ = conn.notify("ui.custom.close", map[string]any{"key": key, "error": "encode focused result: " + err.Error()})
 		}
+		return
+	}
+	if message.mouse != nil && (message.mouse.Type == MouseMove || message.mouse.Type == MouseRelease) {
+		// Pi's renderer draws again after press, click, drag and wheel only
+		// (tui-alt-screen.ts applyMouseDispatchResult).
 		return
 	}
 	_ = o.renderLocked(conn, key, width)
@@ -450,36 +633,99 @@ func (o *remoteOverlay) renderLocked(conn *conn, key string, width int) error {
 	if o.closed {
 		return nil
 	}
-	lines := o.component.Render(width)
+	switch component := o.component.(type) {
+	case ViewComponent:
+		return o.renderViewLocked(conn, key, width, component)
+	case RemoteComponent:
+		renderWidth := width
+		if o.renderWidth != nil {
+			renderWidth = o.renderWidth(width)
+		}
+		lines := component.Render(renderWidth)
+		o.lastRender = time.Now()
+		captures := capturesViewportInput(component)
+		if slices.Equal(lines, o.lastLines) && captures == o.lastCaptures {
+			return nil
+		}
+		o.lastLines = append(o.lastLines[:0], lines...)
+		o.lastCaptures = captures
+		o.seq++
+		return conn.notify("ui.custom.render", o.frameArgs(map[string]any{"key": key, "lines": lines, "width": width, "seq": o.seq}))
+	}
+	return nil
+}
+
+// renderViewLocked sends a view frame: the view with no lines key, under the
+// lines frames' throttle and seq. A frame equal to the last one, without
+// image bytes, at the same width is not sent unless it has images the
+// connection has not sent or the host evicted one of its images.
+func (o *remoteOverlay) renderViewLocked(conn *conn, key string, width int, component ViewComponent) error {
+	view := component.View(width)
 	o.lastRender = time.Now()
-	if slices.Equal(lines, o.lastLines) {
+	encoded, err := kitwire.Encode(view, o.frontend != nil && o.frontend())
+	if err != nil {
+		return err
+	}
+	force := o.forceView.Swap(false)
+	captures := capturesViewportInput(component)
+	if !force && o.lastView != nil && width == o.lastWidth && captures == o.lastCaptures && bytes.Equal(encoded.View, o.lastView) && len(conn.images.unsent(encoded.Images)) == 0 {
 		return nil
 	}
-	o.lastLines = append(o.lastLines[:0], lines...)
+	o.lastView = encoded.View
+	o.lastCaptures = captures
+	o.lastWidth = width
+	refs := make([]string, len(encoded.Images))
+	for i, image := range encoded.Images {
+		refs[i] = image.Ref
+	}
+	o.refsMu.Lock()
+	o.viewRefs = refs
+	o.refsMu.Unlock()
 	o.seq++
-	return conn.notify("ui.custom.render", map[string]any{"key": key, "lines": lines, "width": width, "seq": o.seq})
+	return sendView(conn, encoded, func(view json.RawMessage) error {
+		return conn.notify("ui.custom.render", o.frameArgs(map[string]any{"key": key, "width": width, "seq": o.seq, "view": view}))
+	})
+}
+
+// frameArgs marks a frame of a component that takes the mouse, which the
+// host then hands mouse events inside its bounds, and of one that captures
+// the viewport's input (ViewportInputCapturer), as of when the frame is drawn.
+func (o *remoteOverlay) frameArgs(args map[string]any) map[string]any {
+	if _, ok := o.component.(MouseHandler); ok {
+		args["mouse"] = true
+	}
+	if capturesViewportInput(o.component) {
+		args["capturesViewportInput"] = true
+	}
+	return args
 }
 
 // New creates a new extension with the given name.
 // The name must match the identity of the selected Package, Piglet, or exact path.
 func New(name string) *Extension {
 	return &Extension{
-		name:               name,
-		toolFuncs:          make(map[string]ToolFunc),
-		toolPrepareFuncs:   make(map[string]ToolPrepareArgumentsFunc),
-		commandFuncs:       make(map[string]CommandFunc),
-		commandCompletions: make(map[string]ArgumentCompletionsFunc),
-		eventFuncs:         make(map[int]EventFunc),
-		shortcutFuncs:      make(map[string]ShortcutFunc),
-		rendererFuncs:      make(map[string]RendererFunc),
-		entryRendererFuncs: make(map[string]EntryRendererFunc),
-		flagDefaults:       make(map[string]any),
-		requests:           make(map[string]context.CancelFunc),
-		modelStreams:       make(map[string]*ModelEventStream),
-		overlays:           make(map[string]*remoteOverlay),
-		virtualModelRoutes: make(map[virtualModelKey]ModelRouteFunc),
-		toolLoadoutFuncs:   make(map[string]ToolPrepareLoadoutFunc),
-		executeUpdates:     make(map[string]func(AgentToolResult)),
+		name:                     name,
+		themeFeed:                stateFeed[UITheme]{what: "theme"},
+		expandedFeed:             stateFeed[bool]{what: "tools expanded"},
+		toolFuncs:                make(map[string]ToolFunc),
+		toolPrepareFuncs:         make(map[string]ToolPrepareArgumentsFunc),
+		commandFuncs:             make(map[string]CommandFunc),
+		commandCompletions:       make(map[string]ArgumentCompletionsFunc),
+		eventFuncs:               make(map[int]EventFunc),
+		shortcutFuncs:            make(map[string]ShortcutFunc),
+		rendererFuncs:            make(map[string]RendererFunc),
+		entryRendererFuncs:       make(map[string]EntryRendererFunc),
+		messageViewRendererFuncs: make(map[string]MessageViewRendererFunc),
+		entryViewRendererFuncs:   make(map[string]EntryViewRendererFunc),
+		flagDefaults:             make(map[string]any),
+		requests:                 make(map[string]context.CancelCauseFunc),
+		modelStreams:             make(map[string]*ModelEventStream),
+		modelStreamCallbacks:     make(map[string]*modelStreamCallbacks),
+		overlays:                 make(map[string]*remoteOverlay),
+		virtualModelRoutes:       make(map[virtualModelKey]ModelRouteFunc),
+		toolLoadoutFuncs:         make(map[string]ToolPrepareLoadoutFunc),
+		toolReachFuncs:           make(map[string]ToolReachesToolsFunc),
+		executeUpdates:           make(map[string]func(AgentToolResult)),
 	}
 }
 
@@ -556,20 +802,20 @@ func (e *Extension) ToolWithConstrainedSampling(name, description string, schema
 // Command registers a slash command (e.g. /hello).
 func (e *Extension) Command(name, description string, handler CommandFunc) {
 	e.validateCommand(name, handler != nil)
-	e.commands = append(e.commands, cmdDef{
-		Name:        name,
-		Description: description,
+	decl := cmdDef{Name: name, Description: description}
+	e.declare(registerMsg{Commands: []cmdDef{decl}}, func() {
+		e.commands = append(e.commands, decl)
+		e.commandFuncs[name] = handler
 	})
-	e.commandFuncs[name] = handler
 }
 
 // Shortcut registers a keyboard shortcut handler (e.g. "ctrl+shift+s").
 func (e *Extension) Shortcut(key, description string, handler ShortcutFunc) {
-	e.shortcuts = append(e.shortcuts, shortcutDef{
-		Key:         key,
-		Description: description,
+	decl := shortcutDef{Key: key, Description: description}
+	e.declare(registerMsg{Shortcuts: []shortcutDef{decl}}, func() {
+		e.shortcuts = append(e.shortcuts, decl)
+		e.shortcutFuncs[key] = handler
 	})
-	e.shortcutFuncs[key] = handler
 }
 
 // Flag registers a CLI flag declaration for the extension.
@@ -580,13 +826,15 @@ func (e *Extension) Flag(name string, options FlagOptions) {
 		Type:        string(options.Type),
 	}
 	if options.Default != nil {
-		data, _ := json.Marshal(options.Default)
+		data, _ := json.MarshalJS(options.Default)
 		def.Default = data
 	}
-	e.flags = append(e.flags, def)
-	if e.flagDefaults[name] == nil {
-		e.flagDefaults[name] = options.Default
-	}
+	e.declare(registerMsg{Flags: []flagDef{def}}, func() {
+		e.flags = append(e.flags, def)
+		if e.flagDefaults[name] == nil {
+			e.flagDefaults[name] = options.Default
+		}
+	})
 }
 
 // RegisterProvider registers or overrides a model provider. When config carries
@@ -654,7 +902,7 @@ func (e *Extension) takeProviderDef(name string, config ProviderConfig) (provide
 			config = cfg
 		}
 	}
-	data, err := json.Marshal(config)
+	data, err := json.MarshalJS(config)
 	return providerDef{Name: name, Config: data, StreamSimple: streaming, ImageAPIs: imageAPIs, ClassifierAPIs: classifierAPIs}, err
 }
 
@@ -724,16 +972,43 @@ func (e *Extension) dropQueuedProvider(name string) {
 	e.providers = filtered
 }
 
-// MessageRenderer registers a custom message renderer.
+// MessageRenderer registers a custom message renderer. It replaces a
+// [Extension.MessageViewRenderer] for customType.
 func (e *Extension) MessageRenderer(customType string, handler RendererFunc) {
-	e.renderers = append(e.renderers, rendererDef{CustomType: customType})
-	e.rendererFuncs[customType] = handler
+	decl := rendererDef{CustomType: customType}
+	e.declare(registerMsg{Renderers: []rendererDef{decl}}, func() {
+		e.renderers = append(e.renderers, decl)
+		delete(e.messageViewRendererFuncs, customType)
+		e.rendererFuncs[customType] = handler
+	})
 }
 
-// EntryRenderer registers a custom session-entry renderer.
+// EntryRenderer registers a custom session-entry renderer. It replaces an
+// [Extension.EntryViewRenderer] for customType.
 func (e *Extension) EntryRenderer(customType string, handler EntryRendererFunc) {
-	e.entryRenderers = append(e.entryRenderers, rendererDef{CustomType: customType})
-	e.entryRendererFuncs[customType] = handler
+	decl := rendererDef{CustomType: customType}
+	e.declare(registerMsg{EntryRenderers: []rendererDef{decl}}, func() {
+		e.entryRenderers = append(e.entryRenderers, decl)
+		delete(e.entryViewRendererFuncs, customType)
+		e.entryRendererFuncs[customType] = handler
+	})
+}
+
+// declare applies a command, shortcut, flag or renderer registration and, once the extension is registered with the host, publishes it: Pi writes each into the extension's own Map and every runner getter reads it live (loader.ts), so a registration made after load must reach the host. It panics when the host refuses it, as registerTool does. A registration before Run waits in the register message.
+func (e *Extension) declare(late registerMsg, apply func()) {
+	e.toolMu.Lock()
+	defer e.toolMu.Unlock()
+	apply()
+	if e.toolConn == nil {
+		return
+	}
+	result, err := e.toolConn.call("registerDeclaration", late)
+	if err != nil {
+		panic(fmt.Errorf("registerDeclaration: %w", err))
+	}
+	if result != nil && result.Error != nil {
+		panic(fmt.Errorf("registerDeclaration: %s", result.Error.Message))
+	}
 }
 
 // MarkdownTransformer registers the extension's display-only Markdown
@@ -742,6 +1017,25 @@ func (e *Extension) EntryRenderer(customType string, handler EntryRendererFunc) 
 // transformers; a later registration replaces an earlier one.
 func (e *Extension) MarkdownTransformer(transformer MarkdownTransformerFunc) {
 	e.markdownTransform = transformer
+}
+
+// OwnThinkingRuns declares that this extension owns the thinking runs of
+// assistant messages (PiG-only), so a hidden or zero-row thinking run leaves
+// no blank spacer rows. Before Run registers the extension the value is only
+// recorded and the last call wins; the register payload carries it when true.
+// Once the extension runs the call goes to the host at once.
+// pig additive (D214)
+func (e *Extension) OwnThinkingRuns(enabled bool) {
+	e.toolMu.Lock()
+	e.ownsThinkingRuns = enabled
+	conn := e.toolConn
+	e.toolMu.Unlock()
+	if conn != nil {
+		result, err := hostCallFor(nil, conn, "ownThinkingRuns", map[string]bool{"enabled": enabled})
+		if err = callResultError(result, err); err != nil {
+			panic(fmt.Errorf("ownThinkingRuns: %w", err))
+		}
+	}
 }
 
 // OnSessionStart registers a handler for the session_start event.
@@ -824,28 +1118,51 @@ func (e *Extension) Run() error {
 // testing extensions without the PIG_EXT_SOCKET environment variable.
 func (e *Extension) RunWithSocket(sockPath string) error {
 	// The extension author or Pig host selects this local Unix socket; no network URL is resolved.
+	if started := takeHelperConn(sockPath); started != nil {
+		return e.runWithConn(started.nc, started, sockPath)
+	}
 	//nolint:gosec // G704 models arbitrary network input, not a required local IPC endpoint.
 	nc, err := net.Dial("unix", sockPath)
 	if err != nil {
 		return fmt.Errorf("connect to host: %w", err)
 	}
-	return e.RunWithConn(nc)
+	return e.runWithConn(nc, nil, sockPath)
 }
 
 // RunWithConn serves the extension over an already-connected net.Conn, with no
 // subprocess or socket. A fused Piglet Binary uses this to run the extension
 // inside the host process over an in-memory pipe. The connection is closed when the serve
 // loop ends. Mirrors RunWithSocket's handshake and main loop.
-func (e *Extension) RunWithConn(nc net.Conn) error {
+func (e *Extension) RunWithConn(nc net.Conn) error { return e.runWithConn(nc, nil, "") }
+
+// runWithConn is RunWithConn over started, the connection a helper called before Run dialled and already reads, or over a new one when started is nil.
+// sockPath is the socket nc was dialled on, empty for a connection that has none.
+func (e *Extension) runWithConn(nc net.Conn, started *conn, sockPath string) error {
 	defer func() { _ = nc.Close() }()
 
+	e.stopFactoryPump()
+	e.eventMu.Lock()
+	// One Extension serves one connection at a time: its connection, run context, tool lock and event bus are the running serve's, so a second serve would corrupt the first and hang its host's load.
+	if e.running {
+		e.eventMu.Unlock()
+		return errExtensionAlreadyServing
+	}
 	e.runCtx, e.runCancel = context.WithCancel(context.Background())
 	defer e.runCancel()
-	e.eventMu.Lock()
-	e.conn = newConn(nc)
+	if started != nil {
+		e.conn = started
+	} else {
+		e.conn = newConn(nc)
+	}
 	conn := e.conn
+	e.loading = nil
+	e.running = true
 	e.eventMu.Unlock()
-	conn.start()
+	if started == nil {
+		conn.start()
+	}
+	adoptHelperConn(conn, sockPath, e)
+	defer releaseHelperConn(conn)
 	defer e.resetEventBus()
 	// A node factory's pi.events.on runs before its runtime registers; a native listener subscribed before Run does the same.
 	if err := e.registerPendingListeners(conn); err != nil {
@@ -872,6 +1189,7 @@ func (e *Extension) RunWithConn(nc net.Conn) error {
 			Renderers:               e.renderers,
 			EntryRenderers:          e.entryRenderers,
 			MarkdownTransformer:     e.markdownTransform != nil,
+			OwnsThinkingRuns:        e.ownsThinkingRuns,
 			ToolRenderers:           e.toolRendererCount(),
 			McpServers:              e.mcpServerDecls,
 			VirtualModels:           e.virtualModelDecls,
@@ -881,6 +1199,10 @@ func (e *Extension) RunWithConn(nc net.Conn) error {
 		return fmt.Errorf("send register: %w", err)
 	}
 
+	// A shutdown the factory's pump read ends the run now, after the register frame, as one read below does.
+	if e.shutdownInFactory.Swap(false) {
+		return e.stopRequests()
+	}
 	// Wait for ready. A listener the Host dispatches to while the extension loads is served here, as a node runtime serves it during its factory.
 	var env envelope
 	for {
@@ -891,9 +1213,11 @@ func (e *Extension) RunWithConn(nc net.Conn) error {
 		}
 		if env.Type == msgRequest && env.Request != nil && env.Request.Method == methodEventsDispatch {
 			ctx, finish := e.armRequest(env.ID)
+			// env is the loop's: the next receive overwrites it while the handler runs.
+			dispatch := env
 			e.requestWG.Go(func() {
 				defer finish()
-				e.handleArmedRequest(env.ID, env.Request, ctx)
+				e.handleArmedRequest(dispatch.ID, dispatch.Request, ctx)
 			})
 			continue
 		}
@@ -905,16 +1229,21 @@ func (e *Extension) RunWithConn(nc net.Conn) error {
 		}
 		break
 	}
+	// A shutdown before ready ends the run as one after ready does: no error, because Pi's session shutdown never fails an extension (runner.ts emitSessionShutdownEvent) and the Node runtime returns. The register frame is already sent, and the listener dispatches read before the shutdown have been started and are answered by stopRequests.
+	if env.Type == msgShutdown {
+		return e.stopRequests()
+	}
 	if env.Type != msgReady || env.Ready == nil {
 		return fmt.Errorf("expected ready message, got %s", env.Type)
 	}
 	e.mu.Lock()
-	e.sessionName = env.Ready.SessionName
 	e.cwd = env.Ready.Cwd
 	e.mode = env.Ready.Mode
 	e.width = env.Ready.Width
 	e.height = env.Ready.Height
-	e.model = env.Ready.Model
+	if env.Ready.SourceInfo != nil {
+		e.sourceInfo, e.sourceInfoKnown = *env.Ready.SourceInfo, true
+	}
 	e.mu.Unlock()
 
 	// Process the initial State snapshot embedded in the Ready message.
@@ -937,6 +1266,9 @@ func (e *Extension) RunWithConn(nc net.Conn) error {
 	e.toolConn = conn
 	e.toolMu.Unlock()
 
+	// The factory's emits and the OnLoaded handlers run before the loop serves a request.
+	e.loadedDone = e.startLoaded()
+
 	// Main message loop.
 	return e.loop()
 }
@@ -945,13 +1277,24 @@ func (e *Extension) loop() error {
 	for env := range e.conn.incoming {
 		switch env.Type {
 		case msgRequest:
-			ctx, finish := e.armRequest(env.ID)
+			if env.Request != nil && env.Request.Stream != nil {
+				e.applyEventStream(env.Request)
+			}
+			ctx, scope := e.armRequestScope(env.ID)
 			if env.Request != nil && env.Request.Method == "tool_call" {
-				ctx.start = e.toolStarts.reserve()
+				ctx.start = e.toolBatches.reserve(env.Request.Batch)
+			}
+			if startsInArrivalOrder(env.Request) {
+				ctx.place = e.requestStarts.ReserveInto(&scope.place)
 			}
 			e.requestWG.Go(func() {
-				defer finish()
+				defer scope.end()
 				defer ctx.start.release()
+				defer ctx.place.Pass()
+				// A loop that was not started by Run (a test serving requests on its own connection) has no loaded gate.
+				if e.loadedDone != nil && (env.Request == nil || env.Request.Method != methodEventsDispatch) {
+					<-e.loadedDone
+				}
 				e.handleArmedRequest(env.ID, env.Request, ctx)
 			})
 		case msgCancel:
@@ -969,8 +1312,24 @@ func (e *Extension) loop() error {
 	return e.stopRequests()
 }
 
+// startsInArrivalOrder reports whether a request runs extension code whose start Pi orders by call order: a tool_call, an event or a command. Pi runs the handlers of concurrent emits and of a `Promise.all` batch on one thread, so the one that was asked first starts first (runner.ts:1096-1125, agent-loop.ts:619-647). Other requests (renders, provider streams, completions) hold no place, so a long one never holds a handler back.
+func startsInArrivalOrder(req *requestMsg) bool {
+	if req == nil {
+		return false
+	}
+	switch req.Method {
+	case "tool_call", "event", "command":
+		return true
+	}
+	return false
+}
+
 func (e *Extension) stopRequests() error {
 	e.stopWidthDeliveries()
+	e.themeFeed.stop()
+	e.expandedFeed.stop()
+	// The sessions end with the connection, as the host disposes them: no listener runs after it.
+	e.children.closeAll()
 	if e.runCancel != nil {
 		e.runCancel()
 	}
@@ -996,22 +1355,37 @@ func (e *Extension) stopRequests() error {
 	}
 }
 
+// requestScope is one request's lifetime: how to end it and, for a request that starts in arrival order, its place in requestStarts, held here so the place costs no allocation of its own.
+type requestScope struct {
+	e      *Extension
+	id     string
+	cancel context.CancelCauseFunc
+	place  jsloop.Place
+}
+
+func (s *requestScope) end() {
+	s.e.requestsMu.Lock()
+	delete(s.e.requests, s.id)
+	s.e.requestsMu.Unlock()
+	s.cancel(nil)
+}
+
 func (e *Extension) armRequest(id string) (Context, func()) {
+	ctx, scope := e.armRequestScope(id)
+	return ctx, scope.end
+}
+
+func (e *Extension) armRequestScope(id string) (Context, *requestScope) {
 	requestRoot := e.runCtx
 	if requestRoot == nil {
 		requestRoot = context.Background()
 	}
-	reqCtx, cancel := context.WithCancel(requestRoot)
+	reqCtx, cancel := context.WithCancelCause(requestRoot)
 	parent := e.conn.armParent(id, requestRoot, reqCtx)
 	e.requestsMu.Lock()
 	e.requests[id] = cancel
 	e.requestsMu.Unlock()
-	return Context{ext: e, requestID: id, parent: parent, ctx: reqCtx}, func() {
-		e.requestsMu.Lock()
-		delete(e.requests, id)
-		e.requestsMu.Unlock()
-		cancel()
-	}
+	return Context{ext: e, requestID: id, parent: parent, ctx: reqCtx}, &requestScope{e: e, id: id, cancel: cancel}
 }
 
 func (e *Extension) handleRequest(id string, req *requestMsg) {
@@ -1070,6 +1444,9 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 	case "provider_operation":
 		result, err := e.dispatchProviderOperation(ctx, req)
 		_ = e.conn.respond(id, result, err)
+	case requestUserBashExec:
+		result, err := e.dispatchUserBashExec(ctx, id, req)
+		_ = e.conn.respond(id, result, err)
 	case "provider_call", "provider_stream", "provider_sync":
 		result, err := e.dispatchProviderObject(ctx, req)
 		_ = e.conn.respond(id, result, err)
@@ -1079,6 +1456,10 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 	case methodOAuthLogin, methodOAuthRefresh, methodOAuthGetAPIKey,
 		methodOAuthCredentialStatus, methodOAuthStoreCredentials, methodOAuthDeleteCredentials:
 		e.dispatchOAuth(id, req)
+
+	case "tui.alt.cb":
+		result, err := e.dispatchTuiAlt(ctx, req.Args)
+		_ = e.conn.respond(id, result, err)
 
 	case "terminal_input":
 		e.dispatchTerminalInput(id, req)
@@ -1090,22 +1471,33 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 	case requestExecuteToolUpdate:
 		_ = e.conn.respond(id, nil, e.dispatchExecuteToolUpdate(req.Args))
 
+	case requestBuiltinToolCallback:
+		result, err := e.dispatchBuiltinToolCallback(req.Args)
+		_ = e.conn.respond(id, result, err)
+
+	case requestBuiltinToolExecData:
+		_ = e.conn.respond(id, nil, e.dispatchBuiltinExecData(req.Args))
+
 	case "tool_prepare_loadout":
 		result, err := e.dispatchPrepareLoadout(req.Tool, req.Args)
+		_ = e.conn.respond(id, result, err)
+
+	case "tool_reaches_tools":
+		result, err := e.dispatchReachesTools(req.Tool, req.Args)
 		_ = e.conn.respond(id, result, err)
 
 	case methodEventsDispatch:
 		e.dispatchEventBus(ctx, id, req)
 
 	case "tool_call":
-		e.toolMu.RLock()
-		handler, ok := e.toolFuncs[req.Tool]
-		e.toolMu.RUnlock()
+		handler, ok := e.toolHandler(req)
 		if !ok {
 			_ = e.conn.respond(id, nil, fmt.Errorf("unknown tool: %s", req.Tool))
 			return
 		}
 		ctx.toolCallID = req.ToolCallID
+		ctx.toolIndex = req.ToolCallIndex
+		ctx.toolInput = &req.Args
 		var params map[string]any
 		if len(req.Args) > 0 {
 			if err := json.Unmarshal(req.Args, &params); err != nil {
@@ -1114,15 +1506,15 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 			}
 		}
 		// agent-loop.ts:619-647: the handlers of a batch start in source order.
+		ctx.place.Pass()
 		ctx.start.begin()
 		result, err := handler(ctx, params)
-		_ = e.conn.respond(id, result, err)
+		// A handler whose dialog was answered before another's responds after it, as Pi's continuations run in the order of the answers.
+		ctx.start.respond(func() { _ = e.conn.respond(id, result, err) })
 
 	case "tool_prepare_arguments":
 		// agent-loop.ts:707-716: prepareToolCall runs the hook on the model's arguments and validates what it returns, so the host asks for it before tool_call.
-		e.toolMu.RLock()
-		prepare := e.toolPrepareFuncs[req.Tool]
-		e.toolMu.RUnlock()
+		prepare := e.toolPrepare(req)
 		if prepare == nil {
 			_ = e.conn.respond(id, nil, fmt.Errorf("tool %s has no prepareArguments", req.Tool))
 			return
@@ -1140,8 +1532,17 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 	case requestWithSession:
 		_ = e.conn.respond(id, nil, e.dispatchWithSession(ctx, req.Args))
 
+	case requestSetup:
+		_ = e.conn.respond(id, nil, e.dispatchSetup(ctx, req.Args))
+
+	case requestGraphCallback:
+		result, err := e.dispatchGraphCallback(req.Args)
+		_ = e.conn.respond(id, result, err)
+
 	case "command":
+		e.toolMu.RLock()
 		handler, ok := e.commandFuncs[req.Tool]
+		e.toolMu.RUnlock()
 		if !ok {
 			_ = e.conn.respond(id, nil, fmt.Errorf("unknown command: %s", req.Tool))
 			return
@@ -1150,6 +1551,8 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 		if len(req.Args) > 0 {
 			_ = json.Unmarshal(req.Args, &args)
 		}
+		// runner.ts:1096-1125: the handlers of concurrent requests start in arrival order.
+		ctx.place.Pass()
 		err := handler(ctx, args)
 		_ = e.conn.respond(id, nil, err)
 
@@ -1161,9 +1564,22 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 			_ = e.conn.respond(id, nil, fmt.Errorf("unknown event handler %d for %s", req.HandlerID, req.Event))
 			return
 		}
-		var data map[string]any
-		if len(req.Args) > 0 {
-			_ = json.Unmarshal(req.Args, &data)
+		var data, master map[string]any
+		if req.Stream != nil {
+			if req.streamErr != nil {
+				_ = e.conn.respond(id, nil, req.streamErr)
+				return
+			}
+			data = req.streamData
+		} else if len(req.Args) > 0 {
+			if e.conn.fused {
+				// Fused extensions share one decode of a payload; each handler gets its own copy.
+				var release func()
+				data, master, release = fusedEventArgs.decodeWithMaster(req.Args)
+				defer release()
+			} else {
+				_ = json.Unmarshal(req.Args, &data)
+			}
 		}
 		if req.Event == "agent_before_settle" || req.Event == "turn_end" {
 			boundaryData = data
@@ -1178,18 +1594,33 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 		if req.Event == "before_agent_start" {
 			var err error
 			promptOptions, err = preparePromptOptions(req.Args, data)
+			if err == nil {
+				ctx.systemPrompt, err = newSystemPrompt(ctx, promptOptions, data["systemPrompt"])
+			}
 			if err != nil {
 				_ = e.conn.respond(id, nil, err)
 				return
 			}
+			data["systemPrompt"] = ctx.systemPrompt
 		}
 		snapshot := snapshotContextMessages(req.Event, data)
+		// runner.ts:1096-1125: the handlers of concurrent emits start in arrival order.
+		ctx.place.Pass()
 		result, err := handler(ctx, data)
 		if req.Event == "user_bash" && err == nil {
-			result, err = userBashEventResult(result)
+			result, err = e.userBashEventResult(result)
 		}
 		if snapshot != nil && err == nil {
-			result = contextEventResult(data, snapshot, result)
+			result = contextEventResult(data, snapshot, result, func() []any {
+				if master == nil {
+					// The handler may have edited its copy: decode the payload again.
+					if json.Unmarshal(req.Args, &master) != nil {
+						return nil
+					}
+				}
+				messages, _ := master["messages"].([]any)
+				return messages
+			})
 		}
 		if req.Event == "before_agent_start" {
 			result = map[string]any{"_pigPromptSections": promptOptions["sections"], "_pigPromptSelectedTools": promptOptions["selectedTools"], "_pigPromptOptions": promptOptions, "_pigPromptResult": result}
@@ -1212,7 +1643,9 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 		_ = e.conn.respond(id, result, err)
 
 	case "shortcut":
+		e.toolMu.RLock()
 		handler, ok := e.shortcutFuncs[req.Tool]
+		e.toolMu.RUnlock()
 		if !ok {
 			_ = e.conn.respond(id, nil, fmt.Errorf("unknown shortcut: %s", req.Tool))
 			return
@@ -1221,8 +1654,11 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 		_ = e.conn.respond(id, nil, err)
 
 	case "render_message":
+		e.toolMu.RLock()
 		handler, ok := e.rendererFuncs[req.Tool]
-		if !ok {
+		viewHandler, viewOK := e.messageViewRendererFuncs[req.Tool]
+		e.toolMu.RUnlock()
+		if !ok && !viewOK {
 			_ = e.conn.respond(id, nil, fmt.Errorf("unknown renderer: %s", req.Tool))
 			return
 		}
@@ -1234,12 +1670,20 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 		if len(req.Args) > 0 {
 			_ = json.Unmarshal(req.Args, &payload)
 		}
+		if viewOK {
+			view, err := viewHandler(ctx, payload.Message, payload.Options, payload.Width)
+			e.respondView(id, view, err)
+			return
+		}
 		lines, err := handler(ctx, payload.Message, payload.Options, payload.Width)
 		_ = e.conn.respond(id, map[string]any{"lines": lines}, err)
 
 	case "render_entry":
+		e.toolMu.RLock()
 		handler, ok := e.entryRendererFuncs[req.Tool]
-		if !ok {
+		viewHandler, viewOK := e.entryViewRendererFuncs[req.Tool]
+		e.toolMu.RUnlock()
+		if !ok && !viewOK {
 			_ = e.conn.respond(id, nil, fmt.Errorf("unknown entry renderer: %s", req.Tool))
 			return
 		}
@@ -1251,19 +1695,32 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 		if len(req.Args) > 0 {
 			_ = json.Unmarshal(req.Args, &payload)
 		}
+		if viewOK {
+			view, err := viewHandler(ctx, payload.Entry, payload.Options, payload.Width)
+			e.respondView(id, view, err)
+			return
+		}
 		lines, err := handler(ctx, payload.Entry, payload.Options, payload.Width)
 		_ = e.conn.respond(id, map[string]any{"lines": lines}, err)
 
 	case "markdown_transform":
 		_ = e.conn.respond(id, e.transformMarkdown(req.Args), nil)
 
+	case "model_stream_callback":
+		result, err := e.modelStreamCallback(ctx.ctx, req.Args)
+		_ = e.conn.respond(id, result, err)
+
 	case "command_argument_completions":
 		items, err := e.commandArgumentCompletions(req.Tool, req.Args)
 		_ = e.conn.respond(id, items, err)
 
 	case "render_tool":
-		lines, err := e.renderTool(ctx, req.Tool, req.Args)
-		_ = e.conn.respond(id, map[string]any{"lines": lines}, err)
+		rendered, err := e.renderTool(ctx, req.Tool, req.Args)
+		if rendered.view != nil {
+			e.respondView(id, *rendered.view, err)
+			return
+		}
+		_ = e.conn.respond(id, map[string]any{"lines": rendered.lines}, err)
 
 	case "resolve_tool_renderers":
 		resolved, err := e.resolveToolRenderers(req.Args)
@@ -1289,11 +1746,18 @@ func (e *Extension) transformMarkdown(args json.RawMessage) (result any) {
 		return nil
 	}
 	defer func() {
+		// upstream: coding-agent/src/modes/interactive/components/markdown-transform.ts:applyMarkdownTransformers
 		if recover() != nil {
 			result = nil
 		}
 	}()
 	return e.markdownTransform(payload.Markdown, payload.Context)
+}
+
+// reportRecoveredPanic writes a panic that an isolation boundary recovered to
+// stderr, which the host captures in the extension's log.
+func reportRecoveredPanic(where string, recovered any) {
+	fmt.Fprintf(os.Stderr, "extension: recovered from panic in %s: %v\n%s\n", where, recovered, debug.Stack())
 }
 
 // reportHostCallFailure writes a failed host call the caller cannot return to
@@ -1351,12 +1815,32 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 		return
 	}
 	switch env.Notify.Method {
+	case notifyChildSessionEvent:
+		e.children.deliver(env.Notify.Args)
 	case notifyRunSignal:
 		e.run.apply(env.Notify.Args)
+	case notifyInvalidate:
+		var payload struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(env.Notify.Args, &payload) == nil && payload.Message != "" {
+			e.stale.CompareAndSwap(nil, &payload.Message)
+		}
 	case notifyEventsRelease:
 		e.releaseEventListener(env.Notify.Args)
 	case "tool_render_release":
 		e.releaseToolRenderCard(env.Notify.Args)
+	case notifyBashOperationsRelease:
+		var release struct {
+			Handle string `json:"handle"`
+		}
+		if json.Unmarshal(env.Notify.Args, &release) == nil {
+			e.bashOperationsMu.Lock()
+			delete(e.bashOperations, release.Handle)
+			e.bashOperationsMu.Unlock()
+		}
+	case "provider_superseded":
+		// Another extension registered this provider after this one. Pi keeps one effective registration per provider and merges a later registration's defined values over it (model-runtime.ts:921-940), and this SDK's registration is a snapshot no other process merges, so the host's merged registration keeps calling this extension for every streamSimple, image, classifier and OAuth callback the later registration did not redefine. The extension therefore keeps them; unregisterProvider and teardown release them.
 	case "provider_release":
 		var release struct {
 			Key string `json:"key"`
@@ -1397,12 +1881,22 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 	case "state_update":
 		var payload struct {
 			State struct {
-				HasUI      *bool           `json:"hasUI"`
-				Model      map[string]any  `json:"model"`
-				Session    json.RawMessage `json:"session"`
-				Theme      json.RawMessage `json:"theme"`
-				Settings   json.RawMessage `json:"settings"`
-				McpServers json.RawMessage `json:"mcpServers"`
+				HasUI *bool `json:"hasUI"`
+				// Frontend is omitted by the host while false, and every
+				// state is a full snapshot, so an absent value clears it.
+				Frontend bool            `json:"frontend"`
+				Model    json.RawMessage `json:"model"`
+				Session  json.RawMessage `json:"session"`
+				Theme    json.RawMessage `json:"theme"`
+				// Keybindings is the host's effective keybinding table and TerminalCapabilities its resolved
+				// terminal capabilities; the SDK installs them as pi-tui's global state, as the Node runtime does.
+				Keybindings          json.RawMessage `json:"keybindings"`
+				TerminalCapabilities json.RawMessage `json:"terminalCapabilities"`
+				// ToolsExpanded is always sent by the host; a state without it (a test host) changes nothing.
+				ToolsExpanded *bool           `json:"toolsExpanded"`
+				Settings      json.RawMessage `json:"settings"`
+				McpServers    json.RawMessage `json:"mcpServers"`
+				FooterData    *footerDataWire `json:"footerData"`
 			} `json:"state"`
 		}
 		if err := json.Unmarshal(env.Notify.Args, &payload); err != nil {
@@ -1411,6 +1905,7 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 		// Session replication: apply incremental entries before any handler
 		// runs, so GetBranch()/GetEntries() are current and local.
 		var sessionState struct {
+			SessionName string `json:"sessionName"`
 			SessionFile string `json:"sessionFile"`
 		}
 		if len(payload.State.Session) > 0 {
@@ -1422,31 +1917,35 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 		if payload.State.HasUI != nil {
 			e.hasUI = *payload.State.HasUI
 		}
+		e.frontend = payload.State.Frontend
 		if sessionState.SessionFile != "" {
 			e.sessionFile = sessionState.SessionFile
 		}
-		if theme, ok := decodeUITheme(payload.State.Theme); ok {
-			e.uiTheme = theme
+		// Every session snapshot carries the name; the empty string is the host's carrier for a session with no name, so it clears the replica.
+		if len(payload.State.Session) > 0 {
+			e.sessionName = sessionState.SessionName
 		}
+		if theme, ok := decodeUITheme(payload.State.Theme); ok {
+			e.setUITheme(theme)
+			setHostTheme(theme, payload.State.Theme)
+		}
+		if payload.State.ToolsExpanded != nil {
+			e.setToolsExpanded(*payload.State.ToolsExpanded)
+		}
+		applyHostTuiState(payload.State.Keybindings, payload.State.TerminalCapabilities)
 		e.applyReplicatedState(payload.State.Settings, payload.State.McpServers, 2*seq)
-		defer e.mu.Unlock()
-		if m := payload.State.Model; m != nil {
-			if id, ok := m["id"].(string); ok && id != "" {
-				e.model = id
-			} else if name, ok := m["name"].(string); ok && name != "" {
-				e.model = name
+		footerChanged, branchChanged := e.applyFooterData(payload.State.FooterData)
+		defer func() {
+			e.mu.Unlock()
+			if footerChanged {
+				e.notifyFooterData(branchChanged)
 			}
-			// Extract provider ID from nested {"provider": {"id": "..."}}
-			// or flat {"provider": "..."}.
-			if prov, ok := m["provider"]; ok {
-				switch v := prov.(type) {
-				case map[string]any:
-					if pid, ok := v["id"].(string); ok {
-						e.modelProvider = pid
-					}
-				case string:
-					e.modelProvider = v
-				}
+		}()
+		// An absent model key leaves the replica, an explicit null clears it (the Session has no model), and an object replaces it.
+		if len(payload.State.Model) > 0 {
+			var model map[string]any
+			if json.Unmarshal(payload.State.Model, &model) == nil {
+				e.model, e.modelProvider = modelIdentity(model)
 			}
 		}
 	case "theme_change":
@@ -1462,7 +1961,8 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 			theme, _ = decodeUITheme(json.RawMessage(`{}`))
 		}
 		e.mu.Lock()
-		e.uiTheme = theme
+		e.setUITheme(theme)
+		setHostTheme(theme, args)
 		e.mu.Unlock()
 	case "width_change":
 		var payload struct {
@@ -1477,6 +1977,7 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 			e.mu.Unlock()
 			e.notifyWidthChange(payload.Width)
 			e.refreshSurfaces()
+			e.refreshEditor()
 			e.overlaysMu.RLock()
 			overlays := make(map[string]*remoteOverlay, len(e.overlays))
 			maps.Copy(overlays, e.overlays)
@@ -1497,10 +1998,12 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 			e.height = payload.Height
 			e.mu.Unlock()
 		}
-	case "ui.custom.input":
+	case "ui.editor.input", "ui.editor.mouse", "ui.editor.setText", "ui.editor.insertText", "ui.editor.addToHistory", "ui.editor.configure", "ui.editor.invalidate", "ui.editor.closed":
+		e.handleEditorNotify(env.Notify.Method, env.Notify.Args)
+	case "ui.custom.opened":
 		var payload struct {
-			Key  string `json:"key"`
-			Data string `json:"data"`
+			Key string `json:"key"`
+			overlayHandleState
 		}
 		if err := json.Unmarshal(env.Notify.Args, &payload); err != nil || payload.Key == "" {
 			return
@@ -1509,8 +2012,58 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 		overlay := e.overlays[payload.Key]
 		e.overlaysMu.RUnlock()
 		if overlay != nil {
-			overlay.enqueueInput(e.conn, payload.Key, payload.Data)
+			overlay.enqueue(e.conn, payload.Key, overlayMessage{opened: &payload.overlayHandleState})
 		}
+	case "ui.custom.focus":
+		var payload struct {
+			Key     string `json:"key"`
+			Focused bool   `json:"focused"`
+		}
+		if err := json.Unmarshal(env.Notify.Args, &payload); err != nil || payload.Key == "" {
+			return
+		}
+		e.overlaysMu.RLock()
+		overlay := e.overlays[payload.Key]
+		e.overlaysMu.RUnlock()
+		if overlay != nil {
+			overlay.enqueue(e.conn, payload.Key, overlayMessage{focus: &payload.Focused})
+		}
+	case "ui.custom.input":
+		var payload struct {
+			Key   string              `json:"key"`
+			Data  string              `json:"data"`
+			State *overlayHandleState `json:"state"`
+		}
+		if err := json.Unmarshal(env.Notify.Args, &payload); err != nil || payload.Key == "" {
+			return
+		}
+		e.overlaysMu.RLock()
+		overlay := e.overlays[payload.Key]
+		e.overlaysMu.RUnlock()
+		if overlay != nil {
+			if payload.State != nil {
+				overlay.applyHandleState(*payload.State)
+			}
+			overlay.enqueue(e.conn, payload.Key, overlayMessage{data: payload.Data})
+		}
+	case notifyUICustomMouse:
+		var payload struct {
+			Key   string     `json:"key"`
+			Event MouseEvent `json:"event"`
+		}
+		if err := json.Unmarshal(env.Notify.Args, &payload); err != nil || payload.Key == "" {
+			return
+		}
+		e.overlaysMu.RLock()
+		overlay := e.overlays[payload.Key]
+		e.overlaysMu.RUnlock()
+		if overlay != nil {
+			overlay.enqueue(e.conn, payload.Key, overlayMessage{mouse: &payload.Event})
+		}
+	case notifyUIViewEvent:
+		e.viewEvent(env.Notify.Args)
+	case notifyUIViewEvicted:
+		e.viewImagesEvicted(env.Notify.Args)
 	}
 }
 
@@ -1529,20 +2082,24 @@ func (e *Extension) cancelRequest(env envelope) {
 		e.conn.cancelParentCalls(id)
 	}
 	if cancel != nil {
-		cancel()
+		var cause error
+		if env.Cancel != nil && env.Cancel.Reason != "" {
+			cause = cancelReason(env.Cancel.Reason)
+		}
+		cancel(cause)
 	}
 }
 
 func (e *Extension) cancelAllRequests() {
 	e.requestsMu.Lock()
-	cancels := make([]context.CancelFunc, 0, len(e.requests))
+	cancels := make([]context.CancelCauseFunc, 0, len(e.requests))
 	for _, cancel := range e.requests {
 		cancels = append(cancels, cancel)
 	}
-	e.requests = make(map[string]context.CancelFunc)
+	e.requests = make(map[string]context.CancelCauseFunc)
 	e.requestsMu.Unlock()
 	for _, cancel := range cancels {
-		cancel()
+		cancel(nil)
 	}
 }
 
@@ -1601,6 +2158,7 @@ func NewToolError(content string) *ToolError {
 type ToolResult struct {
 	Content string
 	Images  []ImageContent
+	// pig additive (D160): the collapsed-view preview of a tool result.
 	Preview string
 	Details any
 	// StructuredContent is upstream AgentToolResult.structuredContent: the machine-readable result matching the tool's OutputSchema, for programmatic callers. It is not sent to the model. Nil leaves it unset.
@@ -1615,6 +2173,15 @@ type ToolResult struct {
 type ImageContent struct {
 	Data     string `json:"data"`
 	MimeType string `json:"mimeType"`
+}
+
+// MarshalJSON writes the image block with its type, as upstream's ImageContent carries it.
+func (c ImageContent) MarshalJSON() ([]byte, error) {
+	return json.MarshalJS(struct {
+		Type     string `json:"type"`
+		Data     string `json:"data"`
+		MimeType string `json:"mimeType"`
+	}{"image", c.Data, c.MimeType})
 }
 
 // MarshalJSON writes the wire tool result. Content stays a string unless the
@@ -1637,7 +2204,7 @@ func (r ToolResult) MarshalJSON() ([]byte, error) {
 		}
 		content = blocks
 	}
-	return json.Marshal(struct {
+	return json.MarshalJS(struct {
 		Content           any    `json:"content"`
 		Preview           string `json:"preview,omitempty"`
 		Details           any    `json:"details,omitempty"`
@@ -1695,10 +2262,12 @@ func (e *Extension) dispatchTerminalInput(id string, req *requestMsg) {
 }
 
 // runTerminalInputHandler isolates one handler so a panic cannot swallow the
-// keystroke or take down the extension; a panic yields no verdict.
+// keystroke or take down the extension; a panic is reported on stderr, which
+// the host captures in the extension's log, and yields no verdict.
 func runTerminalInputHandler(handler TerminalInputHandler, data string) (result TerminalInputResult) {
 	defer func() {
-		if recover() != nil {
+		if r := recover(); r != nil {
+			reportRecoveredPanic("a terminal input handler", r)
 			result = TerminalInputResult{}
 		}
 	}()
@@ -1833,6 +2402,26 @@ func (e *Extension) subscribeSessionLog() error {
 	}
 }
 
+// setUITheme replaces the replicated theme and delivers it to the OnThemeChange handlers when it differs from the one before; the caller holds e.mu.
+func (e *Extension) setUITheme(theme UITheme) {
+	changed := e.themeKnown && !reflect.DeepEqual(e.uiTheme, theme)
+	e.uiTheme = theme
+	e.themeKnown = true
+	if changed {
+		e.themeFeed.publish(e, theme)
+	}
+}
+
+// setToolsExpanded replaces the replicated tool-expansion state and delivers it to the OnToolsExpandedChange handlers when it differs from the one before; the caller holds e.mu.
+func (e *Extension) setToolsExpanded(expanded bool) {
+	changed := e.expandedKnown && e.toolsExpanded != expanded
+	e.toolsExpanded = expanded
+	e.expandedKnown = true
+	if changed {
+		e.expandedFeed.publish(e, expanded)
+	}
+}
+
 // widthDelivery is one width and the handlers subscribed when it arrived.
 type widthDelivery struct {
 	width int
@@ -1906,13 +2495,13 @@ type toolCallInput struct {
 }
 
 func newToolCallInput(input any, source json.RawMessage) *toolCallInput {
-	before, _ := json.Marshal(input)
+	before, _ := json.MarshalJS(input)
 	return &toolCallInput{input: input, source: source, before: before}
 }
 
 // edit returns the input as JSON when the handler left its members different from the ones it received. A retained member keeps the place it had, as an assignment to a JavaScript object leaves it.
 func (t *toolCallInput) edit() (any, bool) {
-	after, err := json.Marshal(t.input)
+	after, err := json.MarshalJS(t.input)
 	if err != nil || bytes.Equal(after, t.before) {
 		return nil, false
 	}

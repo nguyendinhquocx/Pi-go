@@ -20,7 +20,7 @@ func TestConfiguredDefaultStreamFn(t *testing.T) {
 				return doneStream(textMessage("fallback")), nil
 			})
 			t.Cleanup(func() { SetDefaultStreamFn(nil) })
-			a := NewAgent(AgentOptions{})
+			a := mustNewAgent(AgentOptions{})
 			if entry == "agent" {
 				mustSend(t, a, "Hello")
 			} else {
@@ -36,7 +36,7 @@ func TestConfiguredDefaultStreamFn(t *testing.T) {
 // Go represents Pi's stock stream identity with a nil override; replacing and restoring it must preserve the host's configured path.
 func TestAgentStreamFunctionOverrideAndRestore(t *testing.T) {
 	var calls []string
-	a := NewAgent(AgentOptions{DefaultStreamFn: func(context.Context, *ai.Model, ai.TranscriptContext, ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
+	a := mustNewAgent(AgentOptions{DefaultStreamFn: func(context.Context, *ai.Model, ai.TranscriptContext, ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
 		calls = append(calls, "stock")
 		return doneStream(textMessage("stock")), nil
 	}})
@@ -68,7 +68,7 @@ func TestStreamFnWithModelDescriptorOnly(t *testing.T) {
 	for _, failed := range []bool{false, true} {
 		t.Run(map[bool]string{false: "success", true: "failure"}[failed], func(t *testing.T) {
 			called := false
-			a := NewAgent(AgentOptions{Model: &ai.Model{ID: "mock", ProviderMeta: ai.ProviderMetadata{ProviderID: "openai", API: ai.APIOpenAIResponses}}, StreamFn: func(context.Context, *ai.Model, ai.TranscriptContext, ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
+			a := mustNewAgent(AgentOptions{Model: &ai.Model{ID: "mock", ProviderMeta: ai.ProviderMetadata{ProviderID: "openai", API: ai.APIOpenAIResponses}}, StreamFn: func(context.Context, *ai.Model, ai.TranscriptContext, ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
 				called = true
 				if failed {
 					return nil, errors.New("provider exploded")
@@ -93,5 +93,29 @@ func TestStreamFnWithModelDescriptorOnly(t *testing.T) {
 				t.Fatalf("response = %+v", last)
 			}
 		})
+	}
+}
+
+// agent.ts `this.streamFunction = runtimeOptions.streamFn ?? getDefaultStreamFn()`: the property summarization passes to compact is never the stock-stream nil.
+func TestAgentEffectiveStreamFunction(t *testing.T) {
+	stream := func(name string, called *string) StreamFn {
+		return func(context.Context, *ai.Model, ai.TranscriptContext, ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
+			*called = name
+			return doneStream(textMessage("ok")), nil
+		}
+	}
+	var called string
+	a := mustNewAgent(AgentOptions{DefaultStreamFn: stream("default", &called)})
+	if a.StreamFunction() != nil {
+		t.Fatal("StreamFunction() is not nil for the default stream")
+	}
+	_, _ = a.EffectiveStreamFunction()(t.Context(), nil, ai.TranscriptContext{}, ai.StreamOptions{})
+	if called != "default" {
+		t.Fatalf("effective stream = %q, want the default", called)
+	}
+	a.SetStreamFunction(stream("override", &called))
+	_, _ = a.EffectiveStreamFunction()(t.Context(), nil, ai.TranscriptContext{}, ai.StreamOptions{})
+	if called != "override" {
+		t.Fatalf("effective stream = %q, want the override", called)
 	}
 }

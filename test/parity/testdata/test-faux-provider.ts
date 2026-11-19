@@ -278,7 +278,30 @@ function classify(messages: any[]) {
       ],
     };
   }
+  // Extension tool and built-in write and edit on one file in one parallel batch: file-mutation-queue.ts is shared by the built-in tools and every extension.
+  if (lastText.includes("Run: parallel extension file mutation")) {
+    return {
+      kind: "tool",
+      toolCalls: [
+        { toolName: "write", toolArgs: { path: "parity-parallel-mutation-target.txt", content: "base\n" } },
+        { toolName: "patch_file", toolArgs: { path: "parity-parallel-mutation-target.txt", line: "patched-A" } },
+        { toolName: "edit", toolArgs: { path: "parity-parallel-mutation-target.txt", edits: [{ oldText: "base", newText: "BASE" }] } },
+      ],
+    };
+  }
+  // MCP tool card parity.
+  if (lastText.includes("Run: mcp search cards")) {
+    return { kind: "tool", toolCalls: [{ toolName: "mcp__docs__search", toolArgs: { query: "cards" } }] };
+  }
   // Extension tool bridge parity.
+  // Generic extension tool call: "Run: ext tool <name> [<json arguments>]" on one line. Must match ai/test_faux.go.
+  if (lastText.includes("Run: ext tool ")) {
+    const rest = lastText.split("Run: ext tool ")[1].split("\n")[0].trim();
+    const space = rest.indexOf(" ");
+    const name = space < 0 ? rest : rest.slice(0, space);
+    const args = space < 0 ? "{}" : rest.slice(space + 1).trim() || "{}";
+    return { kind: "tool", toolCalls: [{ toolName: name, toolArgs: JSON.parse(args) }] };
+  }
   if (lastText.includes("Run: extension echo hello")) {
     return { kind: "tool", toolCalls: [{ toolName: "echo_bridge", toolArgs: { text: "hello" } }] };
   }
@@ -304,6 +327,16 @@ function classify(messages: any[]) {
   }
   if (lastText.includes("Run: extension UI dialogs")) {
     return { kind: "tool", toolCalls: [{ toolName: "ui_dialog_probe", toolArgs: {} }] };
+  }
+  // One assistant message with two calls of a tool that waits on a UI dialog.
+  if (lastText.includes("Run: two dialog tools")) {
+    return {
+      kind: "tool",
+      toolCalls: [
+        { toolName: "dialog_pick", toolArgs: { title: "First?" } },
+        { toolName: "dialog_pick", toolArgs: { title: "Second?" } },
+      ],
+    };
   }
   // Failing bash parity: a non-zero exit is a RETURNED error result, which keeps `isError` inside tool_execution_end.result (bash.ts:403-409).
   if (lastText.includes("Run: bash failing exit")) {
@@ -392,11 +425,28 @@ function classify(messages: any[]) {
     if (currentUserText.includes("Run: noncanonical read") || currentUserText.includes("Run: extension argument coercion")) return { kind: last.isError ? "error" : "text", text: lastText };
     if (currentUserText.includes("Run: read parity-read-target.txt")) return { kind: "text", text: "done" };
     if (currentUserText.includes("Run: write parity-write-output.txt")) return { kind: "text", text: "wrote" };
+    if (currentUserText.includes("Run: parallel extension file mutation")) {
+      // The batch's results (write, patch_file, edit) lead to a read of the file; the read's result decides.
+      if (lastText.includes("Successfully") || lastText.includes("patch-file: appended")) {
+        return { kind: "tool", toolCalls: [{ toolName: "read", toolArgs: { path: "parity-parallel-mutation-target.txt" } }] };
+      }
+      if (lastText.includes("BASE") && lastText.includes("patched-A")) return { kind: "text", text: "parallel-mutation-done" };
+      return { kind: "error", text: "test-faux: lost update: " + lastText };
+    }
     if (currentUserText.includes("Run: write then edit parity-batched-target.txt")) {
       if (historyText.includes("Successfully wrote") && historyText.includes("Successfully replaced 1 block(s) in parity-batched-target.txt.")) {
         return { kind: "text", text: "batched-done" };
       }
       return { kind: "error", text: "test-faux: batched mutation missing success markers" };
+    }
+    if (currentUserText.includes("Run: mcp search cards")) {
+      if (historyText.includes("mcp-hit: cards guide")) {
+        return { kind: "text", text: "mcp-search-done" };
+      }
+      return { kind: "error", text: "test-faux: mcp tool result missing the search hit" };
+    }
+    if (currentUserText.includes("Run: ext tool ")) {
+      return { kind: "text", text: (last.isError ? "ext-tool-error: " : "ext-tool-done: ") + lastText };
     }
     if (currentUserText.includes("Run: extension echo hello")) {
       if (historyText.includes("echo-bridge: hello")) {
@@ -423,6 +473,7 @@ function classify(messages: any[]) {
       }
       return { kind: "error", text: "test-faux: extension UI result missing dialog marker" };
     }
+    if (currentUserText.includes("Run: two dialog tools")) return { kind: "text", text: "two-dialog-tools-done" };
     if (currentUserText.includes("Run: bash failing exit")) return { kind: "text", text: "failed-bash-done" };
     if (currentUserText.includes("Run: bash BLOCK_ME")) {
       if (historyText.includes("parity-blocked")) {

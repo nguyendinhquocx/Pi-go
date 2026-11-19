@@ -25,7 +25,7 @@ func newStreamingRoutingMode(t *testing.T) (*InteractiveMode, context.Context, f
 	provider := &blockingProvider{started: make(chan struct{}), release: make(chan struct{})}
 	model := &ai.Model{ID: "m", Provider: provider, Capabilities: ai.ModelCapabilities{ContextWindow: 800000}}
 	m.opts.Model = model
-	m.agent = agent.NewAgent(agent.AgentOptions{Model: model})
+	m.setAgent(mustNewAgent(agent.AgentOptions{Model: model}))
 	m.chatContainer = tui.NewContainer()
 	m.statusContainer = tui.NewContainer()
 	m.slashRegistry = NewSlashRegistry()
@@ -34,6 +34,7 @@ func newStreamingRoutingMode(t *testing.T) (*InteractiveMode, context.Context, f
 	m.abortCtx, m.abortFn = context.WithCancel(ctx)
 	loopDone := make(chan struct{})
 	go m.drainLoop(ctx, loopDone)
+	m.installRenderDispatcher()
 	var once sync.Once
 	release := func() { once.Do(func() { close(provider.release) }) }
 	t.Cleanup(func() {
@@ -216,7 +217,7 @@ func TestTurnDeadlineErrorIsShown(t *testing.T) {
 	m.chatContainer = tui.NewContainer()
 	m.statusContainer = tui.NewContainer()
 	m.slashRegistry = NewSlashRegistry()
-	m.agent = agent.NewAgent(agent.AgentOptions{Model: model, PreparePrompt: func(context.Context, []agent.AgentMessage) ([]agent.AgentMessage, error) {
+	m.agent = mustNewAgent(agent.AgentOptions{Model: model, PreparePrompt: func(context.Context, []agent.AgentMessage) ([]agent.AgentMessage, error) {
 		return nil, fmt.Errorf("fetch context: %w", context.DeadlineExceeded)
 	}})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -259,9 +260,9 @@ func TestSettleActiveRunAbortsAndWaitsForTheRun(t *testing.T) {
 	}
 }
 
-// An extension's abort cancels the run and waits until it settles, as
-// upstream abort() awaits waitForIdle, and leaves the mode able to run the
-// next prompt. Interactive mode cancelled the shared abort context without
+// An extension's abort cancels the run, which settles (the extension awaits
+// ctx.waitForIdle() for that), and leaves the mode able to run the next
+// prompt. Interactive mode cancelled the shared abort context without
 // replacing it (so the next turn started already cancelled), and
 // waitForIdle polled isIdle every 50 ms off the owner loop (GUARD-11).
 func TestExtensionAbortSettlesTheRunAndTheNextPromptRuns(t *testing.T) {
@@ -315,7 +316,7 @@ func TestTurnErrorMentioning401IsShownAndStartsNoLogin(t *testing.T) {
 	m.chatContainer = tui.NewContainer()
 	m.statusContainer = tui.NewContainer()
 	m.slashRegistry = NewSlashRegistry()
-	m.agent = agent.NewAgent(agent.AgentOptions{Model: model, PreparePrompt: func(context.Context, []agent.AgentMessage) ([]agent.AgentMessage, error) {
+	m.agent = mustNewAgent(agent.AgentOptions{Model: model, PreparePrompt: func(context.Context, []agent.AgentMessage) ([]agent.AgentMessage, error) {
 		return nil, errors.New("upstream 401 from anthropic")
 	}})
 	ctx, cancel := context.WithCancel(context.Background())

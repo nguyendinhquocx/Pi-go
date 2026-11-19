@@ -121,17 +121,16 @@ func backreferences(source string) []int {
 
 // TestGrammarsReadNoQuantifiedCaptures guards the one regexp2 difference the translation keeps: JavaScript resets the captures of a quantified group on each iteration and rejects an empty iteration, while regexp2 keeps earlier captures. Match extents are equal, so the difference is observable only where a backreference or a callback reads such a group. No grammar does.
 func TestGrammarsReadNoQuantifiedCaptures(t *testing.T) {
-	r := NewRegistry()
-	r.LoadAllLanguages()
+	r := eagerRegistry()
 	checked := 0
 	for _, node := range r.nodes {
 		var patterns []pattern
 		var readsGroupOne []pattern
 		switch node := node.(type) {
 		case *Mode:
-			patterns = append(patterns, node.begin, node.end, node.match, node.lexemes, node.beforeMatch, node.illegal)
-			patterns = append(patterns, node.illegal.list...)
-			for _, cb := range []callback{node.onBegin, node.onEnd} {
+			patterns = append(patterns, node.begin, node.end, node.rare().match, node.rare().lexemes, node.rare().beforeMatch, node.rare().illegal)
+			patterns = append(patterns, node.rare().illegal.items()...)
+			for _, cb := range []callback{node.rare().onBegin, node.rare().onEnd} {
 				if cb != nil && strings.HasPrefix(callbackName(cb), "endSameAsBegin.") {
 					readsGroupOne = append(readsGroupOne, node.begin, node.end)
 				}

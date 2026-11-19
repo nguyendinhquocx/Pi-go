@@ -14,7 +14,7 @@ import (
 func scopedModelsWireValue(models []extension.ScopedModel) []map[string]any {
 	result := make([]map[string]any, len(models))
 	for i, scoped := range models {
-		result[i] = map[string]any{"model": extension.ModelInfo(scoped.Model)}
+		result[i] = map[string]any{"model": extension.ModelValue{Model: scoped.Model}}
 		if scoped.ThinkingLevel != "" {
 			result[i]["thinkingLevel"] = string(scoped.ThinkingLevel)
 		}
@@ -26,7 +26,7 @@ func scopedModelsWireValue(models []extension.ScopedModel) []map[string]any {
 func TestScopedModelsAcrossSDKs(t *testing.T) {
 	t.Parallel()
 	cases := allHarnessCases()
-	for _, language := range []string{"go", "python", "rust"} {
+	for _, language := range []string{"go", "python", "rust", "lisp"} {
 		cases = append(cases, harnessCase{name: "packed-" + language, make: func(t *testing.T) *harness { return makePackedScopeHarness(t, language) }})
 	}
 	for _, tc := range cases {

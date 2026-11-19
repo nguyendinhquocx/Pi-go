@@ -18,11 +18,11 @@ Stock PiG is the product-neutral coding agent. It provides:
 - Piglet Binary construction and verification;
 - embedded offline documentation.
 
-Stock PiG does not activate PiG Standard or another product composition. It has no built-in mascot catalogue, marketplace, onboarding workflow, or derivative-harness behavior.
+Stock PiG does not activate PiG Standard or another product composition. It has no marketplace and no derivative-harness behavior. Two PiG-only features ship in the Stock binary: the first-time setup dialog (D88) and the built-in `pig-login` extension, which holds the fifteen built-in sprites and registers `/sprite` (D2).
 
 ## Resources
 
-A Resource contributes one focused part of an agent application.
+A Resource contributes one focused part of an agent application. PiG has nine kinds of Resource.
 
 | Resource | Purpose |
 |---|---|
@@ -32,6 +32,8 @@ A Resource contributes one focused part of an agent application.
 | Theme | Change terminal appearance. |
 | Hook | Describe an event command. |
 | MCP definition | Describe an external tool service. |
+| Compatible agent declaration | Expose an agent that a compatible plugin root declares. See [Packages](/docs/latest/packages). |
+| Context input | Add standing instructions for the model, such as an `AGENTS.md` context file. See [Configure PiG](/docs/latest/configuration#context-files). |
 | Agent environment | Define the environment required by the whole agent. |
 
 A Resource does not activate itself.
@@ -59,7 +61,9 @@ A Piglet is one named whole-agent declaration. It can select:
 - a model preference;
 - ambient discovery policy;
 - secrets and environment requirements;
-- Binary build requirements.
+- Binary build requirements;
+- built-in tools, commands, extensions, model APIs and features to strip (D92);
+- a Go frontend member that draws the interactive mode in a Piglet Binary (D91).
 
 Run a Piglet from source:
 
@@ -69,7 +73,7 @@ pig --piglet ./agents/reviewer.yaml
 
 A Piglet is the normal unit for an agent application. It keeps the application configuration explicit without creating a separate PiG fork or wrapper harness.
 
-See [Piglets](/docs/latest/piglets).
+Publish a Piglet's source to npm with `pig piglet publish <name> --to npm`, and its signed Binaries to GitHub Releases with `--to github`. See [Piglets](/docs/latest/piglets) and [Publish a Package or Piglet](/docs/latest/publishing).
 
 ## Piglet Binaries deliver fixed applications
 
@@ -102,7 +106,7 @@ The Standard source is:
 piglets/standard/pig-standard.yaml
 ```
 
-Its Binary requires every selected extension to be a fuse-compatible Go factory. The build fails if an extension would use a subprocess fallback. The current composition selects `piglogin` for identity and `pigrunner` for timer-driven Runner UI.
+Its Binary requires every selected extension to be a fuse-compatible Go factory. The build fails if an extension would use a subprocess fallback. The current composition selects `piglogin` for identity, `pigrunner` for the PiG Runner game, `angrypigs` for the Angry Pigs game and `bunruntime` to install the Bun TypeScript runtime (see [TypeScript runtimes](/docs/latest/typescript-runtimes)).
 
 ## Choose the correct unit
 

@@ -15,7 +15,7 @@ func BenchmarkRuntimeNewSession(b *testing.B) {
 		if drained != nil {
 			<-drained
 		}
-		services, err := NewServices(ServicesOptions{CWD: options.CWD, AgentDir: options.AgentDir})
+		services, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: options.CWD, AgentDir: options.AgentDir})
 		if err != nil {
 			return CreateAgentSessionRuntimeResult{}, err
 		}
@@ -25,9 +25,10 @@ func BenchmarkRuntimeNewSession(b *testing.B) {
 		}
 		done := make(chan struct{})
 		drained = done
+		eventsCh := session.Events()
 		go func() {
 			defer close(done)
-			for event := range session.Events() {
+			for event := range eventsCh {
 				AcknowledgeEvent(event)
 			}
 		}()

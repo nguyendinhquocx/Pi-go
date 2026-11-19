@@ -17,7 +17,8 @@ func TestListModelsAllocatesOnlyFilteredCatalog(t *testing.T) {
 				}
 			}
 			got := ListModels(provider)
-			if !reflect.DeepEqual(got, want) {
+			// The OpenRouter routing variants ListModels derives (D199) are not in the generated catalog; the catalog's own models keep its order.
+			if !reflect.DeepEqual(piListedModels(got), want) {
 				t.Fatal("filtered catalog differs from generated order or metadata")
 			}
 			if cap(got) != len(got) {
@@ -75,8 +76,8 @@ func referenceCapabilities(m *GeneratedModel) ModelCapabilities {
 		Capabilities:     ModelCapabilities{MaxThinking: thinkingMaxLevel(m.Reasoning, m.ThinkingLevelMap)},
 		ThinkingLevelMap: cloneThinkingLevelMap(m.ThinkingLevelMap),
 	}) {
-		if CompareThinkingLevels(level, caps.MaxThinking) > 0 {
-			caps.MaxThinking = level
+		if CompareThinkingLevels(level, ModelThinkingLevel(caps.MaxThinking)) > 0 {
+			caps.MaxThinking = level.ReasoningOption()
 		}
 	}
 	return caps

@@ -115,12 +115,12 @@ func TestHarnessInspect(t *testing.T) {
 		})
 		var migrations atomic.Int32
 		registered := []durable.AnyTask{
-			gateTask,
-			dependent,
-			inspectTask("test.migrating", 2, inspectTaskOptions{migrate: func() error { migrations.Add(1); return nil }}),
-			inspectTask("test.no-migration", 2),
-			inspectTask("test.failing", 2, inspectTaskOptions{migrate: func() error { return errors.New("cannot migrate") }}),
-			inspectTask("test.too-old", 1),
+			gateTask.Erased(),
+			dependent.Erased(),
+			inspectTask("test.migrating", 2, inspectTaskOptions{migrate: func() error { migrations.Add(1); return nil }}).Erased(),
+			inspectTask("test.no-migration", 2).Erased(),
+			inspectTask("test.failing", 2, inspectTaskOptions{migrate: func() error { return errors.New("cannot migrate") }}).Erased(),
+			inspectTask("test.too-old", 1).Erased(),
 		}
 		harness, _, _ := openTasks(t, storage.NewMemoryStorage(), registered)
 		root, err := harness.Root(testContext, nil)
@@ -164,11 +164,11 @@ func TestHarnessInspect(t *testing.T) {
 			listed = append(listed, entry.Record.Id)
 		}
 		expectIds(t, listed, []durable.TaskId{ids.gate, ids.dependent, ids.migrating, ids.noMigration, ids.failing, ids.tooOld, ids.missing})
-		expectState(t, stateOf(paused.Tasks, ids.gate), TaskInspectionState{Kind: TaskInspectionReady})
-		expectState(t, stateOf(paused.Tasks, ids.dependent), TaskInspectionState{Kind: TaskInspectionReady})
-		expectState(t, stateOf(paused.Tasks, ids.migrating), TaskInspectionState{Kind: TaskInspectionReady, Migrates: true})
+		expectState(t, stateOf(paused.Tasks, ids.gate), TaskInspectionState{Kind: TaskInspectionPending})
+		expectState(t, stateOf(paused.Tasks, ids.dependent), TaskInspectionState{Kind: TaskInspectionPending})
+		expectState(t, stateOf(paused.Tasks, ids.migrating), TaskInspectionState{Kind: TaskInspectionPending, Migrates: true})
 		// A migration that was never tried is not run to find out.
-		expectState(t, stateOf(paused.Tasks, ids.failing), TaskInspectionState{Kind: TaskInspectionReady, Migrates: true})
+		expectState(t, stateOf(paused.Tasks, ids.failing), TaskInspectionState{Kind: TaskInspectionPending, Migrates: true})
 		expectState(t, stateOf(paused.Tasks, ids.noMigration), TaskInspectionState{Kind: TaskInspectionBlocked, Reason: "migration_failed", Error: errors.New("Task test.no-migration version 2 has no migration from 1")})
 		expectState(t, stateOf(paused.Tasks, ids.tooOld), TaskInspectionState{Kind: TaskInspectionBlocked, Reason: "task_too_old"})
 		expectState(t, stateOf(paused.Tasks, ids.missing), TaskInspectionState{Kind: TaskInspectionBlocked, Reason: "missing_task"})

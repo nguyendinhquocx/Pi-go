@@ -1,7 +1,11 @@
+//go:build !pig_strip_word_dictionaries
+
 // © 2016 and later: Unicode, Inc. and others.
 // Copyright (C) 2006-2016, International Business Machines Corporation and others.
 // ICU DictionaryBreakEngine, PossibleWord and Thai/Lao/Khmer/BurmeseBreakEngine translation.
 // See LICENSES/Unicode-3.0.txt and LICENSES/LicenseRef-ICU-SEA.txt.
+
+// Ports packages/tui/src/utils.ts (getWordSegmenter: the Thai, Lao, Khmer and Burmese dictionary engines of Intl.Segmenter)
 
 package wordsegmenter
 
@@ -9,6 +13,8 @@ import (
 	_ "embed"
 	"encoding/binary"
 	"sort"
+
+	"github.com/MichaelKinsy/PiG/internal/pigstrip"
 )
 
 //go:embed thai_dictionary.bin
@@ -23,18 +29,11 @@ var khmerDictionary string
 //go:embed burmese_dictionary.bin
 var burmeseDictionary string
 
-func complexContext(r rune) rune {
-	i := sort.Search(len(complexContextRanges), func(i int) bool { return complexContextRanges[i][1] >= r })
-	if i < len(complexContextRanges) && complexContextRanges[i][0] <= r {
-		return complexContextRanges[i][2]
-	}
-	return 0
-}
-
 // byteDictionary borrows ICU's offset-transformed word bytes in a sorted index. Lookup narrows the prefix range without allocating a runtime trie.
 type byteDictionary string
 
 func (d byteDictionary) uint32At(offset int) int {
+	//portlint:allow utf16units offset indexes the embedded little-endian ICU dictionary bytes, not a JS string; Pi's Intl.Segmenter (utils.ts:getWordSegmenter) has no such table
 	return int(binary.LittleEndian.Uint32([]byte(d[offset : offset+4])))
 }
 func (d byteDictionary) word(index int) string {
@@ -167,6 +166,10 @@ func seaMarkBest(words *[3]possibleWord, found int, text []rune, pos *int, dicti
 
 // seaDivide ports ICU 78.3's four divideUpDictionaryRange implementations. The engines share three-word lookahead and unknown-word resynchronization; Thai additionally consumes elision/repetition suffixes and requires more than four code points. Returned byte offsets exclude the range end, as in ICU's DictionaryCache.
 func seaDivide(text string, script rune, visit func(int)) {
+	// pig additive (D92): a Piglet that strips word-dictionaries finds no boundary inside a Thai, Lao, Khmer or Burmese run, as dictionaries_off.go does.
+	if pigstrip.Has(pigstrip.ListFeatures, pigstrip.WordDictionaries) {
+		return
+	}
 	chars := []rune(text)
 	if len(chars) < 4 || script == 1 && len(chars) == 4 {
 		return

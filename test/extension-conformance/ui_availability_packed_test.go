@@ -68,7 +68,7 @@ func Extension() *sdk.Extension { return sdk.New("ui-peer") }
 		write(filepath.Join(source, "src", "lib.rs"), body)
 		write(filepath.Join(peer, "src", "lib.rs"), "pub fn new_extension() -> pig_sdk::Extension { pig_sdk::Extension::new(\"ui-peer\") }\n")
 		for _, path := range []string{source, peer} {
-			write(filepath.Join(path, "Cargo.toml"), fmt.Sprintf("[package]\nname = %q\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\npig-sdk = {path = %q}\nserde_json = \"1\"\n", filepath.Base(path), filepath.ToSlash(filepath.Join(root, "extensions", "sdk-rs"))))
+			write(filepath.Join(path, "Cargo.toml"), fmt.Sprintf("[package]\nname = %q\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\npig-sdk = {path = %q}\nserde_json = \"1\"\n", filepath.Base(path), filepath.ToSlash(filepath.Join(root, "extensions", "sdk-rs"))))
 		}
 	}
 	for path, text := range files {
@@ -113,7 +113,12 @@ func makePackedUIHarness(t *testing.T, language string) *harness {
 	bridge.SetUIContext(ui)
 	bridge.SetActions(conformanceActions(actions))
 	host := subprocess.NewHost(t.TempDir())
+	if rpcRowMode != "" {
+		host.SetMode(rpcRowMode)
+	}
+	host.SetHostInfo(conformanceHostInfo)
 	host.SetUIBridge(bridge)
+	wire := observeWire(t, host)
 	host.SetConfigLoader(func() ([]subprocess.ExtConfig, error) { return configs, nil })
 	loaded, err := host.Reload(t.Context())
 	if err != nil || len(loaded) != len(configs) {
@@ -127,5 +132,5 @@ func makePackedUIHarness(t *testing.T, language string) *harness {
 	}
 	runner := inproc.NewRunner(loaded, t.TempDir())
 	bridge.SetUIPromptScope(runner)
-	return &harness{runner: runner, host: host, notify: notify, status: status, actions: actions, ui: ui, bridge: bridge}
+	return &harness{runner: runner, host: host, notify: notify, status: status, actions: actions, ui: ui, bridge: bridge, wire: wire}
 }

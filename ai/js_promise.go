@@ -2,7 +2,6 @@ package ai
 
 import (
 	"errors"
-	"iter"
 )
 
 // This file models the ECMAScript Promise, async function and await constructs that Pi's provider, stream and agent code awaits. A provider or stream loop written on it spends the microtask reactions V8 spends at every await.
@@ -215,7 +214,7 @@ func jsPromiseResolve[T any](executor *continuationExecutor, operand jsOperand[T
 	return promise
 }
 
-// jsAwaiter is a place that can await: a coroutine that suspends the body, or a turn that blocks its goroutine. register runs after the awaiter has stopped executing and must arrange for resume to be called from a reaction.
+// jsAwaiter is a place that can await: a coroutine that suspends the body, or a turn that suspends until a grant resumes it. register runs after the awaiter has stopped executing and must arrange for resume to be called from a reaction.
 type jsAwaiter interface {
 	jsExecutor() *continuationExecutor
 	jsSuspend(register func(resume func()))
@@ -223,6 +222,10 @@ type jsAwaiter interface {
 
 // jsAwait is Await(operand). The continuation runs in the reaction the settled promise queues. The error is the rejection reason.
 func jsAwait[T any](awaiter jsAwaiter, operand jsOperand[T]) (T, error) {
+	if turn, ok := awaiter.(*continuationTurn); ok {
+		// The awaits the turn deferred come before the operand's promise is resolved and its reaction registered.
+		turn.settleDeferred()
+	}
 	promise := jsPromiseResolve(awaiter.jsExecutor(), operand)
 	var value T
 	var err error
@@ -240,11 +243,10 @@ func jsAwait[T any](awaiter jsAwaiter, operand jsOperand[T]) (T, error) {
 
 func (turn *continuationTurn) jsExecutor() *continuationExecutor { return turn.executor }
 
-// jsSuspend blocks the turn's goroutine like awaitContinuation: the reaction registered by register grants the turn again.
+// jsSuspend suspends the turn like awaitContinuation: the reaction registered by register grants the turn again.
 func (turn *continuationTurn) jsSuspend(register func(resume func())) {
 	register(turn.grant)
-	turn.release()
-	<-turn.permit
+	turn.suspend()
 }
 
 // assertJSRunning rejects starting a coroutine from a goroutine that owns neither a turn nor a drain, where posting would run reactions inline.
@@ -272,7 +274,7 @@ type jsCoroutine struct {
 
 func newJSCoroutine(executor *continuationExecutor, body func(*jsCoroutine), finish func()) *jsCoroutine {
 	co := &jsCoroutine{executor: executor, finish: finish}
-	co.next, co.stop = iter.Pull(func(yield func(func() bool) bool) {
+	co.next, co.stop = pull(func(yield func(func() bool) bool) {
 		co.yield = yield
 		defer func() {
 			if r := recover(); r != nil {

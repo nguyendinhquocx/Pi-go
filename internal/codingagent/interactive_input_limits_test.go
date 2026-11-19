@@ -23,6 +23,7 @@ import (
 
 // Mirrors agent-session-prompt.test.ts: input transforms feed before_agent_start,
 // then that hook's model selection determines the profile used in history.
+// Pi: packages/coding-agent/src/core/extensions/types.ts:917 (BeforeAgentStartEvent.images).
 func TestInteractivePromptImagesUsePostHookModelLimits(t *testing.T) {
 	seen := make(chan capturedStreamRequest, 1)
 	model := &ai.Model{ID: "capture", Provider: captureStreamOptionsProvider{seen: seen}, Capabilities: ai.ModelCapabilities{ContextWindow: 8000}, InputLimits: &ai.ModelInputLimits{Images: &ai.ModelImageInputLimits{Resize: &ai.ModelImageResizeOptions{MaxWidth: 100}}}}
@@ -30,14 +31,14 @@ func TestInteractivePromptImagesUsePostHookModelLimits(t *testing.T) {
 	strict.InputLimits = &ai.ModelInputLimits{Images: &ai.ModelImageInputLimits{Resize: &ai.ModelImageResizeOptions{MaxWidth: 20}}}
 	input := ai.ImageContent{MimeType: "image/png", Data: base64.StdEncoding.EncodeToString(makePNGImage(t, 80, 40, color.RGBA{255, 0, 0, 255}))}
 	replacement := ai.ImageContent{MimeType: "image/png", Data: base64.StdEncoding.EncodeToString(makePNGImage(t, 40, 20, color.RGBA{0, 0, 255, 255}))}
-	m := NewInteractiveMode(InteractiveOptions{CWD: t.TempDir(), Model: model})
+	m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: t.TempDir(), Model: model})
 	m.chatContainer = tui.NewContainer()
 	m.statusContainer = tui.NewContainer()
 	m.pendingMessagesContainer = tui.NewContainer()
 	m.tuiInst = tui.NewWithOutput(io.Discard, 100, 30)
 	m.editor = tui.NewEditor()
-	m.statusLine = NewStatusLine(model, "", nil)
-	m.agent = agent.NewAgent(agent.AgentOptions{Model: model})
+	m.statusLine = NewFooterComponent(model, "", nil)
+	m.agent = mustNewAgent(agent.AgentOptions{Model: model})
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	m.runCtx = ctx
@@ -110,10 +111,11 @@ func TestInteractivePromptImagesUsePostHookModelLimits(t *testing.T) {
 }
 
 func TestCompactionQueuePreservesUnprocessedImages(t *testing.T) {
+	restoreTUIKeybindings(t)
 	for _, mode := range []compactionQueueMode{compactionQueueSteer, compactionQueueFollowUp} {
 		t.Run(string(mode), func(t *testing.T) {
-			m := NewInteractiveMode(InteractiveOptions{CWD: t.TempDir()})
-			m.agent = agent.NewAgent(agent.AgentOptions{})
+			m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: t.TempDir()})
+			m.agent = mustNewAgent(agent.AgentOptions{})
 			m.keybindings = NewKeybindingsManager(t.TempDir())
 			m.pendingMessagesContainer = tui.NewContainer()
 			m.tuiInst = tui.NewWithOutput(io.Discard, 100, 30)
@@ -164,5 +166,33 @@ func TestPromptImageInputLimitsAcceptNodeBase64(t *testing.T) {
 	config, _, err := image.DecodeConfig(bytes.NewReader(decoded))
 	if err != nil || config.Width != 10 || config.Height != 5 {
 		t.Fatalf("resized dimensions=%+v err=%v", config, err)
+	}
+}
+
+// routedSessionHandle is a session handle that reports a routed model. Only RoutedModelSelection is callable.
+type routedSessionHandle struct {
+	InteractiveSessionHandle
+	routed *RoutedModelSelection
+}
+
+func (h routedSessionHandle) RoutedModelSelection() *RoutedModelSelection { return h.routed }
+
+// Prompt images are sized with `_limitsModel()`: under a virtual selection the physical model that answered last, else the selected model (agent-session.ts:641-643, 2037).
+func TestInteractiveLimitsModelIsTheRoutedPhysicalModel(t *testing.T) {
+	selected := &ai.Model{ID: "virtual"}
+	physical := &ai.Model{ID: "physical", InputLimits: &ai.ModelInputLimits{Images: &ai.ModelImageInputLimits{Resize: &ai.ModelImageResizeOptions{MaxWidth: 20}}}}
+	m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: t.TempDir(), Model: selected})
+	m.agent = mustNewAgent(agent.AgentOptions{Model: selected})
+	if got := m.limitsModel(); got != selected {
+		t.Fatalf("limits model without a routed selection = %v, want the selected model", got)
+	}
+	m.opts.SessionHandle = routedSessionHandle{routed: &RoutedModelSelection{Model: physical}}
+	if got := m.limitsModel(); got != physical {
+		t.Fatalf("limits model = %v, want the routed physical model", got)
+	}
+	input := ai.ImageContent{MimeType: "image/png", Data: base64.StdEncoding.EncodeToString(makePNGImage(t, 80, 40, color.RGBA{255, 0, 0, 255}))}
+	got := NormalizePromptContent(promptContent("look", []ai.ImageContent{input}), true, m.limitsModel(), imageprocessing.ProcessImage)
+	if text := got[0].(ai.TextContent).Text; !strings.Contains(text, "displayed at 20x10") {
+		t.Fatalf("prompt text = %q, want the physical model's 20px resize hint", text)
 	}
 }

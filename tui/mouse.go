@@ -103,15 +103,25 @@ type MouseHandler interface {
 	HandleMouse(event TuiMouseEvent) *TuiMouseDispatchResult
 }
 
+// LeafMouseHandler is implemented by components whose handleMouse returns a plain TuiMouseEventResult, as upstream's Editor does. Go has no
+// covariant results, so a component returns either that or a TuiMouseDispatchResult (MouseHandler); DispatchMouseEvent takes both.
+type LeafMouseHandler interface {
+	HandleMouse(event TuiMouseEvent) *TuiMouseEventResult
+}
+
 // DispatchMouseEvent dispatches an event to a component and retains the exact
 // target and coordinate transform. Containers use it to forward events to
 // nested children. Mirrors upstream dispatchMouseEvent.
 func DispatchMouseEvent(component Component, event TuiMouseEvent) *TuiMouseDispatchResult {
-	handler, ok := component.(MouseHandler)
-	if !ok {
-		return nil
+	var result *TuiMouseDispatchResult
+	switch handler := component.(type) {
+	case MouseHandler:
+		result = handler.HandleMouse(event)
+	case LeafMouseHandler:
+		if plain := handler.HandleMouse(event); plain != nil {
+			result = &TuiMouseDispatchResult{TuiMouseEventResult: *plain}
+		}
 	}
-	result := handler.HandleMouse(event)
 	if result == nil {
 		return nil
 	}
@@ -199,17 +209,32 @@ func measureMouseChildren(components []Component, width int) []mouseChild {
 // input; Go embedding has no subclass identity, so a type that embeds
 // Container and handles input must override HandleMouse to do the same.
 func (c *Container) HandleMouse(event TuiMouseEvent) *TuiMouseDispatchResult {
+	return c.handleMouse(event, false)
+}
+
+// handleMouse is HandleMouse; held says the calling goroutine holds c.mu, as the goroutine rendering the container does while a child's Render calls back
+// into the renderer.
+func (c *Container) handleMouse(event TuiMouseEvent, held bool) *TuiMouseDispatchResult {
 	if event.Y < 0 || event.Y >= event.Height {
 		return nil
 	}
-	c.mu.RLock()
-	layout := c.mouseLayout
-	components := append([]Component(nil), c.children...)
-	c.mu.RUnlock()
+	if !held {
+		c.mu.RLock()
+	}
 	var children []mouseChild
-	if layout != nil && layout.width == event.Width {
-		children = layout.children
-	} else {
+	if c.layoutValid && c.layoutWidth == event.Width {
+		children = make([]mouseChild, len(c.builtKids))
+		top := 0
+		for i, child := range c.builtKids {
+			children[i] = mouseChild{component: child, height: c.builtEnds[i] - top}
+			top = c.builtEnds[i]
+		}
+	}
+	components := append([]Component(nil), c.children...)
+	if !held {
+		c.mu.RUnlock()
+	}
+	if children == nil {
 		children = measureMouseChildren(components, event.Width)
 	}
 	return dispatchToStackedChild(children, event, event.X, event.Y, event.Width)
@@ -236,7 +261,7 @@ func (b *Box) HandleMouse(event TuiMouseEvent) *TuiMouseDispatchResult {
 // isOverlayFocused reports whether the focused component is a visible
 // overlay. Mirrors upstream TuiBase.isOverlayFocused.
 func (t *tuiBase) isOverlayFocused() bool {
-	t.refreshOverlayVisibility(t.width, t.height)
+	t.refreshOverlayVisibility(t.size())
 	t.overlayMu.Lock()
 	defer t.overlayMu.Unlock()
 	focused := t.overlayModel.focusedComponent()

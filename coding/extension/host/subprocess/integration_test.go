@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
@@ -47,7 +46,7 @@ func buildFixture(t *testing.T) string {
 	if p, ok := mustUsePrebuilt(t, envFixtureExtBin); ok {
 		return p
 	}
-	path, err := wireFixtureBinary()
+	path, err := wireFixtureBinary.Do(t, func(ctx context.Context) (string, error) { return compileGoFixture(ctx, "fixture-ext") })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +321,7 @@ func TestHost_Integration_WidgetPushAndUICall(t *testing.T) {
 		t.Fatalf("Execute: %v", err)
 	}
 
-	tr, ok := result.(agent.AgentToolResult)
+	tr, ok := result, true
 	if !ok {
 		t.Fatalf("result type = %T, want agent.AgentToolResult", result)
 	}
@@ -385,7 +384,7 @@ func TestHostIntegrationPreservesGenericExtensionProvidedEdit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	toolResult, ok := result.(agent.AgentToolResult)
+	toolResult, ok := result, true
 	if !ok || toolResult.Text() != "Hello, neutral!" {
 		t.Fatalf("generic extension edit result = %#v", result)
 	}
@@ -458,7 +457,7 @@ func TestHost_Integration_SpawnAndRegister(t *testing.T) {
 		t.Fatalf("Execute: %v", err)
 	}
 
-	tr, ok := result.(agent.AgentToolResult)
+	tr, ok := result, true
 	if !ok {
 		t.Fatalf("result type = %T, want agent.AgentToolResult", result)
 	}
@@ -602,7 +601,8 @@ func (h *testUIContext) SetHiddenThinkingLabel(label string) {
 	h.hiddenLabels = append(h.hiddenLabels, label)
 }
 
-func (h *testUIContext) SetFooter(factory any) {
+func (h *testUIContext) SetFooter(build extension.FooterFactory) {
+	factory := frameOf(build, 3)
 	h.stateMu.Lock()
 	defer h.stateMu.Unlock()
 	if frame, ok := factory.(extension.WidthLines); ok {
@@ -617,7 +617,8 @@ func (h *testUIContext) SetFooter(factory any) {
 	}
 }
 
-func (h *testUIContext) SetHeader(factory any) {
+func (h *testUIContext) SetHeader(build extension.HeaderFactory) {
+	factory := frameOf(build, 2)
 	h.stateMu.Lock()
 	defer h.stateMu.Unlock()
 	if frame, ok := factory.(extension.WidthLines); ok {
@@ -633,8 +634,8 @@ func (h *testUIContext) SetHeader(factory any) {
 }
 func (h *testUIContext) SetLogin(extension.LoginDefinition) error { return nil }
 
-func (h *testUIContext) SetEditorComponent(factory any) {
-	editor, _ := factory.(extension.RemoteEditor)
+func (h *testUIContext) SetEditorComponent(factory extension.EditorFactory) {
+	editor := remoteEditorOfFactory(factory)
 	h.stateMu.Lock()
 	h.editorCleared = factory == nil
 	h.remoteEditor = editor
@@ -1079,7 +1080,7 @@ func buildSDKFixture(t *testing.T) string {
 	if p, ok := mustUsePrebuilt(t, envSDKFixtureBin); ok {
 		return p
 	}
-	path, err := sdkFixtureBinary()
+	path, err := sdkFixtureBinary.Do(t, func(ctx context.Context) (string, error) { return compileGoFixture(ctx, "sdk-fixture", "GOWORK=off") })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1175,8 +1176,8 @@ func TestHost_Integration_SDKToolExecution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if result == nil {
-		t.Fatal("result is nil")
+	if len(result.Content) == 0 {
+		t.Fatal("result has no content")
 	}
 }
 
@@ -1428,16 +1429,16 @@ var (
 	tsFixtureAllTools = []ToolInfo{
 		{Name: "read", Description: "Read the contents of a file.", Parameters: json.RawMessage(`{"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}`),
 			PromptGuidelines: []string{"Use read to examine files instead of cat or sed."},
-			SourceInfo:       map[string]any{"path": "<builtin:read>", "source": "builtin", "scope": "temporary", "origin": "top-level"}},
+			SourceInfo:       extension.SourceInfo{Path: "<builtin:read>", Source: "builtin", Scope: "temporary", Origin: "top-level"}},
 		{Name: "grep", Description: "Search file contents for a pattern.", Parameters: json.RawMessage(`{"type":"object","required":["pattern"],"properties":{"pattern":{"type":"string"}}}`),
-			SourceInfo: map[string]any{"path": "<builtin:grep>", "source": "builtin", "scope": "temporary", "origin": "top-level"}},
+			SourceInfo: extension.SourceInfo{Path: "<builtin:grep>", Source: "builtin", Scope: "temporary", Origin: "top-level"}},
 		{Name: "echo_ts", Description: "Echo from TS shim", Parameters: json.RawMessage(`{"type":"object","required":["text"],"properties":{"text":{"type":"string","description":"Text to echo"}}}`),
-			SourceInfo: map[string]any{"path": "/ext/ts-fixture.ts", "source": "cli", "scope": "temporary", "origin": "top-level"}},
+			SourceInfo: extension.SourceInfo{Path: "/ext/ts-fixture.ts", Source: "cli", Scope: "temporary", Origin: "top-level"}},
 	}
 	tsFixtureCommands = []CommandInfo{
-		{Name: "ping_ts", Description: "Notify from TS shim", Source: "extension", SourceInfo: map[string]any{"path": "/ext/ts-fixture.ts", "source": "cli", "scope": "temporary", "origin": "top-level"}},
-		{Name: "review", Source: "prompt", SourceInfo: map[string]any{"path": "/agent/prompts/review.md", "source": "local", "scope": "user", "origin": "top-level", "baseDir": "/agent/prompts"}},
-		{Name: "skill:lint", Description: "Lint code", Source: "skill", SourceInfo: map[string]any{"path": "/agent/skills/lint/SKILL.md", "source": "local", "scope": "user", "origin": "top-level", "baseDir": "/agent/skills"}},
+		{Name: "ping_ts", Description: "Notify from TS shim", Source: "extension", SourceInfo: extension.SourceInfo{Path: "/ext/ts-fixture.ts", Source: "cli", Scope: "temporary", Origin: "top-level"}},
+		{Name: "review", Source: "prompt", SourceInfo: extension.SourceInfo{Path: "/agent/prompts/review.md", Source: "local", Scope: "user", Origin: "top-level", BaseDir: "/agent/prompts"}},
+		{Name: "skill:lint", Description: "Lint code", Source: "skill", SourceInfo: extension.SourceInfo{Path: "/agent/skills/lint/SKILL.md", Source: "local", Scope: "user", Origin: "top-level", BaseDir: "/agent/skills"}},
 	}
 )
 
@@ -1462,6 +1463,7 @@ func assertSameJSON(t *testing.T, label string, got json.RawMessage, want any) {
 }
 
 func TestHost_Integration_TSFileShim(t *testing.T) {
+	skipWithoutNodeExtensions(t)
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -1504,17 +1506,17 @@ func TestHost_Integration_TSFileShim(t *testing.T) {
 		},
 		IsIdle:          func() bool { return true },
 		GetSystemPrompt: func() string { return "ts-shim system prompt" },
-		GetModelInfo: func() map[string]any {
-			return map[string]any{"id": "anthropic/claude-3-5-haiku", "modelId": "claude-3-5-haiku", "provider": map[string]any{"id": "anthropic"}, "api": "anthropic-messages", "name": "Claude 3.5 Haiku", "displayName": "Claude 3.5 Haiku"}
+		GetModelInfo: func() json.RawMessage {
+			return modelJSON(map[string]any{"id": "anthropic/claude-3-5-haiku", "modelId": "claude-3-5-haiku", "provider": map[string]any{"id": "anthropic"}, "api": "anthropic-messages", "name": "Claude 3.5 Haiku", "displayName": "Claude 3.5 Haiku"})
 		},
-		GetModel: func(providerID, modelID string) map[string]any {
+		GetModel: func(providerID, modelID string) json.RawMessage {
 			if providerID != "anthropic" || modelID != "claude-3-5-haiku" {
 				return nil
 			}
-			return map[string]any{"id": modelID, "modelId": modelID, "provider": providerID, "api": "anthropic-messages", "name": "Claude 3.5 Haiku", "displayName": "Claude 3.5 Haiku"}
+			return modelJSON(map[string]any{"id": modelID, "modelId": modelID, "provider": providerID, "api": "anthropic-messages", "name": "Claude 3.5 Haiku", "displayName": "Claude 3.5 Haiku"})
 		},
-		GetModels: func() []map[string]any {
-			return []map[string]any{{"id": "claude-3-5-haiku", "modelId": "claude-3-5-haiku", "provider": "anthropic", "api": "anthropic-messages", "name": "Claude 3.5 Haiku", "displayName": "Claude 3.5 Haiku"}}
+		GetModels: func() []json.RawMessage {
+			return modelJSONs(map[string]any{"id": "claude-3-5-haiku", "modelId": "claude-3-5-haiku", "provider": "anthropic", "api": "anthropic-messages", "name": "Claude 3.5 Haiku", "displayName": "Claude 3.5 Haiku"})
 		},
 		GetModelAuth: func(_ context.Context, providerID, modelID string) map[string]any {
 			return map[string]any{"ok": providerID == "anthropic" && modelID == "claude-3-5-haiku", "apiKey": "test-key", "headers": map[string]string{"x-test": "1"}}
@@ -1637,9 +1639,9 @@ func TestHost_Integration_TSFileShim(t *testing.T) {
 	if !res.Details.AuthOK || res.Details.ExecStdout != "exec-ts" || res.Details.ExecCode != 0 || res.Details.CompletionStopReason != "stop" || res.Details.CompletionText != "OK" {
 		t.Errorf("auth/exec/complete details = %+v", res.Details)
 	}
-	// Upstream pi.exec resolves a program that cannot start as code 1.
-	if m := res.Details.MissingExec; m == nil || m.Code != 1 || m.Stdout != "" || m.Stderr != "" || m.Killed {
-		t.Errorf("missing-program exec = %+v, want {code:1}", m)
+	// Pi c60de42e9: pi.exec resolves a program that cannot start as code 1 with the spawn error as stderr.
+	if m := res.Details.MissingExec; m == nil || m.Code != 1 || m.Stdout != "" || m.Stderr != "spawn pig-test-missing-program ENOENT" || m.Killed {
+		t.Errorf("missing-program exec = %+v, want {code:1 stderr:spawn pig-test-missing-program ENOENT}", m)
 	}
 	if res.Details.ContextUsage.Tokens != 42 || res.Details.ContextUsage.ContextWindow != 1000 {
 		t.Errorf("contextUsage = %+v, want {Tokens:42 ContextWindow:1000}", res.Details.ContextUsage)
@@ -1734,12 +1736,52 @@ func TestHost_Integration_TSFileShim(t *testing.T) {
 	}
 }
 
-func TestHost_Integration_TSWidgetFactoryRendersInvalidatesResizesAndClears(t *testing.T) {
+// Pi's RPC mode ignores a component factory without calling it (rpc-mode.ts setWidget): the Node runtime must not run it outside the TUI.
+func TestHost_Integration_TSWidgetFactoryIsNotRunOutsideTheTUI(t *testing.T) {
+	skipWithoutNodeExtensions(t)
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
 	shortSockDir(t)
 	h := newTestHost(t)
+	h.SetMode("rpc")
+	bridge := NewUIBridge(func() {})
+	h.SetUIBridge(bridge)
+	var mu sync.Mutex
+	var requests []string
+	bridge.SetWidgetRequestFunc(func(_ string, key string, lines []string, _ *extension.ExtensionWidgetOptions) {
+		mu.Lock()
+		defer mu.Unlock()
+		requests = append(requests, key+":"+strings.Join(lines, ","))
+	})
+	defer h.Shutdown("test done")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	ext, err := h.Load(ctx, ExtConfig{Name: "widget-factory", Source: filepath.Join("testdata", "widget-factory.mjs"), Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge.SetUIContext(extension.NoopUIContext)
+	h.NotifyWidth(80)
+	if err := ext.Commands["widget_factory"].Handler(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) != 0 {
+		t.Fatalf("RPC mode forwarded %q for a component factory, want nothing", requests)
+	}
+}
+
+func TestHost_Integration_TSWidgetFactoryRendersInvalidatesResizesAndClears(t *testing.T) {
+	skipWithoutNodeExtensions(t)
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	shortSockDir(t)
+	h := newTestHost(t)
+	h.SetMode("tui") // a component factory runs only where the TUI renders it
 	bridge := NewUIBridge(func() {})
 	h.SetUIBridge(bridge)
 	defer h.Shutdown("test done")
@@ -1801,6 +1843,7 @@ func (u *themedTestUI) Theme() extension.Theme { return u.theme }
 // to Node, the component aggregates them, and done(value) closes the overlay
 // with that value.
 func TestHost_Integration_TSCustomOverlay(t *testing.T) {
+	skipWithoutNodeExtensions(t)
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -1911,6 +1954,7 @@ func TestHost_Integration_TSCustomOverlay(t *testing.T) {
 // the component renders at upstream's resolved overlay width (75% of the
 // terminal), not at the full terminal width.
 func TestHost_Integration_TSDoomOverlayOptions(t *testing.T) {
+	skipWithoutNodeExtensions(t)
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -2121,6 +2165,7 @@ func TestHost_Integration_NoExtensionsNilSafe(t *testing.T) {
 // If requestRender doesn't work (e.g. the shim is {}), frames never advance
 // and the test times out.
 func TestHost_Integration_RequestRenderFromTimer(t *testing.T) {
+	skipWithoutNodeExtensions(t)
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -2230,6 +2275,7 @@ func TestHost_Integration_RequestRenderFromTimer(t *testing.T) {
 }
 
 func TestHost_Integration_RequestRenderBurstIsCoalescedBeforeIPC(t *testing.T) {
+	skipWithoutNodeExtensions(t)
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -2292,6 +2338,7 @@ func TestHost_Integration_RequestRenderBurstIsCoalescedBeforeIPC(t *testing.T) {
 }
 
 func TestHost_Integration_TSParameterProperties(t *testing.T) {
+	skipWithoutNodeExtensions(t)
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -2351,6 +2398,7 @@ func TestHost_Integration_TSParameterProperties(t *testing.T) {
 // deadline. A focused custom overlay therefore remains active until the user
 // closes it or the caller cancels the request.
 func TestHost_Integration_ToolCustomOverlayWaitsForUser(t *testing.T) {
+	skipWithoutNodeExtensions(t)
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -2418,12 +2466,13 @@ func TestHost_Integration_ToolCustomOverlayWaitsForUser(t *testing.T) {
 	if outcome.err != nil {
 		t.Fatalf("linger_overlay_tool execute error: %v", outcome.err)
 	}
-	if outcome.result == nil {
+	if len(outcome.result.Content) == 0 {
 		t.Fatal("linger_overlay_tool returned no result")
 	}
 }
 
 func TestHost_Integration_CommandCustomOverlayWaitsForUser(t *testing.T) {
+	skipWithoutNodeExtensions(t)
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}

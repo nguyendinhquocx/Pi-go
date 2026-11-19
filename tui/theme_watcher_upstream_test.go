@@ -8,9 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 func writeWatchedTheme(t *testing.T, directory, name, accent string) {
@@ -111,13 +114,13 @@ func waitThemeAccent(t *testing.T, want string) {
 	tick := time.NewTicker(5 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		if ActiveTheme().Colors()["accent"] == want {
+		if ActiveTheme().GetResolvedThemeColors()["accent"] == want {
 			return
 		}
 		select {
 		case <-tick.C:
 		case <-deadline.C:
-			t.Fatalf("accent=%q want=%q", ActiveTheme().Colors()["accent"], want)
+			t.Fatalf("accent=%q want=%q", ActiveTheme().GetResolvedThemeColors()["accent"], want)
 		}
 	}
 }
@@ -152,7 +155,7 @@ func TestThemeWatcherReloadsAfterAtomicReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitThemeAccent(t, "#654321")
-	if got := ActiveThemeRegistry().Get("custom-test").Colors()["accent"]; got != "#654321" {
+	if got := ActiveThemeRegistry().Get("custom-test").GetResolvedThemeColors()["accent"]; got != "#654321" {
 		t.Fatalf("registry cache=%s", got)
 	}
 	// The JSON name may differ after replacement; the watcher remains attached to the selected filename, as in Pi.
@@ -244,6 +247,61 @@ func TestThemeWatcherKeepsLastGoodAndCoalescesBurst(t *testing.T) {
 	waitThemeAccent(t, "#000064")
 }
 
+// upstream: packages/coding-agent/src/modes/interactive/theme/theme.ts:startThemeWatcher — an overflowed native buffer loses events but leaves the watch armed, so the watcher reloads the file and keeps watching.
+func TestThemeWatcherOverflowReloadsAndKeepsWatching(t *testing.T) {
+	for _, overflow := range []error{fsnotify.ErrEventOverflow, errors.New(windowsOverflowMessage)} {
+		t.Run(overflow.Error(), func(t *testing.T) {
+			dir, watcher := watchedThemeFixture(t)
+			reloaded := make(chan struct{}, 1)
+			watcher.mu.Lock()
+			native := watcher.watcher
+			watcher.dispatch = func(ctx context.Context, apply func()) error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				apply()
+				select {
+				case reloaded <- struct{}{}:
+				default:
+				}
+				return nil
+			}
+			watcher.mu.Unlock()
+			native.Errors <- overflow
+			select {
+			case <-reloaded:
+			case <-time.After(5 * time.Second):
+				t.Fatal("overflow did not reload the theme")
+			}
+			writeWatchedTheme(t, dir, "custom-test", "#654321")
+			waitThemeAccent(t, "#654321")
+		})
+	}
+}
+
+// upstream: packages/coding-agent/src/modes/interactive/theme/theme.ts:startThemeWatcher — the error handler closes the watcher.
+func TestThemeWatcherOtherErrorsCloseNativeWatcher(t *testing.T) {
+	_, watcher := watchedThemeFixture(t)
+	watcher.mu.Lock()
+	native := watcher.watcher
+	watcher.mu.Unlock()
+	native.Errors <- errors.New("simulated OS watcher failure")
+	select {
+	case _, ok := <-native.Errors:
+		if ok {
+			t.Fatal("native watcher still delivering after a failure")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("failure did not close the native watcher")
+	}
+	watcher.mu.Lock()
+	closed := watcher.watcher == nil
+	watcher.mu.Unlock()
+	if !closed {
+		t.Fatal("closed native watcher stayed registered")
+	}
+}
+
 func TestThemeWatcherCloseCancelsBlockedDispatch(t *testing.T) {
 	dir, watcher := watchedThemeFixture(t)
 	started := make(chan struct{})
@@ -306,8 +364,13 @@ func TestThemeWatcherErrorClosesNotificationsAndBuiltinsDoNotWatch(t *testing.T)
 func TestThemeWatcherSkipsTheSystemTheme(t *testing.T) {
 	dir := t.TempDir()
 	writeWatchedTheme(t, dir, SystemThemeName, "")
+	// "<in-memory>" is not a legal Windows file name, so no same-named file can exist there to be skipped.
+	if runtime.GOOS != "windows" {
+		writeWatchedTheme(t, dir, InMemoryThemeName, "")
+	}
 	writeWatchedTheme(t, dir, "custom-test", "")
-	for name, watched := range map[string]bool{SystemThemeName: false, "custom-test": true} {
+	// theme.ts:795-798 setThemeInstance names the theme "<in-memory>" and stops the watcher, so a same-named file is not watched either.
+	for name, watched := range map[string]bool{SystemThemeName: false, InMemoryThemeName: false, "custom-test": true} {
 		watcher := StartThemeWatcher(t.Context(), dir, nil)
 		watcher.selectTheme(name)
 		watcher.mu.Lock()

@@ -2,7 +2,10 @@
 
 package nodeerrno
 
-import "syscall"
+import (
+	"sync"
+	"syscall"
+)
 
 // Code returns the Node error code for errno.
 func Code(errno syscall.Errno) (string, bool) {
@@ -13,11 +16,11 @@ func Code(errno syscall.Errno) (string, bool) {
 // POSIX errno, which libuv passes through, when the platform defines one for
 // the code, and libuv's own value otherwise.
 func Errno(code string) (int, bool) {
-	entry, ok := codes[code]
+	entry, ok := codes()[code]
 	if !ok {
 		return 0, false
 	}
-	if errno, ok := posixErrnos[code]; ok {
+	if errno, ok := posixErrnos()[code]; ok {
 		return -int(errno), true
 	}
 	return entry.libuvErrno, true
@@ -32,10 +35,11 @@ func describeErrno(errno syscall.Errno) (string, string, int) {
 
 // posixErrnos is posixCodes reversed: the POSIX errno of each code the
 // platform defines.
-var posixErrnos = func() map[string]syscall.Errno {
-	errnos := make(map[string]syscall.Errno, len(posixCodes))
-	for errno, code := range posixCodes {
+var posixErrnos = sync.OnceValue(func() map[string]syscall.Errno {
+	named := posixCodes()
+	errnos := make(map[string]syscall.Errno, len(named))
+	for errno, code := range named {
 		errnos[code] = errno
 	}
 	return errnos
-}()
+})

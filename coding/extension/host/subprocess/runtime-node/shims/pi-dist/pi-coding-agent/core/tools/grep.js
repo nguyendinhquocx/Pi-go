@@ -81,7 +81,7 @@ export function createGrepToolDefinition(cwd, options) {
                             if (!lines) {
                                 try {
                                     const content = await ops.readFile(filePath);
-                                    lines = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+                                    lines = content.replace(/\r\n/g, "\n").split("\n");
                                 }
                                 catch {
                                     lines = [];
@@ -90,7 +90,9 @@ export function createGrepToolDefinition(cwd, options) {
                             }
                             return lines;
                         };
-                        const args = ["--json", "--line-number", "--color=never", "--hidden"];
+                        // --no-config: the tool contract (literal, glob, limit, ...) must not depend on
+                        // ambient user config like RIPGREP_CONFIG_PATH. Users can customize via bash or extensions.
+                        const args = ["--no-config", "--json", "--line-number", "--color=never", "--hidden"];
                         if (ignoreCase)
                             args.push("--ignore-case");
                         if (literal)

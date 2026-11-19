@@ -21,9 +21,11 @@ import (
 // Adding a file here is a deliberate assertion that it consumes raw input.
 // If it hands data to a component's HandleInput, use ShouldDeliverKey instead.
 var rawKeyReleaseCallers = map[string]string{
-	"tui/keys_decode.go":                          "defines IsKeyRelease and ShouldDeliverKey",
-	"tui/tui_alt_screen_input.go":                 "viewport scrolling consumes the release to stop fallthrough but acts only on press, mirroring upstream handleViewportInput",
-	"internal/codingagent/interactive_helpers.go": "extension shortcut listeners see raw input, mirroring upstream addInputListener",
+	"tui/keys_decode.go":                                "defines IsKeyRelease and ShouldDeliverKey",
+	"tui/tui_alt_screen_input.go":                       "viewport scrolling consumes the release to stop fallthrough but acts only on press, mirroring upstream handleViewportInput",
+	"internal/codingagent/interactive_helpers.go":       "extension shortcut listeners see raw input, mirroring upstream addInputListener",
+	"extensions/sdk/tui/internal/engine/keys_decode.go": "defines the SDK's IsKeyRelease, the export of pi-tui's isKeyRelease for extensions that consume raw input",
+	"extensions/sdk/tui/keys.go":                        "exports pi-tui's isKeyRelease to extensions that consume raw input",
 }
 
 // TestKeyReleaseChokePoint fails when a new production file calls
@@ -117,7 +119,8 @@ var rawInputLoops = map[string]string{
 func TestInputDispatchFiltersKeyReleases(t *testing.T) {
 	root := repoRootForKeyRelease(t)
 
-	filters := []string{"dropKeyReleases(", "ShouldDeliverKey("}
+	// HandleTerminalInput and DispatchFocusedInput (tui/tui_input.go) deliver to the focused component through ShouldDeliverKey.
+	filters := []string{"dropKeyReleases(", "ShouldDeliverKey(", "HandleTerminalInput(", "DispatchFocusedInput("}
 	hasFilter := func(s string) bool {
 		for _, f := range filters {
 			if strings.Contains(s, f) {

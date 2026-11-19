@@ -3,7 +3,7 @@
 // It loads the runtime the way an extension sees it and reports what exists:
 //
 //   - the members of the objects an extension reaches (pi, ctx, ctx.ui,
-//     ctx.ui.theme, ctx.sessionManager, ctx.modelRegistry), by instantiating
+//     ctx.ui.theme, ctx.sessionManager, ctx.modelRegistry, the footer factory's footerData), by instantiating
 //     the runtime and walking each object's own and inherited properties;
 //   - for every runtime export Pi's packages declare, and every member of each
 //     exported class, whether the runtime module serves it, and where the
@@ -82,7 +82,7 @@ function memberNames(obj) {
 }
 for (const name of Object.keys(runtime.api)) out.symbols.push(`api.${name}`);
 for (const name of Object.keys(runtime.api.events ?? {})) out.symbols.push(`api.events.${name}`);
-for (const obj of [runtime.ctx, runtime.ui, runtime.ui.theme, runtime.ctx.sessionManager, runtime.ctx.modelRegistry]) {
+for (const obj of [runtime.ctx, runtime.ui, runtime.ui.theme, runtime.ctx.sessionManager, runtime.ctx.modelRegistry, runtime.footerDataProvider()]) {
   const cls = obj.constructor.name;
   for (const name of memberNames(obj)) out.symbols.push(`${cls}.${name}`);
 }
@@ -95,7 +95,9 @@ function jsFiles(dir) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const path = join(dir, entry.name);
     if (entry.isDirectory()) files.push(...jsFiles(path));
-    else if (entry.name.endsWith(".js")) files.push(path);
+    // cli.js files are bin entries that run on import (the harness entry exits
+    // without PIG_HARNESS_BINARY; pi-ai's prints usage); they export nothing.
+    else if (entry.name.endsWith(".js") && entry.name !== "cli.js") files.push(path);
   }
   return files;
 }

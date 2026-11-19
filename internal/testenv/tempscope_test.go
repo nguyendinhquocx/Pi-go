@@ -1,6 +1,8 @@
 package testenv
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -96,8 +98,57 @@ func TestKeepGoBuildCachesSurvivesAHomeChange(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, "cache"))
+	t.Setenv("XDG_CONFIG_HOME", "")
+	DisableGoTelemetry(t, home)
 	if got := goEnv(); got != want {
 		t.Fatalf("go env after a HOME change = %q, want the caches %q", got, want)
+	}
+}
+
+// The go command must read the mode DisableGoTelemetry writes, and a go command run in that home must then fork no sidecar. The sidecar's first act is to create local/ under the telemetry directory, so a go command that leaves none behind started none.
+func TestDisableGoTelemetryKeepsGoCommandsFromForkingASidecar(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	config, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel, err := filepath.Rel(home, config); err != nil || !filepath.IsLocal(rel) {
+		t.Skipf("the go configuration directory %q is outside HOME on %s", config, runtime.GOOS)
+	}
+	DisableGoTelemetry(t, home)
+	out, err := exec.CommandContext(t.Context(), "go", "env", "GOTELEMETRY", "GOTELEMETRYDIR").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(fields) != 2 || fields[0] != "off" || fields[1] != filepath.Join(config, "go", "telemetry") {
+		t.Fatalf("go env GOTELEMETRY GOTELEMETRYDIR = %q, want off and the telemetry directory under %q", out, config)
+	}
+	if _, err := os.Stat(filepath.Join(fields[1], "local")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a go command in a home with telemetry off created counters in %q (stat err = %v): it forked a sidecar", fields[1], err)
+	}
+}
+
+// A configuration directory outside the test's home is the caller's own: its telemetry mode must survive the test.
+func TestDisableGoTelemetryLeavesAConfigurationOutsideHomeAlone(t *testing.T) {
+	outside := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", outside)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if config, err := os.UserConfigDir(); err != nil || config != outside {
+		t.Skipf("the go configuration directory %q does not follow XDG_CONFIG_HOME on %s", config, runtime.GOOS)
+	}
+	DisableGoTelemetry(t, home)
+	for _, dir := range []string{home, outside} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("DisableGoTelemetry wrote %v into %q, which holds the caller's own configuration", entries, dir)
+		}
 	}
 }
 

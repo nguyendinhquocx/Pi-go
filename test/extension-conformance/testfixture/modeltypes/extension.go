@@ -48,7 +48,7 @@ func imageImpl(model, request map[string]any, options sdk.ProviderOperationOptio
 // cancelled counts the classifications the host cancelled while they waited.
 var cancelled atomic.Int64
 
-// classifyImpl answers each question with the length of the state's text, in the reverse of the question order.
+// classifyImpl answers each question with the length of the state's text plus ten per image, in the reverse of the question order.
 func classifyImpl(model map[string]any, request sdk.ClassifierContext, options sdk.ProviderOperationOptions) (sdk.ClassifierResult, error) {
 	state, _ := request.State["text"].(string)
 	switch state {
@@ -62,7 +62,7 @@ func classifyImpl(model map[string]any, request sdk.ClassifierContext, options s
 	keys := request.Questions.Keys()
 	pairs := make([]any, 0, len(keys)*2)
 	for _, key := range slices.Backward(keys) {
-		pairs = append(pairs, key, map[string]any{"type": "bool", "probability": float64(len(state)) / 100})
+		pairs = append(pairs, key, map[string]any{"type": "bool", "probability": float64(len(state)+10*len(request.Images)) / 100})
 	}
 	return sdk.ClassifierResult{API: fmt.Sprint(model["api"]), Provider: fmt.Sprint(model["provider"]), Model: fmt.Sprint(model["id"]), Answers: sdk.NewOrderedObject(pairs...), StopReason: "stop", Timestamp: 2}, nil
 }
@@ -147,7 +147,16 @@ func Extension() *sdk.Extension {
 			if err != nil {
 				return nil, err
 			}
+			ofType, err := registry.GetModelOfType(sdk.ModelTypeClassifier, "typesafe", "jev-latest")
+			if err != nil {
+				return nil, err
+			}
+			ofTypeMissing, err := registry.GetModelOfType(sdk.ModelTypeClassifier, "typesafe", "missing")
+			if err != nil {
+				return nil, err
+			}
 			report["foundWindow"], report["missing"] = found["contextWindow"], missing
+			report["ofTypeWindow"], report["ofTypeMissing"] = ofType["contextWindow"], ofTypeMissing
 			return text(report)
 		},
 	})
@@ -162,8 +171,12 @@ func Extension() *sdk.Extension {
 			key := "sk-conf"
 			result := registry.Classify(model, approvalContext("Looks good"), &sdk.ClassifierOptions{APIKey: &key})
 			failed := registry.Classify(model, approvalContext("fail"), nil)
+			shown := approvalContext("Looks good")
+			shown.Images = []sdk.ImageContent{{Data: "aW1hZ2U=", MimeType: "image/png"}}
+			withImages := registry.Classify(model, shown, nil)
 			probability, _ := result.Answers.Get("approved")
-			return text(map[string]any{"stop": result.StopReason, "answers": result.Answers.Keys(), "approved": probability.(map[string]any)["probability"], "model": result.Model, "failedStop": failed.StopReason, "failedMessage": failed.ErrorMessage, "failedProvider": failed.Provider})
+			imagesProbability, _ := withImages.Answers.Get("approved")
+			return text(map[string]any{"stop": result.StopReason, "answers": result.Answers.Keys(), "approved": probability.(map[string]any)["probability"], "imagesApproved": imagesProbability.(map[string]any)["probability"], "model": result.Model, "failedStop": failed.StopReason, "failedMessage": failed.ErrorMessage, "failedProvider": failed.Provider})
 		},
 	})
 	e.RegisterTool(sdk.ToolDefinition{
@@ -202,6 +215,41 @@ func Extension() *sdk.Extension {
 		},
 	})
 	e.RegisterTool(sdk.ToolDefinition{
+		Name: "virtual_visible", Label: "virtual_visible", Description: "Registers a virtual model and reads the registry on the next line.", Parameters: object,
+		Execute: func(ctx sdk.Context, _ map[string]any) (any, error) {
+			registry := ctx.ModelRegistry()
+			route := func(sdk.Context, sdk.ModelRouteRequest) (sdk.ModelRoute, error) {
+				return sdk.ModelRoute{Model: map[string]any{"provider": "p", "id": "m"}, ThinkingLevel: "off"}, nil
+			}
+			listed := func() bool {
+				models, err := registry.GetAll()
+				if err != nil {
+					return false
+				}
+				for _, model := range models {
+					if model["provider"] == "router" && model["id"] == "seen" {
+						return true
+					}
+				}
+				return false
+			}
+			if err := registry.RegisterVirtualModel(sdk.VirtualModel{Provider: "router", ID: "seen", Name: "Seen", ContextWindow: 1000, Route: route}); err != nil {
+				return nil, err
+			}
+			found, err := registry.Find("router", "seen")
+			if err != nil {
+				return nil, err
+			}
+			registered, isListed := found != nil, listed()
+			registry.UnregisterVirtualModel("router", "seen")
+			gone, err := registry.Find("router", "seen")
+			if err != nil {
+				return nil, err
+			}
+			return text(map[string]any{"registered": registered, "listed": isListed, "gone": gone == nil, "unlisted": !listed()})
+		},
+	})
+	e.RegisterTool(sdk.ToolDefinition{
 		Name: "ops_status", Label: "ops_status", Description: "Reports what the host's provider requests did in the extension.", Parameters: object,
 		Execute: func(sdk.Context, map[string]any) (any, error) {
 			return text(map[string]any{"cancelled": cancelled.Load()})
@@ -209,5 +257,8 @@ func Extension() *sdk.Extension {
 	})
 	registerLateProbe(e)
 	registerThemeProbe(e)
+	registerTuiThemeProbe(e)
+	registerTuiProbe(e)
+	registerHostSurface(e)
 	return e
 }

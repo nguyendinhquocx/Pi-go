@@ -12,7 +12,21 @@ import (
 	"github.com/MichaelKinsy/PiG/durable"
 )
 
+// testContext is the caller context of every harness operation. It stays uncancelable: a cancelable shared parent would
+// keep every context the harness derives from it reachable and would cancel them all before the goroutine-leak check,
+// which then cannot see a goroutine that waits on a context the harness itself failed to end.
 var testContext = context.Background()
+
+// crashedProcesses lives until every test has run; TestMain then ends it. Only goroutines that model a crashed process
+// (Pi: a promise that never settles, a storage write that never returns) wait on it, so they exit when the tests end,
+// and the goroutine-leak check reports only goroutines abandoned on a primitive nothing can reach.
+var crashedProcesses, endCrashedProcesses = context.WithCancel(context.Background())
+
+// parkLikeACrashedProcess blocks like Pi's never-settling promise until the tests end.
+func parkLikeACrashedProcess() error {
+	<-crashedProcesses.Done()
+	return context.Cause(crashedProcesses)
+}
 
 // supportTool is harness-support.ts tool(): an object-parameter tool whose execution returns no content.
 func supportTool(name string, description ...string) *durable.ToolRegistration {
@@ -145,9 +159,13 @@ func addTask(t *testing.T, registry Registry, task durable.AnyTask, name ...stri
 var hookExtensions = 0
 
 // addHooks installs an extension with one hook registration for task; handlers is untyped so a test can register a handler set the task does not use.
-func addHooks(t *testing.T, registry Registry, task durable.AnyTask, handlers any) installed {
+func addHooks(t *testing.T, registry Registry, task durable.AnyTask, handlers any, name ...string) installed {
 	hookExtensions++
-	return installOne(t, registry, new(durable.Extension{Name: fmt.Sprintf("hooks:%d", hookExtensions), Hooks: []durable.HookRegistration{{Task: task.AnyDefinition().Name, Handlers: handlers}}}))
+	extension := fmt.Sprintf("hooks:%d", hookExtensions)
+	if len(name) > 0 {
+		extension = name[0]
+	}
+	return installOne(t, registry, new(durable.Extension{Name: extension, Hooks: []durable.HookRegistration{{Task: task.AnyDefinition().Name, Handlers: handlers}}}))
 }
 
 // addSection installs a one-section extension named after the section.

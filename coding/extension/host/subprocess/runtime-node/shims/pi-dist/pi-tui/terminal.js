@@ -3,14 +3,17 @@ import * as path from "node:path";
 import { setKittyProtocolActive } from "./keys.js";
 import { isNativeModifierPressed } from "./native-modifiers.js";
 import { getNativePlatformHelper } from "./native-platform.js";
+import { formatProgramStatus, isProgramStatusReply, PROGRAM_STATUS_QUERY, } from "./program-status.js";
 import { StdinBuffer } from "./stdin-buffer.js";
+import { replaceControlCharacters } from "./utils.js";
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0\x07";
 const NATIVE_SHIFT_ENTER_SEQUENCE = "\x1b[13;2u";
 const DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS = 7;
 const KEYBOARD_PROTOCOL_RESPONSE_FRAGMENT_TIMEOUT_MS = 150;
-const KITTY_KEYBOARD_PROTOCOL_QUERY = `\x1b[>${DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS}u\x1b[?u\x1b[c`;
+const KITTY_KEYBOARD_PROTOCOL_QUERY = `\x1b[>${DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS}u\x1b[?u`;
+const DEVICE_ATTRIBUTES_QUERY = "\x1b[c";
 export function parseKeyboardProtocolNegotiationSequence(sequence) {
     const kittyFlags = sequence.match(/^\x1b\[\?(\d+)u$/);
     if (kittyFlags) {
@@ -42,9 +45,14 @@ export function refreshTerminalDimensions() {
         // Signal delivery not permitted in this environment; ignore.
     }
 }
+// Some Apple Terminal setups send ESC+CR (Alt+Enter) for Shift+Enter (#11559).
+function isNativeShiftEnterCandidate(data) {
+    return data === "\r" || data === "\x1b\r";
+}
 export function normalizeNativeShiftEnterInput(data, shouldDetectNativeShiftEnter, isShiftPressed) {
-    if (shouldDetectNativeShiftEnter && data === "\r" && isShiftPressed)
+    if (shouldDetectNativeShiftEnter && isNativeShiftEnterCandidate(data) && isShiftPressed) {
         return NATIVE_SHIFT_ENTER_SEQUENCE;
+    }
     return data;
 }
 export function normalizeAppleTerminalInput(data, isAppleTerminal, isShiftPressed) {
@@ -84,6 +92,12 @@ export class ProcessTerminal {
     stdinBuffer;
     stdinDataHandler;
     progressInterval;
+    /** Latest program status, kept across stop() so start() can report it again. */
+    programStatus;
+    /** Whether the terminal confirmed OSC 7501 support since the last start(), or `PI_PROGRAM_STATUS=1`. */
+    programStatusSupported = false;
+    /** The support query was sent and its DA1 sentinel has not arrived yet. */
+    programStatusQueryPending = false;
     writeLogPath = (() => {
         const env = process.env.PI_TUI_WRITE_LOG || "";
         if (!env)
@@ -144,6 +158,14 @@ export class ProcessTerminal {
         this.stdinBuffer = new StdinBuffer({ escapeTimeout: resolveEscapeTimeoutMs() });
         // Forward individual sequences to the input handler
         this.stdinBuffer.on("data", (sequence) => {
+            if (isProgramStatusReply(sequence)) {
+                if (this.programStatusQueryPending) {
+                    this.programStatusQueryPending = false;
+                    this.programStatusSupported = true;
+                    this.writeProgramStatus();
+                }
+                return;
+            }
             const negotiation = this.readKeyboardProtocolNegotiationSequence(sequence);
             if (negotiation === "pending") {
                 this.scheduleKeyboardProtocolNegotiationBufferFlush();
@@ -177,6 +199,9 @@ export class ProcessTerminal {
      * - 1 = disambiguate escape codes
      * - 2 = report event types (press/repeat/release)
      * - 4 = report alternate keys (shifted key, base layout key)
+     *
+     * The OSC 7501 program status query shares the DA sentinel: a terminal that supports it replies
+     * before DA. `PI_PROGRAM_STATUS=1` or `0` skips the query.
      */
     queryAndEnableKittyProtocol() {
         this.setupStdinBuffer();
@@ -184,7 +209,12 @@ export class ProcessTerminal {
         this.keyboardProtocolPushed = true;
         this.pendingKeyboardProtocolDeviceAttributes += 1;
         this.clearKeyboardProtocolNegotiationBuffer();
-        process.stdout.write(KITTY_KEYBOARD_PROTOCOL_QUERY);
+        const programStatusOverride = process.env.PI_PROGRAM_STATUS;
+        this.programStatusSupported = programStatusOverride === "1";
+        this.programStatusQueryPending = programStatusOverride !== "1" && programStatusOverride !== "0";
+        const programStatusQuery = this.programStatusQueryPending ? PROGRAM_STATUS_QUERY : "";
+        process.stdout.write(`${KITTY_KEYBOARD_PROTOCOL_QUERY}${programStatusQuery}${DEVICE_ATTRIBUTES_QUERY}`);
+        this.writeProgramStatus();
     }
     handleKeyboardProtocolNegotiationSequence(negotiationSequence) {
         this.clearKeyboardProtocolNegotiationBuffer();
@@ -192,6 +222,10 @@ export class ProcessTerminal {
             if (this.pendingKeyboardProtocolDeviceAttributes === 0)
                 return false;
             this.pendingKeyboardProtocolDeviceAttributes -= 1;
+            // The last owed DA answers the latest query, which got no program status reply first. Earlier DA
+            // replies belong to queries from before a restart.
+            if (this.pendingKeyboardProtocolDeviceAttributes === 0)
+                this.programStatusQueryPending = false;
         }
         if (negotiationSequence.type === "kitty-flags") {
             if (negotiationSequence.flags !== 0) {
@@ -267,7 +301,7 @@ export class ProcessTerminal {
     forwardInputSequence(sequence) {
         if (!this.inputHandler)
             return;
-        const shouldDetectNativeShiftEnter = sequence === "\r" && (isAppleTerminalSession() || process.platform === "win32");
+        const shouldDetectNativeShiftEnter = isNativeShiftEnterCandidate(sequence) && (isAppleTerminalSession() || process.platform === "win32");
         const input = normalizeNativeShiftEnterInput(sequence, shouldDetectNativeShiftEnter, shouldDetectNativeShiftEnter && isNativeModifierPressed("shift"));
         this.inputHandler(input);
     }
@@ -339,6 +373,12 @@ export class ProcessTerminal {
         if (this.clearProgressInterval()) {
             process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
         }
+        // Remove the status while stopped, for example after exit or while suspended. start() reports it again.
+        if (this.programStatusSupported && this.programStatus) {
+            process.stdout.write(formatProgramStatus({ state: "clear" }));
+        }
+        this.programStatusSupported = false;
+        this.programStatusQueryPending = false;
         // Disable bracketed paste mode
         process.stdout.write("\x1b[?2004l");
         const shouldDisableKittyProtocol = this.keyboardProtocolPushed || this._kittyProtocolActive;
@@ -373,6 +413,24 @@ export class ProcessTerminal {
         // Restore raw mode state
         if (process.stdin.setRawMode) {
             process.stdin.setRawMode(this.wasRaw);
+        }
+    }
+    restoreOnExit(before, after) {
+        let sequence = before;
+        if (this.progressInterval)
+            sequence += TERMINAL_PROGRESS_CLEAR_SEQUENCE;
+        sequence += "\x1b[?2004l";
+        if (this.keyboardProtocolPushed || this._kittyProtocolActive)
+            sequence += "\x1b[<u";
+        if (this._modifyOtherKeysActive)
+            sequence += "\x1b[>4;0m";
+        sequence += after;
+        try {
+            // process.stdout.write() may be asynchronous (e.g. Windows TTYs) and would not flush during exit.
+            fs.writeSync(process.stdout.fd, sequence);
+        }
+        catch {
+            // The terminal may already be gone.
         }
     }
     write(data) {
@@ -419,8 +477,19 @@ export class ProcessTerminal {
         process.stdout.write("\x1b[2J\x1b[H"); // Clear screen and move to home (1,1)
     }
     setTitle(title) {
-        // OSC 0;title BEL - set terminal window title
-        process.stdout.write(`\x1b]0;${title}\x07`);
+        // OSC 0;title BEL - set terminal window title. A BEL or ESC in the title would end the sequence early and
+        // send the rest to the terminal as escape sequences (session names come from session files).
+        process.stdout.write(`\x1b]0;${replaceControlCharacters(title)}\x07`);
+    }
+    setProgramStatus(status) {
+        this.programStatus = status.state === "clear" ? undefined : status;
+        if (this.programStatusSupported)
+            process.stdout.write(formatProgramStatus(status));
+    }
+    writeProgramStatus() {
+        if (this.programStatusSupported && this.programStatus) {
+            process.stdout.write(formatProgramStatus(this.programStatus));
+        }
     }
     setProgress(active) {
         if (active) {

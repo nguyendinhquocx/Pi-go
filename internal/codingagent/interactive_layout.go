@@ -1,9 +1,16 @@
 package codingagent
 
+// Ports packages/coding-agent/src/modes/interactive/interactive-mode.ts (working loader, status container and extension dialog layout).
+
 import (
 	"context"
+	"runtime"
+	"runtime/debug"
+	"runtime/metrics"
+	"sync/atomic"
 	"time"
 
+	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/tui"
 )
 
@@ -50,8 +57,8 @@ func (m *InteractiveMode) onTerminalHeightChange(height int) {
 	if m.opts.SubprocessHost != nil {
 		m.opts.SubprocessHost.NotifyHeight(height)
 	}
-	if m.extensionDialog != nil {
-		m.setExtensionDialogViewMode(true, m.extensionDialogLines(m.extensionDialog.component))
+	if dialog := m.shownExtensionDialog(); dialog != nil {
+		m.setExtensionDialogViewMode(true, m.extensionDialogLines(dialog.component))
 	}
 }
 
@@ -70,18 +77,18 @@ func (m *InteractiveMode) setStatusContainerLabel(label string) {
 		m.activeStatusIndicator.SetMessage(label)
 		return
 	}
-	m.showStatusIndicator(&tui.StatusIndicator{Kind: "retry", Loader: tui.NewStyledLoader(tui.ActiveTheme().Warning, tui.ActiveTheme().Muted, label, nil)})
+	m.showStatusIndicator(&tui.StatusIndicator{Kind: "retry", Loader: tui.NewLoader(m.tuiInst, tui.ThemeFg("warning"), tui.ThemeFg("muted"), label, nil)})
 }
 
 func (m *InteractiveMode) startWorkingLoader() {
 	if !m.workingVisible {
 		return
 	}
-	message := m.workingMessage
-	if message == "" {
-		message = "Working"
+	message := "Working"
+	if m.workingMessage != nil {
+		message = *m.workingMessage
 	}
-	indicator := &tui.StatusIndicator{Kind: "working", Loader: tui.NewStyledLoader(tui.ActiveTheme().Accent, tui.ActiveTheme().Muted, message, nil)}
+	indicator := &tui.StatusIndicator{Kind: "working", Loader: tui.NewLoader(m.tuiInst, tui.ThemeFg("accent"), tui.ThemeFg("muted"), message, nil)}
 	m.applyWorkingIndicatorOptions(indicator)
 	m.showStatusIndicator(indicator)
 	m.tuiInst.RequestRender()
@@ -89,16 +96,66 @@ func (m *InteractiveMode) startWorkingLoader() {
 
 func (m *InteractiveMode) stopWorkingLoader() { m.clearStatusIndicator("working") }
 
+// tickSpinner drives status-indicator frames. Like Pi's Loader, whose
+// setInterval exists only while a loader does, the ticker parks once a tick
+// finds the session idle with no indicator, so an idle session takes no timer
+// wakes. Owner-loop posts, scheduled renders and indicator changes wake it.
+//
+// A run's end (or a busy tick) arms one idle collection. Once the session has
+// stayed idle for idleCollectAfter, the heap is returned to the OS once if it
+// grew since the last collection; a wake restarts the wait, and while the wait
+// runs every input event wakes it (Pi-Bolt idle-gc.ts).
+// pig additive (D172): the ticker parks while idle and returns heap once after a run.
 func (m *InteractiveMode) tickSpinner(ctx context.Context) {
-	ticker := time.NewTicker(80 * time.Millisecond) // upstream: tui/src/components/loader.ts:DEFAULT_INTERVAL_MS
+	interval := 80 * time.Millisecond // upstream: tui/src/components/loader.ts:DEFAULT_INTERVAL_MS
+	//perf:ok one ticker per spinner goroutine; parking stops it and a wake resets it
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	tickC := ticker.C
+	var collectC <-chan time.Time
+	var collectTimer *time.Timer
+	stopCollect := func() {
+		if collectTimer != nil {
+			collectTimer.Stop()
+			collectTimer, collectC = nil, nil
+			m.idleCollectPending.Store(false)
+		}
+	}
+	defer stopCollect()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case interval := <-m.spinnerIntervalCh:
+		case next := <-m.spinnerIntervalCh:
+			interval = next
 			ticker.Reset(interval)
-		case <-ticker.C:
+			tickC = ticker.C
+			stopCollect()
+		case <-m.spinnerWakeCh:
+			if tickC == nil {
+				ticker.Reset(interval)
+				tickC = ticker.C
+			}
+			stopCollect()
+		case park := <-m.spinnerParkCh:
+			if tickC == nil || park.gen != m.spinnerWakeGen.Load() {
+				continue // a wake arrived after the idle tick was posted
+			}
+			ticker.Stop()
+			tickC = nil
+			if park.afterBusy {
+				stopCollect()
+				//perf:ok once per idle park while armed (D172 idle heap return), not per tick
+				collectTimer = time.NewTimer(idleCollectAfter)
+				collectC = collectTimer.C
+				m.idleCollectPending.Store(true)
+			}
+		case <-collectC:
+			collectTimer, collectC = nil, nil
+			m.idleCollectPending.Store(false)
+			m.idleCollectArmed.Store(false)
+			m.idleCollector.collect()
+		case <-tickC:
 			// Like a Node setInterval on a blocked event loop, ticks that come
 			// due while one is still queued collapse into it; a stalled loop
 			// must not wake to a backlog of frames or a task queue full of
@@ -106,17 +163,96 @@ func (m *InteractiveMode) tickSpinner(ctx context.Context) {
 			if !m.spinnerTickQueued.CompareAndSwap(false, true) {
 				continue
 			}
-			if !m.postUITask(func() {
+			gen := m.spinnerWakeGen.Load()
+			if !m.postUITaskQuiet(func() {
 				m.spinnerTickQueued.Store(false)
 				if ctx.Err() != nil {
 					return
 				}
+				if m.isIdle && m.activeStatusIndicator == nil {
+					select {
+					case m.spinnerParkCh <- spinnerPark{gen: gen, afterBusy: m.idleCollectArmed.Load()}:
+					default:
+					}
+					return
+				}
+				m.idleCollectArmed.Store(true)
 				m.tickStatusIndicators(time.Now())
 			}) {
 				m.spinnerTickQueued.Store(false)
 			}
 		}
 	}
+}
+
+// idleCollectAfter is how long the session stays idle after a run before the
+// idle collection. Mirrors Pi-Bolt's IDLE_GC_DELAY_MS (packages/coding-agent/src/core/idle-gc.ts).
+const idleCollectAfter = 500 * time.Millisecond
+
+type spinnerPark struct {
+	gen       uint64
+	afterBusy bool
+}
+
+// wakeSpinner resumes a parked spinner ticker; its next tick re-checks idleness.
+func (m *InteractiveMode) wakeSpinner() {
+	if m.spinnerWakeCh == nil {
+		return
+	}
+	m.spinnerWakeGen.Add(1)
+	select {
+	case m.spinnerWakeCh <- struct{}{}:
+	default:
+	}
+}
+
+// pig additive (D172): idle heap return after a run, mirroring Pi-Bolt 4ee61e8a.
+// idleHeapCollector returns freed heap to the OS once per idle period, only
+// when the live heap grew since its last collection.
+type idleHeapCollector struct {
+	lastHeap uint64
+	collects atomic.Int32
+}
+
+func (c *idleHeapCollector) collect() {
+	sample := []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
+	metrics.Read(sample)
+	if sample[0].Value.Kind() != metrics.KindUint64 || sample[0].Value.Uint64() <= c.lastHeap {
+		return
+	}
+	// pig additive (D112, D172): the request caches hold the encodings of the conversation the run sent; an idle session lets them go, and the
+	// next prompt encodes its request as its first did.
+	ai.ReleaseRequestCaches()
+	// One forced cycle moves sync.Pool contents to their victim caches and leaves them live; the second, in
+	// FreeOSMemory, frees them and returns the pages (about 290 KB at the tmux prompt, TestTmuxIdleMemoryGate).
+	runtime.GC()
+	debug.FreeOSMemory()
+	metrics.Read(sample)
+	c.lastHeap = sample[0].Value.Uint64()
+	c.collects.Add(1)
+}
+
+// releaseStartupHeap returns the heap the start left free to the OS, once: the first frame and the startup loads (settings, the model catalog,
+// the resource listings, the grammars) allocate several times what they keep, and the runtime's background scavenger releases the rest
+// slowly. It runs on a background task after the first frame, never on the owner loop, which keeps handling input while the collection runs.
+// pig additive (D172): the same heap return as the idle collection, once at start.
+func releaseStartupHeap() {
+	debug.FreeOSMemory()
+}
+
+// releaseSwitchHeap returns the heap a Session replacement or a tree navigation left free to the OS, on a task the mode owns after the new
+// transcript is painted: the replaced Session's entries and the load's buffers are garbage by then, and the runtime's scavenger returns them
+// slowly. One release is queued at a time; a switch that arrives while it runs is covered by it or by the idle collection.
+// pig additive (D172): the same heap return as the one at start, which ran before any switch.
+func (m *InteractiveMode) releaseSwitchHeap() {
+	m.switchHeapReleases.Add(1)
+	if !m.switchHeapRelease.CompareAndSwap(false, true) {
+		return
+	}
+	m.backgroundTasks.Go(func() {
+		defer m.switchHeapRelease.Store(false)
+		releaseStartupHeap()
+	})
 }
 
 func (m *InteractiveMode) tickStatusIndicators(now time.Time) {

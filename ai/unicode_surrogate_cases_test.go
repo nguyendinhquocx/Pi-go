@@ -117,29 +117,29 @@ func unicodeUpstreamCases() []unicodeUpstreamCase {
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:625
 		{"should handle unpaired high surrogate (0xD83D) in tool results", "minimax", "MiniMax-M2.7", 2, false, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:633
-		{"should handle emoji in tool results", "xiaomi", "mimo-v2.5-pro", 0, false, ""},
+		{"should handle emoji in tool results", "xiaomi", "mimo-v2.6-pro", 0, false, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:637
-		{"should handle real-world LinkedIn comment data with emoji", "xiaomi", "mimo-v2.5-pro", 1, false, ""},
+		{"should handle real-world LinkedIn comment data with emoji", "xiaomi", "mimo-v2.6-pro", 1, false, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:641
-		{"should handle unpaired high surrogate (0xD83D) in tool results", "xiaomi", "mimo-v2.5-pro", 2, false, ""},
+		{"should handle unpaired high surrogate (0xD83D) in tool results", "xiaomi", "mimo-v2.6-pro", 2, false, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:651
-		{"should handle emoji in tool results", "xiaomi-token-plan-cn", "mimo-v2.5-pro", 0, false, ""},
+		{"should handle emoji in tool results", "xiaomi-token-plan-cn", "mimo-v2.6-pro", 0, false, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:655
-		{"should handle real-world LinkedIn comment data with emoji", "xiaomi-token-plan-cn", "mimo-v2.5-pro", 1, false, ""},
+		{"should handle real-world LinkedIn comment data with emoji", "xiaomi-token-plan-cn", "mimo-v2.6-pro", 1, false, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:659
-		{"should handle unpaired high surrogate (0xD83D) in tool results", "xiaomi-token-plan-cn", "mimo-v2.5-pro", 2, false, ""},
+		{"should handle unpaired high surrogate (0xD83D) in tool results", "xiaomi-token-plan-cn", "mimo-v2.6-pro", 2, false, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:674
-		{"should handle emoji in tool results", "xiaomi-token-plan-ams", "mimo-v2.5-pro", 0, false, ""},
+		{"should handle emoji in tool results", "xiaomi-token-plan-ams", "mimo-v2.6-pro", 0, false, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:678
-		{"should handle real-world LinkedIn comment data with emoji", "xiaomi-token-plan-ams", "mimo-v2.5-pro", 1, false, ""},
+		{"should handle real-world LinkedIn comment data with emoji", "xiaomi-token-plan-ams", "mimo-v2.6-pro", 1, false, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:682
-		{"should handle unpaired high surrogate (0xD83D) in tool results", "xiaomi-token-plan-ams", "mimo-v2.5-pro", 2, false, ""},
+		{"should handle unpaired high surrogate (0xD83D) in tool results", "xiaomi-token-plan-ams", "mimo-v2.6-pro", 2, false, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:697
-		{"should handle emoji in tool results", "xiaomi-token-plan-sgp", "mimo-v2.5-pro", 0, false, ""},
+		{"should handle emoji in tool results", "xiaomi-token-plan-sgp", "mimo-v2.6-pro", 0, false, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:701
-		{"should handle real-world LinkedIn comment data with emoji", "xiaomi-token-plan-sgp", "mimo-v2.5-pro", 1, false, ""},
+		{"should handle real-world LinkedIn comment data with emoji", "xiaomi-token-plan-sgp", "mimo-v2.6-pro", 1, false, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:705
-		{"should handle unpaired high surrogate (0xD83D) in tool results", "xiaomi-token-plan-sgp", "mimo-v2.5-pro", 2, false, ""},
+		{"should handle unpaired high surrogate (0xD83D) in tool results", "xiaomi-token-plan-sgp", "mimo-v2.6-pro", 2, false, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:718
 		{"should handle emoji in tool results", "qwen-token-plan", "qwen3.7-max", 0, false, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:722
@@ -177,10 +177,10 @@ func unicodeUpstreamCases() []unicodeUpstreamCase {
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:806
 		{"should handle unpaired high surrogate (0xD83D) in tool results", "amazon-bedrock", "global.anthropic.claude-sonnet-4-5-20250929-v1:0", 2, false, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:812
-		{"gpt-5.5 - should handle emoji in tool results", "openai-codex", "gpt-5.5", 0, true, ""},
+		{"gpt-6.1-sol - should handle emoji in tool results", "openai-codex", "gpt-6.1-sol", 0, true, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:821
-		{"gpt-5.5 - should handle real-world LinkedIn comment data with emoji", "openai-codex", "gpt-5.5", 1, true, ""},
+		{"gpt-6.1-sol - should handle real-world LinkedIn comment data with emoji", "openai-codex", "gpt-6.1-sol", 1, true, ""},
 		// .upstream/v0.87.1/packages/ai/test/unicode-surrogate.test.ts:830
-		{"gpt-5.5 - should handle unpaired high surrogate (0xD83D) in tool results", "openai-codex", "gpt-5.5", 2, true, ""},
+		{"gpt-6.1-sol - should handle unpaired high surrogate (0xD83D) in tool results", "openai-codex", "gpt-6.1-sol", 2, true, ""},
 	}
 }

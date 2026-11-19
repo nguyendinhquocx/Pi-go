@@ -3,21 +3,27 @@
 
 package harness
 
+// pi: packages/durable/src/harness/submissions.ts
+
 import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"strconv"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/durable"
+	"github.com/MichaelKinsy/PiG/durable/session"
 	"github.com/MichaelKinsy/PiG/durable/storage"
 )
 
 // ownTool builds an executable tool with an object schema.
 func ownTool(name, description string, parameters map[string]any, execute func(ctx context.Context, args any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error), edit ...func(*durable.ToolRegistration)) *durable.ToolRegistration {
-	tool := new(durable.ToolRegistration{
+	tool := DefineTool(durable.ToolRegistration{
 		ToolSchema: ai.ToolSchema{Name: name, Description: description, Parameters: parameters},
 		Execute:    execute,
 	})
@@ -28,12 +34,12 @@ func ownTool(name, description string, parameters map[string]any, execute func(c
 }
 
 func ownText(text string) durable.ToolExecutionResult {
-	return durable.ToolExecutionResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: text}}}
+	return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{ai.TextContent{Text: text}}}
 }
 
 // ownCall is a tool-calling faux answer with one call.
 func ownCall(name string, args map[string]any, id string) ai.FauxResponseStep {
-	return ai.FauxStaticStep(ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxToolCall(name, args, id)}, StopReason: "toolUse"})
+	return ai.FauxStaticStep(ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxToolCall(name, args, &ai.FauxToolCallOptions{ID: id})}, StopReason: "toolUse"})
 }
 
 // ownGatedStep is a faux response held until release or cancellation; reached resolves when the request is sent.
@@ -45,12 +51,12 @@ type ownGatedStep struct {
 
 func ownGated(text string) ownGatedStep {
 	held := ownGatedStep{reached: deferred(), gate: deferred()}
-	held.step = ai.FauxFactoryStep(func(_ ai.TranscriptContext, options ai.StreamOptions, _ *ai.FauxProviderState, _ *ai.Model) (ai.FauxResponse, error) {
+	held.step = ai.FauxFactoryStep(func(_ ai.TranscriptContext, options ai.StreamOptions, _ *ai.FauxProviderState, _ *ai.Model) (ai.AssistantMessage, error) {
 		held.reached.resolve()
 		if err := held.gate.wait(options.Signal); err != nil {
-			return ai.FauxResponse{}, err
+			return ai.FauxResponse{}.AssistantMessage(), err
 		}
-		return ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxText(text)}}, nil
+		return ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxText(text)}}.AssistantMessage(), nil
 	})
 	return held
 }
@@ -100,13 +106,16 @@ func ownSubmitAndWait(t *testing.T, conversation Conversation, text string) dura
 	return settled
 }
 
+// Pi TaskRuntime.conversation: packages/durable/src/types.ts:217.
 func TestOwnedConversationsFromTools(t *testing.T) {
 	t.Run("gives a tool an invocation-bound handle whose submissions stay durable after the call ends", func(t *testing.T) {
 		setup := chatSetup(t)
 		handle := &syncValue[durable.ConversationHandle]{}
 		missing := &syncValue[durable.ConversationHandle]{}
 		submission := &syncValue[durable.Submission]{}
+		toolContext := &syncValue[context.Context]{}
 		addTool(t, setup.Registry, ownTool("delegate", "Delegates", emptyObjectSchema(), func(ctx context.Context, _ any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
+			toolContext.put(ctx)
 			child, err := ownCreateChild(ctx, api)
 			if err != nil {
 				return durable.ToolExecutionResult{}, err
@@ -138,6 +147,10 @@ func TestOwnedConversationsFromTools(t *testing.T) {
 		if absent, _ := missing.get(); absent != nil {
 			t.Fatalf("handle of an absent conversation is %v, want nil", absent)
 		}
+		// The call's invocation ends in the step after its phase, on its own goroutine, and the parent's turn goes on from the call's result
+		// without waiting for it. The call's context is the invocation's, which the end cancels after it marks the invocation ended.
+		callContext, _ := toolContext.get()
+		<-callContext.Done()
 		// The call ended: the handle and its submission reject, while the submission record remains.
 		bound, _ := handle.get()
 		_, submitErr := bound.Submit(testContext, ownInput("again"))
@@ -166,15 +179,21 @@ func TestOwnedConversationsFromTools(t *testing.T) {
 		mustClose(t, harness)
 	})
 
-	t.Run("rejects a handle operation queued on the line when the invocation ends before it runs", func(t *testing.T) {
+	// harness-ownership.test.ts:1067 it("runs a handle operation queued behind the abort mark before the mark's publication,
+	// and the cascade aborts it") (Pi e5c6182b)
+	t.Run("runs a handle operation queued behind the abort mark before the mark's publication, and the cascade aborts it", func(t *testing.T) {
 		setup := chatSetup(t)
 		type ready struct {
 			child  durable.ConversationId
 			taskId durable.TaskId
 		}
+		type submitted struct {
+			submission durable.Submission
+			err        error
+		}
 		readyValue := &syncValue[ready]{}
 		goSubmit := deferred()
-		submitting := make(chan error, 1)
+		submitting := make(chan submitted, 1)
 		submitQueued := deferred()
 		addTool(t, setup.Registry, ownTool("delegate", "Delegates late", emptyObjectSchema(), func(ctx context.Context, _ any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			value, err := api.Commit(ctx, func(tx durable.Tx) (any, error) {
@@ -196,17 +215,20 @@ func TestOwnedConversationsFromTools(t *testing.T) {
 			// Called while the invocation is alive, with a context that is not the call's: the handle binds it to the
 			// invocation. It reaches the line only after the abort mark.
 			go func() {
-				_, submitErr := bound.Submit(testContext, ownInput("late"))
-				submitting <- submitErr
+				submission, submitErr := bound.Submit(testContext, ownInput("late"))
+				submitting <- submitted{submission, submitErr}
 			}()
 			submitQueued.resolve()
 			return durable.ToolExecutionResult{}, abortedBy(ctx)
 		}))
 		setup.Faux.SetResponses([]ai.FauxResponseStep{ownCall("delegate", map[string]any{}, "c1")})
-		harness, root := openChat(t, storage.NewMemoryStorage(), setup)
+		// Holds the storage call that writes the abort mark, so the mark is published only once the test lets it.
+		store := &holdMarkStorage{MemoryStorage: storage.NewMemoryStorage(), entered: deferred(), stored: deferred()}
+		harness, root := openChat(t, store, setup)
 		ownSubmit(t, root, ownInput("go"))
 		eventually(t, readyValue.isSet)
 		info, _ := readyValue.get()
+		store.hold(info.taskId)
 		// Hold the Session line, queue the abort mark behind it, then let the tool queue its submit.
 		entered, release := deferred(), deferred()
 		holding := goCall(func() error {
@@ -237,14 +259,38 @@ func TestOwnedConversationsFromTools(t *testing.T) {
 		if err := holding.wait(t); err != nil {
 			t.Fatal(err)
 		}
+		// The submit starts while the mark's storage call is in flight: once the call is held, the submit's job waits for the
+		// mark's publication, which it does only after its start check passed. Nothing else takes the task's gate meanwhile.
+		if err := store.entered.wait(testContext); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, func() bool { return line.GateTouches(session.TaskKey(info.taskId)) > 0 })
+		store.stored.resolve()
 		if err := aborting.wait(t); err != nil {
 			t.Fatal(err)
 		}
-		if err := tkWaitErr(t, submitting); err == nil {
-			t.Fatal("the late submit was admitted")
+		// Cancellation is checked when a job starts: the submit's job started, and passed its check, before the mark is
+		// published, so it lands. The mark's cascade then aborts the run it started in the owned conversation.
+		var late submitted
+		select {
+		case late = <-submitting:
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for the late submit")
 		}
-		if entries := ownChildEntries(t, harness, info.child); len(entries) != 0 {
-			t.Fatalf("child entries %+v, want none", entries)
+		if late.err != nil {
+			t.Fatalf("the late submit failed: %v", late.err)
+		}
+		waitForIdle(t, ownConversation(t, harness, info.child))
+		record := ownSubmissionStatus(t, harness, late.submission.Id())
+		if record.Status != durable.SubmissionUnanswered || record.Reason == nil || *record.Reason != "aborted" {
+			t.Fatalf("submission %+v, want unanswered, aborted", record)
+		}
+		kinds := []string{}
+		for _, entry := range ownChildEntries(t, harness, info.child) {
+			kinds = append(kinds, entry.Kind)
+		}
+		if !reflect.DeepEqual(kinds, []string{"pi.user"}) {
+			t.Fatalf("child entries %v, want [pi.user]", kinds)
 		}
 		inspection, err := harness.Inspect(testContext)
 		if err != nil {
@@ -252,7 +298,103 @@ func TestOwnedConversationsFromTools(t *testing.T) {
 		}
 		for _, record := range inspection.Submissions {
 			if record.ConversationId == info.child {
-				t.Fatalf("submission %+v admitted in the child", record)
+				t.Fatalf("submission %+v still open in the child", record)
+			}
+		}
+		mustClose(t, harness)
+	})
+
+	// Go-only: not a case of harness-ownership.test.ts at v1.5.0. It keeps the expectations of the v1.4.0 case `rejects a handle
+	// operation queued on the line when the invocation ends before it runs`, which Pi replaced by the case above, as the other
+	// order of the same race: the mark is published while an earlier job holds the line, so the invocation is aborted before the
+	// submit's job starts and session.ts commit's `context.abortSignal?.throwIfAborted()` rejects it (Pi e5c6182b, harness.ts submit).
+	t.Run("rejects a handle submit whose invocation was aborted while it was queued behind a line job, and stores nothing", func(t *testing.T) {
+		setup := chatSetup(t)
+		type ready struct {
+			child  durable.ConversationId
+			taskId durable.TaskId
+			ctx    context.Context
+			bound  durable.ConversationHandle
+		}
+		readyValue := &syncValue[ready]{}
+		addTool(t, setup.Registry, ownTool("delegate", "Delegates late", emptyObjectSchema(), func(ctx context.Context, _ any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
+			child, err := ownCreateChild(ctx, api)
+			if err != nil {
+				return durable.ToolExecutionResult{}, err
+			}
+			bound, err := api.Conversation(ctx, child)
+			if err != nil || bound == nil {
+				return durable.ToolExecutionResult{}, errors.New("child conversation is missing")
+			}
+			readyValue.put(ready{child: child, taskId: api.TaskId(), ctx: ctx, bound: bound})
+			return durable.ToolExecutionResult{}, abortedBy(ctx)
+		}))
+		setup.Faux.SetResponses([]ai.FauxResponseStep{ownCall("delegate", map[string]any{}, "c1")})
+		harness, root := openChat(t, storage.NewMemoryStorage(), setup)
+		ownSubmit(t, root, ownInput("go"))
+		eventually(t, readyValue.isSet)
+		info, _ := readyValue.get()
+		// The line holds two jobs that outlast the abort mark's publication: the first, the mark behind it, then the second,
+		// with the handle's submit behind that. The mark publishes while the second job holds the line.
+		hold := func(entered, release *deferredGate) *future[struct{}] {
+			var holding *future[struct{}]
+			queueOnLineAdmitted(t, func(admitted context.Context) <-chan struct{} {
+				holding = asyncErr(func() error {
+					_, err := root.Commit(admitted, func(durable.Tx) (any, error) {
+						entered.resolve()
+						return nil, release.wait(testContext)
+					})
+					return err
+				})
+				return holding.done
+			})
+			return holding
+		}
+		firstEntered, firstRelease := deferred(), deferred()
+		secondEntered, secondRelease := deferred(), deferred()
+		first := hold(firstEntered, firstRelease)
+		if err := firstEntered.wait(testContext); err != nil {
+			t.Fatal(err)
+		}
+		var aborting *future[struct{}]
+		queueOnLineAdmitted(t, func(admitted context.Context) <-chan struct{} {
+			aborting = asyncErr(func() error {
+				_, err := harness.AbortTask(admitted, info.taskId)
+				return err
+			})
+			return aborting.done
+		})
+		second := hold(secondEntered, secondRelease)
+		var submitting *future[durable.Submission]
+		queueOnLineAdmitted(t, func(admitted context.Context) <-chan struct{} {
+			submitting = async(func() (durable.Submission, error) { return info.bound.Submit(admitted, ownInput("late")) })
+			return submitting.done
+		})
+		firstRelease.resolve()
+		if err := secondEntered.wait(testContext); err != nil {
+			t.Fatal(err)
+		}
+		// The mark was published while the second job runs: the invocation is aborted before the submit's job starts.
+		<-info.ctx.Done()
+		secondRelease.resolve()
+		for _, done := range []*future[struct{}]{first, aborting, second} {
+			if _, err := done.wait(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if submission, err := submitting.wait(); err == nil {
+			t.Fatalf("the submit queued before the invocation was aborted was admitted as %v, want it rejected when its job started", submission.Id())
+		}
+		if users := ownCountKind(ownChildEntries(t, harness, info.child), "pi.user"); users != 0 {
+			t.Fatalf("%d user entries in the child, want 0", users)
+		}
+		inspection, err := harness.Inspect(testContext)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, record := range inspection.Submissions {
+			if record.ConversationId == info.child {
+				t.Fatalf("submission %+v stored in the child", record)
 			}
 		}
 		mustClose(t, harness)
@@ -304,10 +446,7 @@ func TestOwnedConversationsFromTools(t *testing.T) {
 		if err := ownConversation(t, harness, childId).WaitForIdle(testContext); err != nil {
 			t.Fatal(err)
 		}
-		live, err := harness.SnapshotErased(testContext, LiveDoc, childId)
-		if err != nil || !reflect.DeepEqual(live, durable.JsonObject{}) {
-			t.Fatalf("child live document %v %v, want {}", live, err)
-		}
+		expectOnlyRunFailure(t, harness, childId, RunAborted)
 		inspection, err := harness.Inspect(testContext)
 		if err != nil {
 			t.Fatal(err)
@@ -365,7 +504,7 @@ func TestOwnedConversationsFromTools(t *testing.T) {
 		children := &syncList[durable.TaskId]{}
 		toolRunning := deferred()
 		setup := chatSetup(t)
-		addTask(t, setup.Registry, fixtures.hold)
+		addTask(t, setup.Registry, fixtures.hold.Erased())
 		addTool(t, setup.Registry, ownTool("spawn", "Starts owned work, then throws or hangs",
 			map[string]any{"type": "object", "properties": map[string]any{"mode": map[string]any{"type": "string"}}, "required": []any{"mode"}},
 			func(ctx context.Context, args any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
@@ -495,7 +634,7 @@ func TestOwnedConversationsFromTools(t *testing.T) {
 		if users := ownCountKind(ownChildEntries(t, harness, seen[0]), "pi.user"); users != 1 {
 			t.Fatalf("%d user entries in the child, want 1", users)
 		}
-		view, err := root.Context(testContext)
+		view, err := root.Context(testContext, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -517,9 +656,8 @@ func TestOwnedConversationsFromTools(t *testing.T) {
 			Child *durable.ConversationId `json:"child,omitempty"`
 		}
 		children := durable.DefineDoc(durable.DocDefinition[childrenState]{
-			CommonDocDefinition: durable.CommonDocDefinition[childrenState]{Kind: "test.children", Version: 1},
+			CommonDocDefinition: durable.CommonDocDefinition[childrenState]{Kind: "test.children", Version: 1, Initial: func() childrenState { return childrenState{} }, CheckpointWhen: func(childrenState, []durable.Op, durable.CheckpointInfo) bool { return false }},
 			DocumentSemantics:   durable.DocumentSemantics{Scope: durable.ScopeConversation, History: durable.HistoryLatest, Fork: durable.ForkInitial},
-			Initial:             func() childrenState { return childrenState{} },
 		})
 		type supervisorInput struct {
 			Parent durable.ConversationId `json:"parent"`
@@ -567,7 +705,7 @@ func TestOwnedConversationsFromTools(t *testing.T) {
 			},
 		})
 		setup := chatSetup(t)
-		addTask(t, setup.Registry, supervisor)
+		addTask(t, setup.Registry, supervisor.Erased())
 		first := ownGated("never")
 		setup.Faux.SetResponses([]ai.FauxResponseStep{first.step, fauxAnswer("answer")})
 		harness, root := openChat(t, tkOpenSqlite(t, path), setup)
@@ -617,4 +755,38 @@ func TestOwnedConversationsFromTools(t *testing.T) {
 		}
 		mustClose(t, harness)
 	})
+}
+
+// holdMarkStorage holds the storage call that writes the abort mark of one task until stored resolves; entered resolves
+// once the call is held.
+type holdMarkStorage struct {
+	*storage.MemoryStorage
+	mu      sync.Mutex
+	target  durable.TaskId
+	entered *deferredGate
+	stored  *deferredGate
+}
+
+func (store *holdMarkStorage) hold(id durable.TaskId) {
+	store.mu.Lock()
+	store.target = id
+	store.mu.Unlock()
+}
+
+func (store *holdMarkStorage) Commit(ctx context.Context, batches [][]durable.StorageWrite, receive func(index int, seq durable.Seq)) (durable.CommitResult, error) {
+	store.mu.Lock()
+	target := store.target
+	marks := target != 0 && slices.ContainsFunc(slices.Concat(batches...), func(write durable.StorageWrite) bool {
+		task, ok := write.(durable.TaskWrite)
+		return ok && task.Value.Id == target && task.Value.AbortRequested
+	})
+	if marks {
+		store.target = 0
+	}
+	store.mu.Unlock()
+	if marks {
+		store.entered.resolve()
+		_ = store.stored.wait(testContext)
+	}
+	return store.MemoryStorage.Commit(ctx, batches, receive)
 }

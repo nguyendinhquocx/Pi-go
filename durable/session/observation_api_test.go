@@ -1,12 +1,16 @@
 package session_test
 
+// pi: packages/durable/src/session/session.ts
+
+// pi: packages/durable/src/session/observation.ts
+
 import (
 	"context"
 	"runtime"
 	"sync/atomic"
 	"testing"
 
-	"github.com/MichaelKinsy/PiG/chord"
+	"github.com/MichaelKinsy/PiG/chord/delta"
 
 	"github.com/MichaelKinsy/PiG/durable"
 	"github.com/MichaelKinsy/PiG/durable/session"
@@ -16,49 +20,30 @@ import (
 // The Harness drives committed observations directly (view.ts:90 and :104, events.ts:132); these cases pin the exported
 // constructor and lifecycle surface it uses.
 func TestCommittedObservationHarnessSurface(t *testing.T) {
-	t.Run("a session-bound watch delivers advanced frames and ends cancelled", func(t *testing.T) {
+	t.Run("a session-bound watch delivers advanced frames and ends aborted", func(t *testing.T) {
 		harness := open()
 		released := 0
-		watch := session.NewCommittedWatch(harness.Session, []any{}, func() { released++ }, func() []any { return []any{"reset"} })
+		watch := session.NewSessionWatch(harness.Session, []any{}, func() { released++ })
 		frames := make(chan []any, 2)
-		watch.Start(func(_ context.Context, value []any, _ []durable.Op) error { frames <- value; return nil })
-		watch.Advance(context.Background(), []any{"a"}, []durable.Op{{"p", "", 0, 0, []any{"a"}}})
+		watch.Start(func(_ context.Context, change durable.WatchCall[[]any]) error {
+			value := change.Value
+			frames <- value
+			return nil
+		})
+		watch.Advance(context.Background(), durable.WatchCall[[]any]{Kind: durable.WatchCallValue, Value: []any{"a"}, Ops: []durable.Op{{"p", "", 0, 0, []any{"a"}}}})
 		expectEqual(t, <-frames, []any{"a"})
-		watch.Cancel()
+		watch.Abort()
 		<-watch.Closed()
 		harness.Session.WaitDeliveries()
-		if watch.End().Reason != durable.WatchCancelled || released != 1 {
+		if watch.End().Kind != durable.WatchAborted || released != 1 {
 			t.Fatalf("end %+v released %d", watch.End(), released)
-		}
-	})
-
-	t.Run("a session-bound state source closes with the Session", func(t *testing.T) {
-		harness := open()
-		released := 0
-		source := session.NewCommittedStateSource(harness.Session, obj{"n": 0}, func() { released++ })
-		attachment, err := source.Attach()
-		must(t, err)
-		expectEqual(t, attachment.Snapshot().Value, obj{"n": 0})
-		var frames []chord.ReplicatedStateSourceFrame[obj]
-		must(t, attachment.Activate(func(frame chord.ReplicatedStateSourceFrame[obj]) { frames = append(frames, frame) }))
-		source.Advance(context.Background(), obj{"n": 1}, []durable.Op{{"s", "/n", 1}})
-		harness.Session.WaitDeliveries()
-		if len(frames) != 1 || frames[0].Cursor != attachment.Snapshot().Cursor+1 {
-			t.Fatalf("frames %+v", frames)
-		}
-		expectEqual(t, frames[0].Value, obj{"n": 1})
-		source.CloseSession()
-		attachment.Dispose()
-		harness.Session.WaitDeliveries()
-		if released != 1 {
-			t.Fatalf("released %d", released)
 		}
 	})
 
 	t.Run("counts live commit subscriptions", func(t *testing.T) {
 		harness := open()
 		before := harness.Session.CommitSubscriptions()
-		unsubscribe := harness.Session.SubscribeCommits(func(context.Context, durable.CommitPublication) {})
+		unsubscribe := sessiontest.ObserveCommitsFunc(harness.Session, func(context.Context, durable.CommitPublication) {})
 		if harness.Session.CommitSubscriptions() != before+1 {
 			t.Fatal("subscribing adds one")
 		}
@@ -77,7 +62,7 @@ func TestSessionCloseBeforeCloseFollowsYieldingListeners(t *testing.T) {
 		var sawListener atomic.Bool
 		kernel := session.NewSessionImpl(sessiontest.NewControlledStorage(), session.Hooks{BeforeClose: func() {
 			sawListener.Store(listenerDone.Load())
-		}})
+		}}, nil, nil)
 		kernel.SubscribeClose(func() {
 			for range 1000 {
 				runtime.Gosched()
@@ -99,7 +84,7 @@ func TestCreateTaskRequiresOwnership(t *testing.T) {
 	for _, ownership := range []durable.TaskOwnership{{}, {Kind: "other"}} {
 		mints := harness.Storage.MintCount()
 		err := tryCommit(harness.Session, func(tx durable.Tx) error {
-			_, err := tx.CreateTaskErased(workTask, obj{"path": "a"}, durable.TaskOptions{Ownership: ownership, ConversationId: &conversationId})
+			_, err := tx.CreateTaskErased(workTask.Erased(), delta.JsonObjectOf("path", "a"), durable.TaskOptions{Ownership: ownership, ConversationId: &conversationId})
 			return err
 		})
 		expectErrorContains(t, err, "requires options.ownership")
