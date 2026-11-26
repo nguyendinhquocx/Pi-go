@@ -38,6 +38,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # On release/* and the integration branches (automation/ci/integration-branches.txt; the pull request's base, or the pushed or dispatched
+      # ref) the compile gate, the Linux shards, the Node, Durable and Android jobs, and the Windows and macOS shards still wait for Bookkeeping
+      # or the compile gate to finish, but they are not skipped when it fails, so one run shows every failure. main keeps the cheap-first order.
+      # The push filter above lists the same names; TestIntegrationBranchesHaveOneSource keeps them equal.
+      - name: Choose the job order for this branch
+        id: branch
+        env:
+          BRANCH: ${{ github.base_ref || github.ref_name }}
+        shell: bash
+        run: |
+          parallel=false
+          case "$BRANCH" in
+            release/*|integration/*) parallel=true ;;
+            *) grep -vE '^[[:space:]]*(#|$)' automation/ci/integration-branches.txt | grep -qxF -- "$BRANCH" && parallel=true ;;
+          esac
+          echo "os-parallel=$parallel" | tee -a "$GITHUB_OUTPUT"
       - name: Classify the change
         id: classify
         env:
@@ -87,20 +103,66 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: ./automation/ci/check-dco.sh "$BASE_SHA" "$HEAD_SHA"
 
+  preflight-platforms:
+    name: Linux / preflight-platforms
+    # Cross-platform vet half of the compile gate: vets every platform declared in automation/ci/vet-tags.txt
+    # (windows/amd64, windows/arm64, android/arm64). Starts as soon as Pre-flight verdict and Changed paths succeed,
+    # running in parallel with Bookkeeping instead of behind it so Windows, macOS and Node loader wait only for
+    # Linux / preflight after Bookkeeping finishes (saving ~10-15 min of critical-path latency without dropping any gate).
+    needs: [changes, verdict]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.verdict.result == 'success' && needs.changes.outputs.product == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .go-version
+          cache: false
+      - name: Restore the Go module cache
+        id: cache-the-go-module-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/go/pkg/mod
+          key: gomod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            gomod-${{ runner.os }}-
+      - name: Restore the Go build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: gocache-${{ runner.os }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            gocache-${{ runner.os }}-${{ hashFiles('go.sum') }}-
+      - name: Cross-platform vet every shipped target
+        env:
+          CI: '1'
+          MAKEFLAGS: -k
+        run: make ci-preflight-platforms
+
   linux:
     name: Linux / ${{ matrix.shard }}
     needs: [changes]
     if: needs.changes.outputs.product == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Applies to every shard of the Linux matrix (conformance, portmap, test-fast and the rest);
+    # slowest leg is Linux / test-fast across three dispatched runs (45131680807, 45061942294, 45034549861):
+    # 41:27, 34:07, 28:54 (worst 41:27, 69% of 60; 3x = 124:21 -> 125).
+    timeout-minutes: 125
+    # The job installs the Pi oracle (make upstream-mirror): a test that cannot find its Pi source fails here instead of skipping (internal/pioracle.Missing).
+    env:
+      PIG_REQUIRE_PI_ORACLE: "1"
     strategy:
       fail-fast: false
       matrix:
         shard: [startup, build, test-fast, test-cli, test-subprocess, test-conformance, sdk, extensions, race, integration, parity, drift, contracts, closure]
     steps:
+      # Only build (lint-changed), test-fast (ci-test-changed), alloc-ratchet (alloc-baseline-changed), and contracts (test-porting-release) read git history; every other Linux shard uses a shallow checkout.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          fetch-depth: ${{ (matrix.shard == 'build' || matrix.shard == 'test-fast' || matrix.shard == 'alloc-ratchet' || matrix.shard == 'contracts') && '0' || '1' }}
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -570,6 +632,7 @@ jobs:
           DCO: ${{ needs.dco.result }}
           VERIFY: ${{ needs.verify.result }}
           NODE_RUNTIME: ${{ needs.node-runtime.result }}
+          CHORD: ${{ needs.chord.result }}
           WINDOWS: ${{ needs.windows.result }}
           MACOS: ${{ needs.macos.result }}
           ANDROID: ${{ needs.android.result }}

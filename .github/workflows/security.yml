@@ -46,7 +46,8 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.product == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Three dispatched runs (45131684796, 45123321834, 45061944784): 20:09, 18:28, 12:53 (worst 20:09, 67% of 30; 3x = 60:27 -> 65).
+    timeout-minutes: 65
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -67,16 +68,22 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
+      - name: Restore the pinned ShellCheck download
+        id: cache-shellcheck
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pig-ci-downloads
+          key: ci-downloads-shellcheck-${{ hashFiles('automation/ci/install-shellcheck.sh') }}
       - name: Install source-analysis tools
         run: |
           python -m pip install --disable-pip-version-check --require-hashes \
             -r automation/ci/security-tools.txt
-          automation/ci/install-apt-packages.sh shellcheck
+          automation/ci/install-shellcheck.sh
       - name: Check compliance evidence (REUSE, govulncheck, pins, workflow hardening)
         run: make compliance
       - name: Run Go static analysis
         run: |
-          go vet ./...
+          automation/ci/go-vet.sh
           # golangci-lint owns style and Pi-compatible naming checks. This pass
           # runs Staticcheck's correctness analyzers without conflicting rules.
           go tool staticcheck -checks='SA*' ./...
@@ -97,7 +104,7 @@ jobs:
           exit 0
       - name: Analyze Python SDK
         run: |
-          ruff check extensions/sdk-py
+          make lint-sdk-py
           bandit -q -r extensions/sdk-py/pig_sdk
           python - <<'PY'
           import tomllib
@@ -110,7 +117,7 @@ jobs:
           PY
         shell: bash
       - name: Analyze shell scripts
-        run: find automation docs/site/public -type f -name '*.sh' -print0 | xargs -0 shellcheck
+        run: make lint-shell
       - name: Generate source SBOMs
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
@@ -215,7 +222,7 @@ jobs:
                 - coding/extension/host/subprocess/runtime-node
               paths-ignore:
                 # Vendored upstream copies (Pi's own dist, cross-spawn,
-                # grok-mermaid): shipped byte-exact so extensions run Pi's
+                # lovely-mermaid): shipped byte-exact so extensions run Pi's
                 # code; findings belong upstream, not in local patches.
                 - coding/extension/host/subprocess/runtime-node/shims
           - language: python
