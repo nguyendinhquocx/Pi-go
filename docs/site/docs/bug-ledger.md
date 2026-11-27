@@ -782,6 +782,7 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-58c210c](#bf-58c210c) | Ports Pi's fix b82477b7b (#12134): Groq Qwen reasoning models no longer fail with `400 Unexpected message… | A fix Pi shipped that PiG ported | All platforms | 0.8.0 |
 | [BF-58c30ec](#bf-58c30ec) | Chord: a parked call whose caller aborts is rejected inside the abort, and a flush that runs in the same… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-58f6697](#bf-58f6697) | Text typed and followed at once by Enter no longer skips the autocomplete menu Pi opens: `/model provider/id`… | PiG's own defect | All platforms | 0.7.0 |
+| [BF-58f8238](#bf-58f8238) | Nightly `windows-concurrency-stress` now restores and links the cached Windows pinned Pi oracle before… | PiG's own defect | Windows | Unreleased |
 | [BF-59456ae](#bf-59456ae) | Pressing a key in a subprocess extension's overlay no longer freezes interactive mode when the key reaches… | PiG's own defect | All platforms | 0.5.0 |
 | [BF-59693cd](#bf-59693cd) | Interactive mode: after choosing an entry in `/tree` the chat first redrew at the old position and, about a… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-598e27f](#bf-598e27f) | Escape over an open autocomplete list during compaction now closes the list and lets compaction continue, as… | PiG's own defect | All platforms | 0.5.0 |
@@ -855,6 +856,7 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-613d8aa](#bf-613d8aa) | fix(tools): restore the deprecated grep readFile hook in every SDK | PiG's own defect | All platforms | Unreleased |
 | [BF-618af0a](#bf-618af0a) | `chord/nextnode/plugins`: the directory the plugins' Node runtime is extracted to is named by the manifest… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-619443a](#bf-619443a) | MCP sign-in now rejects authorization endpoints and other OAuth metadata URLs that are not `http:` or… | A fix Pi shipped that PiG ported | All platforms | 0.7.0 |
+| [BF-61a2559](#bf-61a2559) | Restructured `check-unchanged-main.py` so `decide_ci` and `decide_nightly` return skip from a single proved… | PiG's own defect | All platforms | Unreleased |
 | [BF-61af4af](#bf-61af4af) | fix(durable/core): an api read that stores held changes ends with the Storage's answer; the host forgets what… | PiG's own defect | All platforms | Unreleased |
 | [BF-61fc01d](#bf-61fc01d) | `list_mcp_resources`, `list_mcp_resource_templates` and `read_mcp_resource` return every member a server sent… | PiG's own defect | All platforms | 0.5.0 |
 | [BF-61fc01d-2](#bf-61fc01d-2) | MCP tool descriptions, resource MIME types, a pasted sign-in redirect URL and the resource tools' `server`… | PiG's own defect | All platforms | 0.5.0 |
@@ -1123,6 +1125,7 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-7160ad4](#bf-7160ad4) | Chord: a table read made while its object ended no longer races with the end | PiG's own defect | All platforms | 0.8.0 |
 | [BF-7163ab3](#bf-7163ab3) | A pi-env connection whose daemon exits (or fails) before `hello` now adds the end of the daemon's stderr (the… | PiG's own defect | All platforms | 0.7.0 |
 | [BF-7177d5f](#bf-7177d5f) | fix(tui): card of an unregistered tool is Pi's formatToolExecution | PiG's own defect | All platforms | Unreleased |
+| [BF-7184929](#bf-7184929) | `pig build` now raises the merged `go.mod` `go` directive to the highest `go` version required by any fused… | PiG's own defect | All platforms | Unreleased |
 | [BF-71e0f20](#bf-71e0f20) | A fullscreen or inline exit writes the cursor show and bracketed paste off (`CSI ?25h`, `CSI ?2004l`) in Pi's… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-7236618](#bf-7236618) | Follows Pi e03dca7a3843: `Session.Reload` (and the reload of every SDK's `AgentSession`) did not emit… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-725e104](#bf-725e104) | The upstream test inventory records Pi's `shell-path-exists.test.ts` as ported instead of partial: Pi mocks… | PiG's own defect | Windows | 0.5.2 |
@@ -1229,6 +1232,7 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-7e16053](#bf-7e16053) | `pig install /abs/path` (and `~/path` or a `file://` URL) records the path as you typed it in `packages[]` | A Pi defect that PiG fixed first | All platforms | 0.7.0 |
 | [BF-7e16053-2](#bf-7e16053-2) | A configured local Package whose directory does not exist is now a startup warning in the session, and an… | PiG's own defect | All platforms | 0.7.0 |
 | [BF-7e1a05c](#bf-7e1a05c) | Resource resolution follows Pi's `DefaultPackageManager.resolve` in two cases: built-in extensions come after… | PiG's own defect | All platforms | 0.5.0 |
+| [BF-7e3d3c7](#bf-7e3d3c7) | Release archives of `pig-acp` now bundle `@pi-in-go/pigpen-acp` 0.2.4, which reads PiG's own version from… | PiG's own defect | All platforms | Unreleased |
 | [BF-7e42a6a](#bf-7e42a6a) | CSS module mappings are what Node's `vm` gives, as Pi's (key order of integer-like names, no `__proto__` key… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-7e9a4bc](#bf-7e9a4bc) | Chord: an abort listener that ran leaves every source it listened to, and an emptied listener set is dropped | PiG's own defect | All platforms | 0.8.0 |
 | [BF-7ea21f3](#bf-7ea21f3) | RPC output writes summed usage (a tool result's usage with nested model calls, a compaction summary's usage)… | PiG's own defect | All platforms | 0.5.0 |
@@ -1340,6 +1344,7 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-8ac653e](#bf-8ac653e) | The powershell tool no longer reports `Command exited with code 1` under Windows PowerShell 5.1 when a native… | PiG's own defect | Windows | 0.8.0 |
 | [BF-8aff02e](#bf-8aff02e) | `grep` with `context` numbers a file's lines at line feeds only, as ripgrep does: a lone carriage return no… | PiG's own defect | All platforms | 0.7.0 |
 | [BF-8b15be3](#bf-8b15be3) | Tests: the read barrier, which lets a fixture server write its next record only when the client is reading… | PiG's own defect | Linux | 0.8.0 |
+| [BF-8b5ab0a](#bf-8b5ab0a) | Added the complete `wasi-libc` (wasi-sdk 30) license texts, component notices (`dlmalloc`, `emmalloc`… | PiG's own defect | All platforms | Unreleased |
 | [BF-8b6eb22](#bf-8b6eb22) | A Go, Rust, Python or Lisp extension that shows its own alternate screen (`TuiAltScreen`) and re-sends a… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-8b75dc0](#bf-8b75dc0) | Config selector (`pig config`): every key that reaches the search input re-filters and resets the selection… | PiG's own defect | All platforms | 0.5.0 |
 | [BF-8b792f9](#bf-8b792f9) | Ctrl+V pastes files, images and text on Windows and WSL as well as Alt+V (terminals that pass Ctrl+V to the… | PiG's own defect | Windows, WSL | 0.8.0 |
@@ -1496,6 +1501,7 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-93cc26e](#bf-93cc26e) | A durable `Submission.Wait` or task wait whose context was cancelled while earlier commits were still… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-93f8b7c](#bf-93f8b7c) | fix(agent): a listener failure at agent_start ends the run as in Pi; failure messages carry the model's api | PiG's own defect | All platforms | Unreleased |
 | [BF-940fde6](#bf-940fde6) | Aborting a compaction while extensions were being told it finished no longer keeps the extensions after the… | PiG's own defect | All platforms | 0.8.0 |
+| [BF-9425774](#bf-9425774) | `TestAuthCommandsMatchPiEndToEnd` now gives each concurrent Pi subprocess its own seeded temporary agent… | PiG's own defect | All platforms | Unreleased |
 | [BF-94284ac](#bf-94284ac) | `pig -e git:<repo>@<branch>` no longer stays on its first checkout | A fix Pi shipped that PiG ported | All platforms | 0.7.0 |
 | [BF-942bc6c](#bf-942bc6c) | fix(coding-agent): preserve pi.exec spawn errors (Pi) | PiG's own defect | All platforms | Unreleased |
 | [BF-9486493](#bf-9486493) | The OpenAI Codex provider (`openai-codex-responses`) now gets prompt cache hits for the system prompt on… | PiG's own defect | All platforms | 0.8.0 |
@@ -1579,6 +1585,7 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-9e8e1f9](#bf-9e8e1f9) | fix(codingagent): an editor built before the bind's setup gets the provider the setup builds, and a provider… | PiG's own defect | All platforms | Unreleased |
 | [BF-9eda512](#bf-9eda512) | The Go Durable SDK's scheduler no longer resolves the Harness settings for the context a run itself reads… | PiG's own defect | All platforms | 0.7.0 |
 | [BF-9ee5c21](#bf-9ee5c21) | Loading a packed Lisp cell no longer hangs when two of its extensions each make a host call, such as a… | PiG's own defect | All platforms | 0.8.0 |
+| [BF-9f08e13](#bf-9f08e13) | `automation/ci/changed-packages.py` no longer pulls in unrelated packages from Go comments or non-fixture… | PiG's own defect | All platforms | Unreleased |
 | [BF-9f4702c](#bf-9f4702c) | A failed extension shortcut handler is now reported as `Error: Shortcut handler error: …` in the error… | PiG's own defect | All platforms | 0.5.0 |
 | [BF-9f7111a](#bf-9f7111a) | The `/tree` key-hint rows keep Pi's one-cell wrapped rows in a zero-width terminal instead of drawing empty… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-9fc0792](#bf-9fc0792) | fix(chord): tui follow stop type | PiG's own defect | All platforms | Unreleased |
@@ -1742,6 +1749,7 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-aeabf18](#bf-aeabf18) | Windows: the pipes that carry the output of the bash tool's shell and of `pi.exec` children are overlapped… | PiG's own defect | Windows | 0.8.0 |
 | [BF-aec0042](#bf-aec0042) | The pi-env daemon runs a command whose `timeoutMs` is above 2^31-1 ms without a deadline, as Pi's daemon… | PiG's own defect | All platforms | 0.7.0 |
 | [BF-aec5a31](#bf-aec5a31) | fix(chord): a chmod of a recorded base file is compared like a write | PiG's own defect | All platforms | Unreleased |
+| [BF-af138c9](#bf-af138c9) | Reloading an evicted history chunk now validates each record length with `checkRecordSize` before narrowing… | PiG's own defect | All platforms | Unreleased |
 | [BF-af1fe1a](#bf-af1fe1a) | Cycling models in the interactive UI goes through the Session as in Pi: the new model persists as the… | PiG's own defect | All platforms | 0.5.0 |
 | [BF-af36fe8](#bf-af36fe8) | A streamed tool call whose arguments are valid JSON but not an object (`[]`, `null`, `5`, `"s"`) keeps them… | PiG's own defect | All platforms | 0.5.0 |
 | [BF-af56fab](#bf-af56fab) | A task list item whose text starts with emphasis, a code span or a link (`- [ ] **bold** text`) no longer… | PiG's own defect | All platforms | 0.8.0 |
@@ -1837,6 +1845,7 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-bc02460](#bf-bc02460) | Changing the output padding now applies at once to the branch-summary, compaction-summary and… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-bc05945](#bf-bc05945) | A resumed session takes the model its registry lists for the saved provider and id, with that listing's API… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-bc24321](#bf-bc24321) | fix(mem M3): arm the idle collection at run end and run it after 500 ms | PiG's own defect | All platforms | Unreleased |
+| [BF-bc30287](#bf-bc30287) | Bundled Go and Node model catalogs now match the pinned Pi 1.6.0 release snapshot (`2026-11-20T10:48:49Z`)… | PiG's own defect | All platforms | Unreleased |
 | [BF-bc4cd62](#bf-bc4cd62) | `toPrecision` rounds a value just below a power of ten (1e-11 to 16 digits, 9.999999999999998e9 to 16 digits)… | PiG's own defect | All platforms | 0.5.0 |
 | [BF-bc5d1ad](#bf-bc5d1ad) | durable harness: closing a Harness on one goroutine while a commit was being published on another could start… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-bc6c54f](#bf-bc6c54f) | Fix the extension event result type and keep the event fast paths exact | PiG's own defect | All platforms | Unreleased |
@@ -1946,7 +1955,9 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-ca06a0b](#bf-ca06a0b) | Tool arguments that TypeBox's Convert wraps in an array (an object where the schema asks for an array, such… | PiG's own defect | All platforms | 0.5.0 |
 | [BF-ca27ba6](#bf-ca27ba6) | The Go extension SDK accepts a native Provider object with no auth methods, as Pi's `ProviderAuth` (both… | PiG's own defect | All platforms | 0.5.0 |
 | [BF-ca41377](#bf-ca41377) | fix(tui): the alt-screen frame serves a render's viewport reads and ends a screen's callbacks at disposal… | PiG's own defect | All platforms | Unreleased |
+| [BF-ca588df](#bf-ca588df) | Pre-flight `gitleaks` now runs from inside the added-lines directory (`dir .`) instead of passing an absolute… | PiG's own defect | All platforms | Unreleased |
 | [BF-ca675e0](#bf-ca675e0) | A list item whose text is `[ ] ` or `[x] ` with nothing after the spaces on the line is plain text, not a… | PiG's own defect | All platforms | 0.5.0 |
+| [BF-ca818aa](#bf-ca818aa) | Quoted `git rev-parse 'HEAD^{tree}'` in `.github/workflows/ci.yml` to satisfy shellcheck SC1083 and synced… | PiG's own defect | All platforms | Unreleased |
 | [BF-ca83bfc](#bf-ca83bfc) | ai: an Azure OpenAI Responses base URL that already carries the full Responses endpoint path with a query… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-caae28a](#bf-caae28a) | In RPC mode, `exit.log` no longer says "received SIGTERM" for a single signal that arrived during a shutdown… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-cafa121](#bf-cafa121) | fix(llama): default llama.cpp server URL is port 9931 (Pi, #12001); NVIDIA RTX guide mirror (Pi) | PiG's own defect | All platforms | Unreleased |
@@ -2062,6 +2073,7 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-d7bfea6](#bf-d7bfea6) | A git source whose ref has no repository (`git:#v1`) no longer panics, and a ref split out of an opaque-path… | PiG's own defect | All platforms | 0.5.0 |
 | [BF-d7c7f86](#bf-d7c7f86) | fix(runtimecell): start a packed cell's members in order so a later member's factory cannot take the factory… | PiG's own defect | All platforms | Unreleased |
 | [BF-d7fbf00](#bf-d7fbf00) | Stored assistant messages of a durable conversation now carry `thinkingLevel`: a generation records the… | PiG's own defect | All platforms | 0.7.0 |
+| [BF-d7fedef](#bf-d7fedef) | Packed Go extension builds no longer fail with `go build: undefined: sdk.ReportLoadFailure` (or any future… | PiG's own defect | All platforms | Unreleased |
 | [BF-d80425c](#bf-d80425c) | fix(train): gate repairs after merging train 3 and the ordering stack | PiG's own defect | All platforms | Unreleased |
 | [BF-d80c1cd](#bf-d80c1cd) | Where Pi calls `new URL(value)`, Pig now parses a `ws:`, `wss:`, `ftp:` or `file:` URL, and a bracketed IPv6… | PiG's own defect | All platforms | 0.5.0 |
 | [BF-d80cb24](#bf-d80cb24) | A Chord singleton state document's handle reads its value in a section of the host's loop, as its watch does… | PiG's own defect | All platforms | 0.8.0 |
@@ -13036,6 +13048,20 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Tests:** `tui/editor_autocomplete_flush_test.go::TestFlushAutocompleteAfterShutdownStartsNothing`, `tui/editor_autocomplete_flush_test.go::TestFlushAutocompleteAnswersTheLastRequestOfAReadOnce`, `tui/editor_autocomplete_flush_test.go::TestFlushAutocompleteDropsARequestTheEditorMovedOnFrom`, `tui/editor_autocomplete_flush_test.go::TestFlushAutocompleteJoinsARequestStillOnTheWorker`, `tui/editor_autocomplete_flush_test.go::TestFlushAutocompleteLeavesAnAwaitedAnswerToTheWorker`, `tui/editor_autocomplete_flush_test.go::TestFlushAutocompleteLeavesTheSymbolDebounceToItsTimer`, `tui/editor_autocomplete_flush_test.go::TestPostedRequestStartsWithoutAFlush`, `tui/editor_completion_owner_test.go::TestOwnedAutocompleteWaitsForOwnerPublication`
 - **Release note:** Text typed and followed at once by Enter no longer skips the autocomplete menu Pi opens: `/model provider/id` typed and entered in one go switched the model in PiG, where Pi accepts the suggestion into the editor on the first Enter and switches on the second (the same holds for `/thinking level`, any command with argument completions, and a partially typed slash command, which Pi accepts and submits). Pi's editor resolves its autocomplete request in the Promise jobs that follow the terminal read that typed the text, so the menu is open when the next read arrives; PiG started the request on a worker and published the menu through two later owner-loop tasks that the Enter overtook, so the Enter found no menu and submitted what was typed. The editor now starts the request of a read when the read has been handled (`Editor.FlushAutocomplete`, called by the interactive loop after each read), and an Enter in the same read as the text still submits it, as in Pi. Typed at human speed both behaved like Pi already.
 
+### BF-58f8238
+
+**Nightly `windows-concurrency-stress` now restores and links the cached Windows pinned Pi oracle before…**
+
+- **Source:** PiG's own defect
+- **Symptom:** Nightly `windows-concurrency-stress` now restores and links the cached Windows pinned Pi oracle before running `automation/ci/windows-concurrency-stress.sh`, fixing missing `proper-lockfile` module failures in Go+Pi lock interop tests, and scheduled `ci.yml` / `nightly.yml` runs skip redundant work on an unchanged `main` while preserving the 5-day cache refresh cadence and stochastic nightly jobs.
+- **Root cause:** nightly.yml windows-concurrency-stress omitted Node and pinned Pi oracle setup required by pilock/ai interop tests
+- **User impact:** Behavior differed from Pi
+- **Platform:** Windows
+- **Fixed in:** Unreleased
+- **Fix commits:** `58f8238101` (2026-11-25)
+- **Tests:** `automation/ci/test_check_unchanged_main.py`, `test/ci-images/light_pr_guards_test.go::TestNightlyWindowsConcurrencyStressJobWired`, `test/ci-images/light_pr_guards_test.go::TestScheduledUnchangedMainSkipWiring`, `test/ci-images/merge_queue_test.go::TestCIResultRequiresEveryPlannedJob`
+- **Release note:** Nightly `windows-concurrency-stress` now restores and links the cached Windows pinned Pi oracle before running `automation/ci/windows-concurrency-stress.sh`, fixing missing `proper-lockfile` module failures in Go+Pi lock interop tests, and scheduled `ci.yml` / `nightly.yml` runs skip redundant work on an unchanged `main` while preserving the 5-day cache refresh cadence and stochastic nightly jobs.
+
 ### BF-59456ae
 
 **Pressing a key in a subprocess extension's overlay no longer freezes interactive mode when the key reaches…**
@@ -14043,6 +14069,20 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Fix commits:** `619443a024` (2026-10-23)
 - **Tests:** `mcp/oauth/oauth_test.go::TestMCPOAuthRejectsNonHTTPAuthorizationEndpointsWhichThePlatformURLHandlerWouldLaunch`
 - **Release note:** MCP sign-in now rejects authorization endpoints and other OAuth metadata URLs that are not `http:` or `https:`, so a malicious server cannot make pig launch a `file:` or custom protocol URL.
+
+### BF-61a2559
+
+**Restructured `check-unchanged-main.py` so `decide_ci` and `decide_nightly` return skip from a single proved…**
+
+- **Source:** PiG's own defect
+- **Symptom:** Restructured `check-unchanged-main.py` so `decide_ci` and `decide_nightly` return skip from a single proved path (failing open on any error, unparseable timestamp, budget cap, unread jobs page, or attempt mismatch), shared one unchanged-main decision between Changes and Bookkeeping in `.github/workflows/ci.yml`, sanitized `GITHUB_OUTPUT` values, matched prefixed/joined globs in `changed-packages.py`, and detected removed unnamed `func Example()` declarations in `classify-changes.sh`.
+- **Root cause:** PR #574 review caught cache-timestamp typo returning True, split unchanged-main checks, continue-on-error loops, and glob/Example regex edges
+- **User impact:** An operation failed or was rejected
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `61a2559d2b` (2026-11-26)
+- **Tests:** `test/ci-images/unconditional_jobs_test.go::TestChangesAndBookkeepingJobsStayUnconditional`
+- **Release note:** Restructured `check-unchanged-main.py` so `decide_ci` and `decide_nightly` return skip from a single proved path (failing open on any error, unparseable timestamp, budget cap, unread jobs page, or attempt mismatch), shared one unchanged-main decision between Changes and Bookkeeping in `.github/workflows/ci.yml`, sanitized `GITHUB_OUTPUT` values, matched prefixed/joined globs in `changed-packages.py`, and detected removed unnamed `func Example()` declarations in `classify-changes.sh`.
 
 ### BF-61af4af
 
@@ -17778,6 +17818,20 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Fix commits:** `7177d5f92b` (2026-10-11)
 - **Tests:** `tui/summary_output_pad_test.go::TestToolAndBashBlocksFollowOutputPad`, `tui/tool_execution_test.go::TestToolExecutionStreamingFallbackUsesLeadingPreview`, `tui/tool_execution_test.go::TestUnregisteredToolCardIsUpstreamFormatToolExecution`
 
+### BF-7184929
+
+**`pig build` now raises the merged `go.mod` `go` directive to the highest `go` version required by any fused…**
+
+- **Source:** PiG's own defect
+- **Symptom:** `pig build` now raises the merged `go.mod` `go` directive to the highest `go` version required by any fused member module (compared with `go/version`), preventing `-mod=readonly` failures when a fused member requires a newer Go language or patch version than PiG's own directive (PR #446).
+- **Root cause:** coding/pigletbuild/fuse_modules.go merged member require/replace directives without raising pig.Go when a fused member required a newer go directive
+- **User impact:** Behavior differed from Pi
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `7184929b8e` (2026-11-25)
+- **Tests:** `coding/pigletbuild/fuse_modules_test.go::TestMergeFusedModulesKeepsNewerPigDirective`, `coding/pigletbuild/fuse_modules_test.go::TestMergeFusedModulesRaisesPigDirectiveForNewerMemberVersion`, `coding/pigletbuild/fuse_modules_test.go::TestMergeFusedModulesRaisesPigDirectiveForPatchFormMemberVersion`
+- **Release note:** `pig build` now raises the merged `go.mod` `go` directive to the highest `go` version required by any fused member module (compared with `go/version`), preventing `-mod=readonly` failures when a fused member requires a newer Go language or patch version than PiG's own directive (PR #446).
+
 ### BF-71e0f20
 
 **A fullscreen or inline exit writes the cursor show and bracketed paste off (`CSI ?25h`, `CSI ?2004l`) in Pi's…**
@@ -19241,6 +19295,20 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Fix commits:** `12cd60837e` (2026-10-09), `24232ef878` (2026-10-09), `2b3403045b` (2026-10-09), `3def2a7bd8` (2026-10-10), `7e1a05ccfd` (2026-10-10), `919575a79c` (2026-10-10), `f3b4045e8a` (2026-10-10)
 - **Tests:** `coding/mcpext/config_load_oracle_test.go::TestLoadMcpConfigMatchesPiOnRandomFiles`, `internal/codingagent/paths_oracle_test.go::TestPathsMatchPi`, `internal/codingagent/session_file_bytes_oracle_test.go::TestSessionFileBytesMatchPi`, `internal/codingagent/settings_file_bytes_oracle_test.go::TestSettingsFileBytesMatchPi`, `internal/codingagent/settings_load_oracle_test.go::TestSettingsLoadMatchesPiOnCorruptedFiles`, `internal/ignorerules/ignore_oracle_test.go::TestIgnoredMatchesPiIgnorePackage`, `internal/ignorerules/ignorerules_test.go::TestIgnoreRulesFollowTheIgnorePackage`, `internal/jsonparse/json_parse_oracle_test.go::TestValidateMatchesNodeJSONParse` and 2 more in docs/bug-ledger.json
 - **Release note:** Resource resolution follows Pi's `DefaultPackageManager.resolve` in two cases: built-in extensions come after file and package extensions, and a Package listed twice in the same project settings uses its last entry (and its filters), keeping the first position.
+
+### BF-7e3d3c7
+
+**Release archives of `pig-acp` now bundle `@pi-in-go/pigpen-acp` 0.2.4, which reads PiG's own version from…**
+
+- **Source:** PiG's own defect
+- **Symptom:** Release archives of `pig-acp` now bundle `@pi-in-go/pigpen-acp` 0.2.4, which reads PiG's own version from `pig version` (with a bounded `--version` fallback) instead of displaying the upstream Pi version from `pig --version` in Zed thread titles and update notices.
+- **Root cause:** automation/release/pig-acp.lock pinned 0.2.3 whose pigVersionHeader ran pig --version
+- **User impact:** Wrong display
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `7e3d3c737b` (2026-11-25)
+- **Tests:** None recorded.
+- **Release note:** Release archives of `pig-acp` now bundle `@pi-in-go/pigpen-acp` 0.2.4, which reads PiG's own version from `pig version` (with a bounded `--version` fallback) instead of displaying the upstream Pi version from `pig --version` in Zed thread titles and update notices.
 
 ### BF-7e42a6a
 
@@ -20784,6 +20852,20 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Fix commits:** `8b15be354a` (2026-11-13)
 - **Tests:** `ai/abort_text_pi_test.go::TestProviderAbortTextsMatchPi`, `coding/rpc33_azure_ticks_test.go::TestRPC33AzureTickOrder`
 - **Release note:** Tests: the read barrier, which lets a fixture server write its next record only when the client is reading the socket again, counted bytes per client address. Linux gives one local port to live connections to different servers, so two parallel fixture servers could see the same client address; one of them then waited until its test's deadline, or wrote two records into one read. `TestRPC33AzureTickOrder` failed that way in about one run in a hundred, more often on a loaded machine. The barrier now counts per connection (client and server address).
+
+### BF-8b5ab0a
+
+**Added the complete `wasi-libc` (wasi-sdk 30) license texts, component notices (`dlmalloc`, `emmalloc`…**
+
+- **Source:** PiG's own defect
+- **Symptom:** Added the complete `wasi-libc` (wasi-sdk 30) license texts, component notices (`dlmalloc`, `emmalloc`, `cloudlibc`, `musl`, `musl-fts`), and SPDX REUSE annotations for the embedded `quickjs.wasm` and `quickjs-wasi` WebAssembly binaries in `THIRD_PARTY_NOTICES.md`, `LICENSES/`, `REUSE.toml`, and `codemode/assets/PROVENANCE.md`.
+- **Root cause:** THIRD_PARTY_NOTICES.md named wasi-libc without reproducing its license terms and both REUSE.toml annotations marked quickjs.wasm as MIT only
+- **User impact:** Behavior differed from Pi
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `8b5ab0a08b` (2026-11-25)
+- **Tests:** None recorded.
+- **Release note:** Added the complete `wasi-libc` (wasi-sdk 30) license texts, component notices (`dlmalloc`, `emmalloc`, `cloudlibc`, `musl`, `musl-fts`), and SPDX REUSE annotations for the embedded `quickjs.wasm` and `quickjs-wasi` WebAssembly binaries in `THIRD_PARTY_NOTICES.md`, `LICENSES/`, `REUSE.toml`, and `codemode/assets/PROVENANCE.md`.
 
 ### BF-8b6eb22
 
@@ -22962,6 +23044,20 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Tests:** `coding/session_compact_abort_dispatch_test.go::TestSessionCompactReachesEveryExtensionWhenAbortedDuringDispatch`, `test/extension-conformance/session_compact_abort_test.go::TestNodeSessionCompactReachesTheNextExtensionWhenAbortedDuringDispatch`, `test/extension-conformance/session_compact_abort_test.go::TestSessionCompactIsDeliveredToEverySDKWhenAbortedDuringDispatch`
 - **Release note:** Aborting a compaction while extensions were being told it finished no longer keeps the extensions after the first from hearing about it. `session_compact` now reaches every extension, in order, as in Pi, whichever of them calls `abortCompaction()` or has the compaction aborted while its handler runs; the saved compaction still completes.
 
+### BF-9425774
+
+**`TestAuthCommandsMatchPiEndToEnd` now gives each concurrent Pi subprocess its own seeded temporary agent…**
+
+- **Source:** PiG's own defect
+- **Symptom:** `TestAuthCommandsMatchPiEndToEnd` now gives each concurrent Pi subprocess its own seeded temporary agent directory so concurrent `pi auth check` and `pi auth check --no-refresh` probes cannot race on unlocked `auth.json` creation and fail JSON parsing with exit 2 (`invalid`).
+- **Root cause:** TestAuthCommandsMatchPiEndToEnd shared dirs[p.setup] across 8 concurrent Pi subprocesses while FileAuthStorageBackend.ensureFileExists wrote auth.json outside any lock
+- **User impact:** An operation failed or was rejected
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `9425774166` (2026-11-25)
+- **Tests:** `coding/cli/auth_cli_oracle_test.go::TestAuthCommandsMatchPiEndToEnd`
+- **Release note:** `TestAuthCommandsMatchPiEndToEnd` now gives each concurrent Pi subprocess its own seeded temporary agent directory so concurrent `pi auth check` and `pi auth check --no-refresh` probes cannot race on unlocked `auth.json` creation and fail JSON parsing with exit 2 (`invalid`).
+
 ### BF-94284ac
 
 **`pig -e git:<repo>@<branch>` no longer stays on its first checkout**
@@ -24106,6 +24202,20 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Fix commits:** `9ee5c21f21` (2026-11-09)
 - **Tests:** None recorded.
 - **Release note:** Loading a packed Lisp cell no longer hangs when two of its extensions each make a host call, such as a `pi.events` subscription, while their factories run. The host serves a cell's connections in order, so the second extension's first call waits for the first extension's register; the first extension's run needed the lock that call held to take its connection, and when the second factory reached its call before the first run took its connection, neither could continue and the load never ended. A factory-time call now holds only the lock of its own connection.
+
+### BF-9f08e13
+
+**`automation/ci/changed-packages.py` no longer pulls in unrelated packages from Go comments or non-fixture…**
+
+- **Source:** PiG's own defect
+- **Symptom:** `automation/ci/changed-packages.py` no longer pulls in unrelated packages from Go comments or non-fixture sibling literals, while matching exact directory/glob references for every 3+ component ancestor directory of a changed non-Go file (cutting light-PR `test-fast` selection on PR #572 from 186 fast-parallel packages to 13 while preserving whole-directory readers such as `test/parity/cmd/sdksurface`, `test/wiring`, `test/extension-conformance`, `test/docs-drift`, `automation/ci/preflight/reviewed`, and `automation/ci/divsplit`).
+- **Root cause:** referencing() scanned raw Go source including comments, matched any 3-segment parent directory as a fixture tree, attributed go list test-variant dependency sources to the importing test package, and previously gated dir_ref_pattern behind a static two-directory list
+- **User impact:** Behavior differed from Pi
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `9f08e13f59` (2026-11-26)
+- **Tests:** None recorded.
+- **Release note:** `automation/ci/changed-packages.py` no longer pulls in unrelated packages from Go comments or non-fixture sibling literals, while matching exact directory/glob references for every 3+ component ancestor directory of a changed non-Go file (cutting light-PR `test-fast` selection on PR #572 from 186 fast-parallel packages to 13 while preserving whole-directory readers such as `test/parity/cmd/sdksurface`, `test/wiring`, `test/extension-conformance`, `test/docs-drift`, `automation/ci/preflight/reviewed`, and `automation/ci/divsplit`).
 
 ### BF-9f4702c
 
@@ -26408,6 +26518,20 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Fix commits:** `aec5a318db` (2026-11-07)
 - **Tests:** None recorded.
 
+### BF-af138c9
+
+**Reloading an evicted history chunk now validates each record length with `checkRecordSize` before narrowing…**
+
+- **Source:** PiG's own defect
+- **Symptom:** Reloading an evicted history chunk now validates each record length with `checkRecordSize` before narrowing to `uint32`, preventing a corrupted or oversized loader record of length `n + k*2^32` from bypassing the entry length check in `Chain.fill`.
+- **Root cause:** Chain.fill compared c.ents[i].n != uint32(len(rec)) without first checking that len(rec) fits within maxRecordBytes
+- **User impact:** Lost or altered data
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `af138c9a84` (2026-11-25)
+- **Tests:** `durable/core/history/record_size_test.go::TestReloadRecordLenMatchesRejectsNarrowingWraparound`
+- **Release note:** Reloading an evicted history chunk now validates each record length with `checkRecordSize` before narrowing to `uint32`, preventing a corrupted or oversized loader record of length `n + k*2^32` from bypassing the entry length check in `Chain.fill`.
+
 ### BF-af1fe1a
 
 **Cycling models in the interactive UI goes through the Session as in Pi: the new model persists as the…**
@@ -27722,6 +27846,20 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Fixed in:** Unreleased
 - **Fix commits:** `bc243218dd` (2026-10-13)
 - **Tests:** `internal/codingagent/interactive_layout_idle_test.go::TestIdleHeapCollectionAfterRun`
+
+### BF-bc30287
+
+**Bundled Go and Node model catalogs now match the pinned Pi 1.6.0 release snapshot (`2026-11-20T10:48:49Z`)…**
+
+- **Source:** PiG's own defect
+- **Symptom:** Bundled Go and Node model catalogs now match the pinned Pi 1.6.0 release snapshot (`2026-11-20T10:48:49Z`), adding 65 models that were missing in PiG 0.8.0 (including `gemini-4-neon`, `gpt-6.2-astra`, `gpt-6.2-sol`, `mai-code-2`, and `mai-code-2-flash` on `github-copilot`, plus `gemini-4-neon` on `google`, `google-vertex`, `opencode`, `radius`, `openrouter`, and `vercel-ai-gateway`) and removing 27 entries absent from Pi 1.6.0.
+- **Root cause:** automation/gen/catalog-source remained on a 2026-11-15 recording when .upstream/pin moved to Pi 1.6.0
+- **User impact:** Behavior differed from Pi
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `bc302875f2` (2026-11-25)
+- **Tests:** `ai/catalog_freshness_test.go::TestBundledCatalogNotOlderThanPinnedPi`, `cmd/gen-models/catalog_recording_test.go::TestGeneratorMatchesPisGeneratorOnTheCommittedRecording`
+- **Release note:** Bundled Go and Node model catalogs now match the pinned Pi 1.6.0 release snapshot (`2026-11-20T10:48:49Z`), adding 65 models that were missing in PiG 0.8.0 (including `gemini-4-neon`, `gpt-6.2-astra`, `gpt-6.2-sol`, `mai-code-2`, and `mai-code-2-flash` on `github-copilot`, plus `gemini-4-neon` on `google`, `google-vertex`, `opencode`, `radius`, `openrouter`, and `vercel-ai-gateway`) and removing 27 entries absent from Pi 1.6.0. Added `TestBundledCatalogNotOlderThanPinnedPi` to prevent future pin bumps from shipping a stale catalog recording.
 
 ### BF-bc4cd62
 
@@ -29229,6 +29367,20 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Fix commits:** `ca413772f0` (2026-10-31)
 - **Tests:** `coding/extension/host/subprocess/tui_alt_dispose_test.go::TestDisposingAScreenEndsAFrameThatWaitsForAnExtensionThatNeverAnswers`, `coding/extension/host/subprocess/tui_alt_frame_calls_test.go::TestTuiAltCallsFromARenderDoNotTakeTheFrameLockAgain`, `tui/tui_alt_frame_test.go::TestAltScreenFrameReadsAndMovesTheViewportAtOnce`
 
+### BF-ca588df
+
+**Pre-flight `gitleaks` now runs from inside the added-lines directory (`dir .`) instead of passing an absolute…**
+
+- **Source:** PiG's own defect
+- **Symptom:** Pre-flight `gitleaks` now runs from inside the added-lines directory (`dir .`) instead of passing an absolute temporary directory path, so `^`-anchored `paths` allowlist entries in `.gitleaks.toml` and relative fingerprints in main's `.gitleaksignore` match repository-relative paths, while quarantining PR copies of `.gitleaksignore` and `.gitleaks.toml` under neutral names (and warning via `gitleaks-config`) so PR content cannot act as gitleaks configuration.
+- **Root cause:** automation/ci/preflight/config.yaml passed absolute {input} to gitleaks dir and gitleaks auto-loads <source>/.gitleaksignore from its scan directory
+- **User impact:** An operation failed or was rejected
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `ca588df48a` (2026-11-25), `ca88756cd3` (2026-11-25)
+- **Tests:** `automation/ci/preflight/config_test.go::TestConfigRejects`, `automation/ci/preflight/gitleaks_scan_test.go::TestGitleaksQuarantineStagesAndMapsFindingsBack`, `automation/ci/preflight/gitleaks_scan_test.go::TestGitleaksScanAllowlistAndRealFindings`, `automation/ci/preflight/gitleaks_scan_test.go::TestGitleaksScanCommandRunsInsideAddedTree`, `automation/ci/preflight/gitleaks_scan_test.go::TestShippedGitleaksConfigWarningCheck`, `automation/ci/preflight/rules_test.go::TestRuleParamsRejected`
+- **Release note:** Pre-flight `gitleaks` now runs from inside the added-lines directory (`dir .`) instead of passing an absolute temporary directory path, so `^`-anchored `paths` allowlist entries in `.gitleaks.toml` and relative fingerprints in main's `.gitleaksignore` match repository-relative paths, while quarantining PR copies of `.gitleaksignore` and `.gitleaks.toml` under neutral names (and warning via `gitleaks-config`) so PR content cannot act as gitleaks configuration.
+
 ### BF-ca675e0
 
 **A list item whose text is `[ ] ` or `[x] ` with nothing after the spaces on the line is plain text, not a…**
@@ -29242,6 +29394,20 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Fix commits:** `ca675e0af0` (2026-10-11)
 - **Tests:** `tui/markdown_task_item_oracle_test.go::TestMarkdownTaskItemFirstLineIsTextMatchesPi`, `tui/markdown_task_item_oracle_test.go::TestMarkdownTaskItemNeedsATextAfterTheSpacesMatchesPi`
 - **Release note:** A list item whose text is `[ ] ` or `[x] ` with nothing after the spaces on the line is plain text, not a task item (marked's listIsTask needs a non-whitespace character after the spaces), so `- [ ] ` renders as `- [ ]` like Pi.
+
+### BF-ca818aa
+
+**Quoted `git rev-parse 'HEAD^{tree}'` in `.github/workflows/ci.yml` to satisfy shellcheck SC1083 and synced…**
+
+- **Source:** PiG's own defect
+- **Symptom:** Quoted `git rev-parse 'HEAD^{tree}'` in `.github/workflows/ci.yml` to satisfy shellcheck SC1083 and synced `variables/versions.yaml` (`npm: 12.2.1`, `node: 24.22.2`, `pi: v1.6.0`) with the repository's committed toolchain and Pi pins.
+- **Root cause:** unquoted braces in ci.yml triggered actionlint SC1083 and variables/versions.yaml had drifted from the committed npm, node, and Pi pins checked by preflight mandatory.yaml
+- **User impact:** Behavior differed from Pi
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `ca818aa221` (2026-11-26)
+- **Tests:** None recorded.
+- **Release note:** Quoted `git rev-parse 'HEAD^{tree}'` in `.github/workflows/ci.yml` to satisfy shellcheck SC1083 and synced `variables/versions.yaml` (`npm: 12.2.1`, `node: 24.22.2`, `pi: v1.6.0`) with the repository's committed toolchain and Pi pins.
 
 ### BF-ca83bfc
 
@@ -30833,6 +30999,20 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Fix commits:** `d7fbf0046b` (2026-10-25)
 - **Tests:** `durable/harness/harness_generation_recovery_test.go::TestGenerationRecovery`, `durable/harness/harness_generation_test.go::TestGeneration`
 - **Release note:** Stored assistant messages of a durable conversation now carry `thinkingLevel`: a generation records the thinking level its request asked for on the response, also after polling a deferred one. A poll checkpoint written by an earlier version has no level and records none.
+
+### BF-d7fedef
+
+**Packed Go extension builds no longer fail with `go build: undefined: sdk.ReportLoadFailure` (or any future…**
+
+- **Source:** PiG's own defect
+- **Symptom:** Packed Go extension builds no longer fail with `go build: undefined: sdk.ReportLoadFailure` (or any future runner-template SDK symbol) when an extension's `go.mod` local `replace` or `PIG_SDK_GO_ROOT` points to an SDK checkout older than the running `pig` binary.
+- **Root cause:** findSDKRootWithPreferred accepted any Go SDK directory containing go.mod without checking that it exported the symbols called by the generated runner template
+- **User impact:** An operation failed or was rejected
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `d7fedef9aa` (2026-11-25)
+- **Tests:** `coding/extension/host/runtimecell/go_sdk_compat_test.go::TestBuildGoPackedCellFallsBackFromIncompatibleExtensionReplace`, `coding/extension/host/runtimecell/go_sdk_compat_test.go::TestExtractRunnerSDKRequirementsDerivesFromTemplate`, `coding/extension/host/runtimecell/go_sdk_compat_test.go::TestFindSDKRootRejectsOnlyIncompatibleCandidateWithActionableError`
+- **Release note:** Packed Go extension builds no longer fail with `go build: undefined: sdk.ReportLoadFailure` (or any future runner-template SDK symbol) when an extension's `go.mod` local `replace` or `PIG_SDK_GO_ROOT` points to an SDK checkout older than the running `pig` binary. Required SDK symbols are now derived directly from the generated runner template; incompatible SDK roots fall back to the running binary's staged SDK, or report an actionable error naming the incompatible path, how it was selected, and the missing symbol(s) when no compatible SDK exists.
 
 ### BF-d80425c
 

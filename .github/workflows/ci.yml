@@ -31,6 +31,9 @@ jobs:
     name: Changed paths
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
     outputs:
       product: ${{ steps.classify.outputs.product }}
     steps:
@@ -102,7 +105,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # Bookkeeping stays unconditional (no job-level if:), and reuses needs.changes.outputs.skip-unchanged
+      # so Changes and Bookkeeping always agree on one unchanged-main decision.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: needs.changes.outputs.skip-unchanged != 'true'
         with:
           go-version-file: .go-version
           cache: true
@@ -270,12 +276,14 @@ jobs:
     steps:
       - name: Require every Linux shard
         env:
+          EVENT: ${{ github.event_name }}
           CHANGES: ${{ needs.changes.result }}
           PRODUCT: ${{ needs.changes.outputs.product }}
+          SKIP_UNCHANGED: ${{ needs.changes.outputs.skip-unchanged }}
           RESULT: ${{ needs.linux.result }}
-        # Shards are skipped only when the change classifier succeeded and
-        # found no product change.
-        run: test "$RESULT" = success || { test "$CHANGES" = success && test "$PRODUCT" = false && test "$RESULT" = skipped; }
+        # Shards are skipped only when the change classifier succeeded and either found no product
+        # change or skipped an unchanged scheduled main run.
+        run: test "$RESULT" = success || { test "$CHANGES" = success && test "$RESULT" = skipped && { test "$PRODUCT" = false || { test "$EVENT" = schedule && test "$SKIP_UNCHANGED" = true; }; }; }
 
   windows:
     name: Windows ${{ matrix.shard }}
