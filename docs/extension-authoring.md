@@ -12,7 +12,7 @@ Read these files before adding or changing extension behavior:
 6. `test/extension-conformance/conformance_test.go`: cross-SDK behavior gate.
 7. `test/extension-conformance/sdkscenarios/`: the scenario table. A scenario is data: the extension every SDK's scenario driver (`testdata/scenario-driver*`) registers, the host steps `TestSDKScenarios` runs against the real host, and the observation every SDK must produce. Add a capability as a scenario here, not as a copy per SDK. A row an SDK fails today goes in the scenario's `Red` map with the owner of the fix and the observation the SDK produces today (`Got`). `make test-sdk-conformance` runs the table. A red row must produce exactly its `Got`, and the entry must be deleted when the row passes.
 8. `docs/extension-sdk-consistency.md`: for every Pi extension API member and event, whether each SDK has it and whether a conformance fixture of that SDK reaches it. A member an SDK has and no fixture reaches is a hole: it needs an entry in `test/parity/sdk-conformance-gaps.toml` with an owner and the row that closes it, and `go run ./test/parity/cmd/sdksurface` fails on an unlisted hole and on an entry whose hole closed. Close a hole with a scenario row, not a per-SDK test.
-9. `docs/extension-sdk-exports.md`: the disposition, per runtime, of every runtime export and class member of the packages Pi serves to extensions (`pi-tui` helpers, `createAgentSession`, `StringEnum`, ...). A `gap:<lane>` cell is an export a Node extension can import that this SDK cannot yet offer; `test/parity/sdk-exports.toml` names the lane that owns it. Check it before you assume an import has a native equivalent.
+9. `docs/extension-sdk-exports.md`: the disposition, per runtime, of every runtime export and class member of the packages Pi serves to extensions (`pi-tui` helpers, `createAgentSession`, `StringEnum`, ...). A `gap:<lane>` cell is an export a Node extension can import that this SDK cannot yet offer; `test/parity/ledgers/sdk-exports.toml` names the lane that owns it. Check it before you assume an import has a native equivalent.
 10. `docs/performance/extension-ipc.md`: the wire's framing, queue and stderr guarantees, the benchmarks, the open-loop round-trip test and the soak test (`TestExtensionSoak`, leak and latency budgets) with the commands that run them.
 11. `examples/extensions/`: one runnable example per SDK (`go-factory`, `rust-factory`, `python-factory`, `node-factory`) and `plan-mode`. `TestExamplesRunThroughTheHost` loads each example into a real host and calls its tool.
 
@@ -86,7 +86,7 @@ The helpers are `ctx.Yield()` and `ctx.Sleep(d)` (Go), `ctx.yield_now()` and `ct
 
 ### Per-run prompt sections
 
-`before_agent_start` handlers receive `event.messageType`: `"user"` with `event.prompt` and `event.images` for a run that a user message starts, and `"custom"` with `event.message` for a run that `sendMessage` with `triggerTurn` starts while the agent is idle. A custom run also checks compaction first, applies the handlers' result and delivers pending `nextTurn` messages, as a user run does. Either run counts as busy while its handlers run, so messages sent meanwhile join it and a prompt or `sendUserMessage` must name its delivery. Handlers that should act only on user prompts check `event.messageType === "user"`, as `examples/extensions/plan-mode` does. This is Pi 1.6.0's behavior (Pi #5581, Pi PR #10739).
+`before_agent_start` handlers receive `event.messageType`: `"user"` with `event.prompt` and `event.images` for a run that a user message starts, and `"custom"` with `event.message` for a run that `sendMessage` with `triggerTurn` starts while the agent is idle. A custom run also checks compaction first, applies the handlers' result and delivers pending `nextTurn` messages, as a user run does. Either run counts as busy while its handlers run, so messages sent meanwhile join it and a prompt or `sendUserMessage` must name its delivery. Handlers that should act only on user prompts check `event.messageType === "user"`, as `examples/extensions/plan-mode` does. This is Pi 1.6.1's behavior (Pi #5581, Pi PR #10739).
 
 `before_agent_start` handlers can edit `event.systemPromptOptions.sections`. PiG preserves authored section order, validates XML tag names, records section deltas in the Session, and removes a per-run section when the next unmodified run starts. The host awaits the handler and retains section mutations before it reports an error. These mutations do not change the Session's base options.
 
@@ -263,7 +263,7 @@ A card that a click expands is written as Pi writes it, with the pieces the SDK 
 
 The host owns the state of a view's lists: keys the focused list binds move it, and its callbacks arrive as `kit.Event`s (`select`, `cancel`, `selectionChange`, `change`) on the overlay's input queue, after the input sent before them; every other key reaches the input handler. `View.theme` overrides theme tokens for one surface. An image's bytes cross the wire once per connection. The `lines` node's `image`, `progress` and `list` annotations are frontend-only: the SDKs send them only while a frontend draws.
 
-The conversation kinds (§2.1) follow Pi 1.6.0's components. A tool card and
+The conversation kinds (§2.1) follow Pi 1.6.1's components. A tool card and
 a `!` command take Pi's `outputPad` (default 1; Pi's `ToolExecutionOptions`
 and `BashExecutionComponent` argument) and `setOutputPad`, and a tool result
 carries the final result's `durationMs`, which a shell card draws as
@@ -422,6 +422,7 @@ The Go SDK changes that the upgrade reports since 0.4.1:
 - `HostHelpers.HighlightCode` has no `markdown` parameter: `getMarkdownTheme().highlightCode` is `highlightCode`.
 
 - `Context.SetModel` takes a model object (`map[string]any`) instead of the `provider/id` string, and `Context.SetModelNamed` takes the string. The upgrade rewrites a call whose argument is a string; it lists a call whose argument has another type.
+- `SettingsManager.GetShowCacheMissNotices` and `SettingsManager.SetShowCacheMissNotices` are deprecated in 0.8.1 (delegating to `notices.cacheMisses`) and scheduled for removal in 0.9.0; migrate to `SettingsManager.GetNotices()` and `SettingsManager.SetNotice(key, shown)`.
 
 `make sdk-apidiff` fails an incompatible change to an extension SDK package that has no upgrade rule or release note.
 
@@ -889,7 +890,7 @@ A second `Register` replaces the first, and `Register(nil)` removes the hook. `R
 1. Read upstream Pi behavior in Pi's `packages/coding-agent/docs/extensions.md` and the upstream source under `.upstream/current/`.
 2. Add/confirm protocol shape in `coding/extension/host/subprocess/protocol.go`.
 3. Wire host behavior in `coding/extension/host/subprocess/`.
-4. Add matching Go, Rust, Python, and Lisp SDK behavior (`extensions/sdk`, `extensions/sdk-rs`, `extensions/sdk-py`, `extensions/sdk-lisp`), with a conformance row (the scenario table, the SDK harness or the family fixture under `test/extension-conformance/testdata/*-lisp`), or name the Lisp gap in `test/parity/sdk-exports.toml`.
+4. Add matching Go, Rust, Python, and Lisp SDK behavior (`extensions/sdk`, `extensions/sdk-rs`, `extensions/sdk-py`, `extensions/sdk-lisp`), with a conformance row (the scenario table, the SDK harness or the family fixture under `test/extension-conformance/testdata/*-lisp`), or name the Lisp gap in `test/parity/ledgers/sdk-exports.toml`.
 5. Update the Node compatibility runtime and `extensions/sdk-ts` declarations when the surface is available to Node extensions.
 6. Add or extend `test/extension-conformance` so every runtime matches the in-process reference.
 7. Update `docs/extension-api-parity.md`.

@@ -113,7 +113,7 @@ func collectDroppedReasoningReasons(diagnostic ai.AssistantMessageDiagnostic, dr
 
 // maybeShowThinkingDropNotice compares with the preceding displayed response. Session persistence can overtake queued UI events, so the owner loop keeps this state and branch rebuilds initialize it in their existing history walk.
 func (m *InteractiveMode) maybeShowThinkingDropNotice(message *agent.AssistantMessage) {
-	if !m.showCacheMissNotices() {
+	if !m.notices().ReasoningDrops {
 		return
 	}
 	dropped, diagIdx := countDroppedReasoning(message)
@@ -314,6 +314,12 @@ func (m *InteractiveMode) applyEventRegion() {
 func (m *InteractiveMode) applyAgentEvent(ev agent.AgentEvent) {
 	// Each assistant message owns one block updated from authoritative event snapshots.
 	m.programStatusReporter().HandleEvent(ev)
+	// The session file, and with it the resume command, appears when the first prompt is written, which
+	// happens after its message_end reaches listeners. The reply's message_start or the run's end sees it.
+	switch ev.(type) {
+	case agent.MessageStartEvent, agent.AgentSettledEvent:
+		m.programResume.ReportIfNone()
+	}
 	switch e := ev.(type) {
 	case agent.SessionInfoChangedEvent:
 		m.setTerminalTitle(tui.BuildTerminalTitle(e.Name, m.opts.CWD))
@@ -570,7 +576,7 @@ func (m *InteractiveMode) applyAgentEvent(ev agent.AgentEvent) {
 			m.maybeSuggestBugReport(e.Message.Assistant)
 		} else {
 			m.maybeShowThinkingDropNotice(e.Message.Assistant)
-			if m.showCacheMissNotices() {
+			if m.notices().CacheMisses {
 				if notice := formatCacheMissNotice(m.currentSession().detectCacheMiss(e.Message.Assistant)); notice != "" {
 					m.addCacheMissNotice(notice)
 				}

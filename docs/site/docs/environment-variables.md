@@ -2,7 +2,7 @@
 
 PiG reads these variables at startup. Each one has a setting or a default that covers the normal case, so set a variable only when you need to change PiG from outside its configuration: in a container, in CI, or while debugging.
 
-Variables named `PI_*` are read for compatibility with Pi 1.6.0 ([Pi's environment variable reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/environment-variables.md)). Directory variables use the spellings selected by `PIG_USE_PI_DIRS`; other paired variables accept both spellings. Provider credential variables, such as `ANTHROPIC_API_KEY`, are listed in [Providers](/docs/latest/providers) and in `pig --help`.
+Variables named `PI_*` are read for compatibility with Pi 1.6.1 ([Pi's environment variable reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/environment-variables.md)). Directory variables use the spellings selected by `PIG_USE_PI_DIRS`; other paired variables accept both spellings. Provider credential variables, such as `ANTHROPIC_API_KEY`, are listed in [Providers](/docs/latest/providers) and in `pig --help`.
 
 ## Location
 
@@ -151,6 +151,7 @@ These variables describe how PiG was installed, so `pig update` can give the rig
 | `PI_CLIPBOARD_OSC52` | Set to `1` to also send copied text to the terminal with OSC 52 after the local clipboard write, as PiG does over SSH or Mosh. Use it when a remote client reaches PiG without SSH variables, such as a multiplexer attached from another machine or a remote IDE daemon |
 | `PI_HYPERLINKS` | Override OSC 8 hyperlink detection with `1`, `0`, or `auto` |
 | `PI_PROGRAM_STATUS` | Override OSC 7501 program status detection: `1` always reports, `0` never reports; otherwise PiG reports only after the terminal confirms support. See [Terminal setup](/docs/latest/terminal-setup#program-status) |
+| `OSC7577_TOKEN` | Set by terminals that support OSC 7577 program resume, not by you. PiG reports how to resume the session and removes the variable from the environment of every process it starts. See [Terminal setup](/docs/latest/terminal-setup#program-resume) |
 | `PI_IMAGE_PROTOCOL` | Override inline image detection with `kitty`, `iterm2`, `none`, or `auto` |
 | `PI_TRUE_COLOR` | Override true-color detection with `1`, `0`, or `auto`. With true color off, themes use the 256-color palette |
 | `PIG_FRAME_PACING` | PiG-only (D625). `adaptive` begins the frames of a streaming reply 10 to 16 ms apart in fullscreen mode on the terminals listed in [Terminal setup](/docs/latest/terminal-setup#display-problems), for this run; `pi` or `0` begins them 16 ms apart, as Pi does, which is also the default. Any other value, and an empty one, counts as unset. `adaptive` takes effect only with the screen writer (`PIG_TUI_SCREEN_WRITER=writer` or `terminal.screenWriter`); without it, interactive mode shows a warning at start. Read when PiG starts |

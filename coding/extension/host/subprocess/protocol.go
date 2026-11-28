@@ -99,6 +99,11 @@ type Envelope struct {
 	// ackCounted records that readLoop counted this MsgCall frame in its request's ackHold before sealing.
 	ackCounted bool
 
+	// afterAck, when non-nil, is the embedder's command-reply gate captured for a post-acknowledgment MsgCall frame (Host.SetPostAckGate).
+	afterAck <-chan struct{}
+	// afterAckCancel, when non-nil, closes if a later call on the same request needs an answer (is not a post-ack fire-and-forget call), releasing any held post-ack calls on that lane so the handler cannot deadlock waiting for the host.
+	afterAckCancel <-chan struct{}
+
 	// Common fields
 	ID string `json:"id,omitempty"` // Correlation ID for request/response pairs
 
@@ -1491,10 +1496,11 @@ type ViewToolResult struct {
 // code (nil: unknown), whether it was cancelled, whether the output was
 // truncated, and where the full output is.
 type ViewBashComplete struct {
-	ExitCode       *int   `json:"exitCode,omitempty"`
-	Cancelled      bool   `json:"cancelled,omitempty"`
-	Truncated      bool   `json:"truncated,omitempty"`
-	FullOutputPath string `json:"fullOutputPath,omitempty"`
+	ExitCode        *int   `json:"exitCode,omitempty"`
+	Cancelled       bool   `json:"cancelled,omitempty"`
+	Truncated       bool   `json:"truncated,omitempty"`
+	FullOutputPath  string `json:"fullOutputPath,omitempty"`
+	FullOutputError string `json:"fullOutputError,omitempty"`
 }
 
 // ViewStackEntry mirrors upstream StackEntryOptions without visible. A nil

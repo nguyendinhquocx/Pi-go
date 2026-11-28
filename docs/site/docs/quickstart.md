@@ -1,6 +1,6 @@
 # Quickstart
 
-PiG is under active development. Install it on macOS or Linux with `curl -fsSL https://pi-in-go.dev/install.sh | sh`, on any supported platform with `npm install -g @pi-in-go/pig` or `go install github.com/MichaelKinsy/PiG/cmd/pig@latest`, or download an archive from [GitHub Releases](https://github.com/MichaelKinsy/PiG/releases). Windows support is a preview. To build from source instead, follow the steps below. Pi 1.6.0 documents its own install routes in [Pi's quickstart](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/quickstart.md).
+PiG is under active development. Install it on macOS or Linux with `curl -fsSL https://pi-in-go.dev/install.sh | sh`, on any supported platform with `npm install -g @pi-in-go/pig` or `go install github.com/MichaelKinsy/PiG/cmd/pig@latest`, or download an archive from [GitHub Releases](https://github.com/MichaelKinsy/PiG/releases). Windows support is a preview. To build from source instead, follow the steps below. Pi 1.6.1 documents its own install routes in [Pi's quickstart](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/quickstart.md).
 
 If you have not used a terminal before, start with [Your first ten minutes](/docs/latest/first-run). It explains each step.
 
@@ -78,7 +78,7 @@ go install github.com/MichaelKinsy/PiG/cmd/pig@latest
 Use an exact version for a reproducible installation:
 
 ```bash
-go install github.com/MichaelKinsy/PiG/cmd/pig@v0.5.0
+go install github.com/MichaelKinsy/PiG/cmd/pig@v0.8.0
 ```
 
 Go writes the `pig` executable to `GOBIN`. When `GOBIN` is empty, Go uses the
@@ -100,7 +100,7 @@ matching installation receipt.
 
 Explicit `pig update` version checks retry transient transport failures and transient HTTP statuses at most twice within one ten-second budget. Startup checks do not retry. Signature and manifest errors stop the update. Native standalone updates reject concurrent replacement of the same executable and hold the installation lock until receipt commit or rollback completes (D39). The `<executable>.update.lock` sidecar exists only while an update runs; the update removes it when it ends.
 
-Each release tags the root module (`v0.5.0`) and the nested Go extension SDK module (`extensions/sdk/v0.5.0`) on the same commit; `go install` needs both.
+Each release tags the root module (`v0.8.0`) and the nested Go extension SDK module (`extensions/sdk/v0.8.0`) on the same commit; `go install` needs both.
 
 ## Install with Nix
 
@@ -130,7 +130,7 @@ A source build is at `bin/pig` in the PiG checkout. Run it by its full path, for
 
 PiG stores user state below `~/.pig`. Use `PIG_HOME` only when you need an isolated configuration root.
 
-On an interactive start in the default agent directory that holds no `settings.json` yet, which includes every fresh `PIG_HOME`, PiG shows a first-time setup screen: theme, sprite and usage-analytics choices. `Esc` skips it and saves nothing. A custom agent directory (`PIG_CODING_AGENT_DIR`) and print, JSON and RPC modes skip it (`coding/cli/extensions.go:93-95`). Pi 1.6.0 shows its screen (theme and usage-analytics choices) only when all of these hold (`startup-ui.ts` `shouldRunFirstTimeSetup`): the binary is Pi's own distribution (package `@earendil-works/pi-coding-agent`, app `pi`, config directory `.pi`), `PI_EXPERIMENTAL=1` is set, `PI_CODING_AGENT_DIR` is not set, and `~/.pi/agent/settings.json` does not exist yet. This is divergence D88. Change the theme later with `/settings` and the pig with `/sprite`. [Your first ten minutes](/docs/latest/first-run) shows the screen.
+On an interactive start in the default agent directory that holds no `settings.json` yet, which includes every fresh `PIG_HOME`, PiG shows a first-time setup screen: theme, sprite and usage-analytics choices. `Esc` skips it and saves nothing. A custom agent directory (`PIG_CODING_AGENT_DIR`) and print, JSON and RPC modes skip it (`coding/cli/extensions.go:93-95`). Pi 1.6.1 shows its screen (theme and usage-analytics choices) only when all of these hold (`startup-ui.ts` `shouldRunFirstTimeSetup`): the binary is Pi's own distribution (package `@earendil-works/pi-coding-agent`, app `pi`, config directory `.pi`), `PI_EXPERIMENTAL=1` is set, `PI_CODING_AGENT_DIR` is not set, and `~/.pi/agent/settings.json` does not exist yet. This is divergence D88. Change the theme later with `/settings` and the pig with `/sprite`. [Your first ten minutes](/docs/latest/first-run) shows the screen.
 
 ## Authenticate a provider
 
